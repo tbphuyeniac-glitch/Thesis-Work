@@ -1,0 +1,3 @@
+candidate_pairs_before_pruning,pairs_after_pruning,pairs_accepted_stackelberg,patterns_built_before_gnn,active_product_period_count,patterns_kept_after_gnn,episode,duplicate_id_rejects,duplicate_signature_rejects,empty_flow_rejects,patterns_added_to_pool,selected_patterns,objective,improvement
+1,4,4,4,1,2,1,0,1,0,1,21,1290471415.1754081,27629.766000270844
+0,0,0,0,0,0,2,0,0,0,0,21,1290471415.1754081,0.0

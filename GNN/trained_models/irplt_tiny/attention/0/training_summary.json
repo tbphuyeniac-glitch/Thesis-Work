@@ -1,0 +1,4 @@
+{
+  "best_valid_loss": 0.3341393347667611,
+  "checkpoint": "GNN/trained_models/irplt_tiny/attention/0/best_model.pt"
+}

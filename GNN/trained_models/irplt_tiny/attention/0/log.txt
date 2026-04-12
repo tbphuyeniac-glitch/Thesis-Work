@@ -1,0 +1,24 @@
+[2026-04-12 12:19:33.948045] train_samples=8 valid_samples=4
+[2026-04-12 12:19:33.948454] device=cpu hidden_dim=16
+[2026-04-12 12:19:34.062333] epoch=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500
+[2026-04-12 12:19:34.066345] saved best model
+[2026-04-12 12:20:58.660031] train_samples=8 valid_samples=4
+[2026-04-12 12:20:58.660311] device=cpu hidden_dim=16
+[2026-04-12 12:20:58.784425] epoch=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500
+[2026-04-12 12:20:58.788784] saved best model
+[2026-04-12 12:24:44.319283] train_samples=8 valid_samples=4
+[2026-04-12 12:24:44.319751] device=cpu hidden_dim=16
+[2026-04-12 12:24:44.426451] epoch=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500
+[2026-04-12 12:24:44.430106] saved best model
+[2026-04-12 12:27:32.709504] train_samples=8 valid_samples=4
+[2026-04-12 12:27:32.709893] device=cpu hidden_dim=16
+[2026-04-12 12:27:32.817690] epoch=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500
+[2026-04-12 12:27:32.821361] saved best model
+[2026-04-12 12:31:07.223034] train_samples=8 valid_samples=4
+[2026-04-12 12:31:07.223626] device=cpu hidden_dim=16
+[2026-04-12 12:31:07.354178] epoch=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500 pos_score=0.4982 neg_score=nan col_emb_norm=1.4535 con_emb_norm=1.8808 param_update_norm=0.267745
+[2026-04-12 12:31:07.358871] saved best model
+[2026-04-12 12:31:32.970408] train_samples=8 valid_samples=4
+[2026-04-12 12:31:32.971293] device=cpu hidden_dim=16
+[2026-04-12 12:31:33.102540] epoch=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500 pos_score=0.4980 neg_score=0.5035 col_emb_norm=1.4465 con_emb_norm=1.6106 param_update_norm=0.267745
+[2026-04-12 12:31:33.106460] saved best model

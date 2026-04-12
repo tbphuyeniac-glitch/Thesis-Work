@@ -1,0 +1,6 @@
+{
+  "best_valid_loss": 0.3255679957244707,
+  "checkpoint": "GNN/trained_models/irplt_tiny/bigat/0/best_model.pt",
+  "history": "GNN/trained_models/irplt_tiny/bigat/0/training_history.json",
+  "loss_chart": "GNN/trained_models/irplt_tiny/bigat/0/training_loss_curve.png"
+}

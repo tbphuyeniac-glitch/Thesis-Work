@@ -1,0 +1,26 @@
+[2026-04-12 12:34:39.408764] train_samples=8 valid_samples=4
+[2026-04-12 12:34:39.409653] model=BiGAT device=cpu hidden_dim=16
+[2026-04-12 12:34:39.514282] episode=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500 pos_score=0.4980 neg_score=0.5035 col_emb_norm=1.4465 con_emb_norm=1.6106 param_update_norm=0.267745
+[2026-04-12 12:34:39.518135] saved best BiGAT model
+[2026-04-12 12:42:14.779752] train_samples=8 valid_samples=4
+[2026-04-12 12:42:14.780038] model=BiGAT device=cpu hidden_dim=16
+[2026-04-12 12:42:14.888403] episode=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500 pos_score=0.4980 neg_score=0.5035 col_emb_norm=1.4465 con_emb_norm=1.6106 param_update_norm=0.267745
+[2026-04-12 12:42:14.891820] saved best BiGAT model
+[2026-04-12 12:42:17.783474] train_samples=8 valid_samples=4
+[2026-04-12 12:42:17.783714] model=BiGAT device=cpu hidden_dim=16
+[2026-04-12 12:42:17.861098] episode=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500 pos_score=0.4980 neg_score=0.5035 col_emb_norm=1.4465 con_emb_norm=1.6106 param_update_norm=0.267745
+[2026-04-12 12:42:17.863594] saved best BiGAT model
+[2026-04-12 12:52:01.228906] train_samples=8 valid_samples=4
+[2026-04-12 12:52:01.229367] model=BiGAT device=cpu hidden_dim=16
+[2026-04-12 12:52:01.365039] episode=001 train_loss=0.4323 valid_loss=0.3341 valid_f1=0.4500 valid_top1=0.7500 pos_score=0.4980 neg_score=0.5035 col_emb_norm=1.4465 con_emb_norm=1.6106 param_update_norm=0.267745
+[2026-04-12 12:52:01.368844] saved best BiGAT model
+[2026-04-12 12:52:01.420896] episode=002 train_loss=0.4231 valid_loss=0.3314 valid_f1=0.4679 valid_top1=0.7500 pos_score=0.5036 neg_score=0.5029 col_emb_norm=1.4454 con_emb_norm=1.6031 param_update_norm=0.185541
+[2026-04-12 12:52:01.422561] saved best BiGAT model
+[2026-04-12 12:52:01.476448] episode=003 train_loss=0.4214 valid_loss=0.3293 valid_f1=0.7398 valid_top1=0.7500 pos_score=0.5080 neg_score=0.5026 col_emb_norm=1.4650 con_emb_norm=1.5930 param_update_norm=0.172316
+[2026-04-12 12:52:01.478076] saved best BiGAT model
+[2026-04-12 12:52:01.571919] episode=004 train_loss=0.4228 valid_loss=0.3275 valid_f1=0.7814 valid_top1=1.0000 pos_score=0.5088 neg_score=0.4983 col_emb_norm=1.4772 con_emb_norm=1.5697 param_update_norm=0.160381
+[2026-04-12 12:52:01.573529] saved best BiGAT model
+[2026-04-12 12:52:01.625477] episode=005 train_loss=0.4172 valid_loss=0.3256 valid_f1=0.7814 valid_top1=1.0000 pos_score=0.5124 neg_score=0.4972 col_emb_norm=1.4911 con_emb_norm=1.5557 param_update_norm=0.151112
+[2026-04-12 12:52:01.627064] saved best BiGAT model
+[2026-04-12 12:52:01.828583] saved training history to GNN/trained_models/irplt_tiny/bigat/0/training_history.json
+[2026-04-12 12:52:01.829154] saved training loss chart to GNN/trained_models/irplt_tiny/bigat/0/training_loss_curve.png

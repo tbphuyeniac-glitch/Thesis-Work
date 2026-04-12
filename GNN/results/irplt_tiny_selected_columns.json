@@ -1,0 +1,110 @@
+{
+  "summary": {
+    "split": "test",
+    "n_samples": 4,
+    "top_k": 3,
+    "top_k_hit_rate": 1.0
+  },
+  "samples": [
+    {
+      "sample": "GNN/data/irplt_tiny/test/sample_00001.pkl",
+      "n_columns": 5,
+      "n_positive_columns": 4,
+      "selected_columns": [
+        {
+          "rank": 1,
+          "column_id": 3,
+          "score": 0.521691083908081,
+          "label": 1.0
+        },
+        {
+          "rank": 2,
+          "column_id": 2,
+          "score": 0.5201933979988098,
+          "label": 1.0
+        },
+        {
+          "rank": 3,
+          "column_id": 0,
+          "score": 0.5099422335624695,
+          "label": 1.0
+        }
+      ]
+    },
+    {
+      "sample": "GNN/data/irplt_tiny/test/sample_00002.pkl",
+      "n_columns": 6,
+      "n_positive_columns": 6,
+      "selected_columns": [
+        {
+          "rank": 1,
+          "column_id": 5,
+          "score": 0.5095471143722534,
+          "label": 1.0
+        },
+        {
+          "rank": 2,
+          "column_id": 2,
+          "score": 0.5063745379447937,
+          "label": 1.0
+        },
+        {
+          "rank": 3,
+          "column_id": 0,
+          "score": 0.504352331161499,
+          "label": 1.0
+        }
+      ]
+    },
+    {
+      "sample": "GNN/data/irplt_tiny/test/sample_00003.pkl",
+      "n_columns": 5,
+      "n_positive_columns": 2,
+      "selected_columns": [
+        {
+          "rank": 1,
+          "column_id": 4,
+          "score": 0.5016379952430725,
+          "label": 0.0
+        },
+        {
+          "rank": 2,
+          "column_id": 3,
+          "score": 0.49856171011924744,
+          "label": 0.0
+        },
+        {
+          "rank": 3,
+          "column_id": 0,
+          "score": 0.49134042859077454,
+          "label": 1.0
+        }
+      ]
+    },
+    {
+      "sample": "GNN/data/irplt_tiny/test/sample_00004.pkl",
+      "n_columns": 8,
+      "n_positive_columns": 2,
+      "selected_columns": [
+        {
+          "rank": 1,
+          "column_id": 3,
+          "score": 0.5062066316604614,
+          "label": 0.0
+        },
+        {
+          "rank": 2,
+          "column_id": 7,
+          "score": 0.4999423623085022,
+          "label": 1.0
+        },
+        {
+          "rank": 3,
+          "column_id": 1,
+          "score": 0.48996058106422424,
+          "label": 0.0
+        }
+      ]
+    }
+  ]
+}
