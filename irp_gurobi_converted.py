@@ -3795,7 +3795,7 @@ class IRPResearchPipeline:
 # ============================================================================
 
 if __name__ == "__main__":
-    EXCEL_PATH = "/Users/trannguyenhung/Documents/THESIS/Code/Dataset/1BISCR501V_90100140_20260323-150407111_filtered_sites.csv"
+    EXCEL_PATH = Path(__file__).with_name("1BISCR501V_90100140_20260323-150407111_filtered_sites.csv")
 
     mapper = DatasetToIRPValidationMapper(
         excel_path=EXCEL_PATH,
