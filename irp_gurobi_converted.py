@@ -47,6 +47,24 @@ try:
 except ImportError as e:
     raise ImportError("Install gurobipy first: pip install gurobipy") from e
 
+GLOBAL_GUROBI_ENV: Optional[gp.Env] = None
+
+
+def create_gurobi_env() -> gp.Env:
+    env = gp.Env(empty=True)
+    env.setParam("WLSAccessID", os.environ["WLSACCESSID"])
+    env.setParam("WLSSecret", os.environ["WLSSECRET"])
+    env.setParam("LicenseID", int(os.environ["LICENSEID"]))
+    env.start()
+    return env
+
+
+def get_gurobi_env() -> gp.Env:
+    global GLOBAL_GUROBI_ENV
+    if GLOBAL_GUROBI_ENV is None:
+        GLOBAL_GUROBI_ENV = create_gurobi_env()
+    return GLOBAL_GUROBI_ENV
+
 Store = str
 Product = str
 Period = int
@@ -700,7 +718,7 @@ class BaselineIRPModel:
 
     def solve(self, msg: bool = False) -> BaselineIRPSolution:
         d = self.data
-        mdl = gp.Model("Baseline_IRP")
+        mdl = gp.Model("Baseline_IRP", env=get_gurobi_env())
         mdl.Params.OutputFlag = 1 if msg else 0
 
         q_cw_keys = [(s, p, t) for s in d.stores for p in d.products for t in d.periods]
@@ -797,7 +815,7 @@ class AchamrahFullIRPTModel:
         CW = d.warehouse
         N0 = [CW] + N
 
-        mdl = gp.Model("Achamrah_Full_IRPT")
+        mdl = gp.Model("Achamrah_Full_IRPT", env=get_gurobi_env())
         mdl.Params.OutputFlag = 1 if msg else 0
         if time_limit is not None:
             mdl.Params.TimeLimit = time_limit
@@ -2596,7 +2614,7 @@ class LateralTransshipmentCG:
         d = self.data
         need, surplus = self._build_need_and_surplus_proxies()
         active_product_periods = self._compute_active_product_periods(need, surplus)
-        mdl = gp.Model("LT_RMP")
+        mdl = gp.Model("LT_RMP", env=get_gurobi_env())
         mdl.Params.OutputFlag = 1 if msg else 0
 
         pattern_map = {pat.pattern_id: pat for pat in self.patterns if (pat.product, pat.period) in active_product_periods}
