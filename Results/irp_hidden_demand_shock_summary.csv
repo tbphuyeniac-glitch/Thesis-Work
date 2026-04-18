@@ -1,0 +1,2 @@
+shock_model,shock_probability,max_reallocation_fraction,shock_seed,n_store_sku_period_reallocations,total_reallocated_units,total_forecast_demand,total_realized_demand,total_post_shock_shortage,total_post_shock_inventory
+hidden_local_reallocation,0.5,0.35,20260418,9,133.35,2676.0,2676.0,73.15,7436.1

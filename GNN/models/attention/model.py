@@ -90,11 +90,17 @@ class BiGATColumnScorer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.column_norm0 = nn.LayerNorm(hidden_dim)
+        self.constraint_norm0 = nn.LayerNorm(hidden_dim)
 
         self.col_to_con_1 = BipartiteAttentionLayer(hidden_dim, self.edge_dim, dropout)
         self.con_to_col_1 = BipartiteAttentionLayer(hidden_dim, self.edge_dim, dropout)
         self.col_to_con_2 = BipartiteAttentionLayer(hidden_dim, self.edge_dim, dropout)
         self.con_to_col_2 = BipartiteAttentionLayer(hidden_dim, self.edge_dim, dropout)
+        self.column_norm1 = nn.LayerNorm(hidden_dim)
+        self.constraint_norm1 = nn.LayerNorm(hidden_dim)
+        self.column_norm2 = nn.LayerNorm(hidden_dim)
+        self.constraint_norm2 = nn.LayerNorm(hidden_dim)
 
         self.scoring_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -126,18 +132,26 @@ class BiGATColumnScorer(nn.Module):
         edge_attr_col_to_con: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return final column and constraint embeddings before scoring."""
-        h_col = self.column_encoder(column_features.float())
-        h_con = self.constraint_encoder(constraint_features.float())
+        h_col = self.column_norm0(self.column_encoder(column_features.float()))
+        h_con = self.constraint_norm0(self.constraint_encoder(constraint_features.float()))
 
         edge_index_col_to_con = edge_index_col_to_con.long()
         edge_index_con_to_col = torch.stack(
             [edge_index_col_to_con[1], edge_index_col_to_con[0]], dim=0
         )
 
-        h_con = h_con + self.col_to_con_1(h_col, h_con, edge_index_col_to_con, edge_attr_col_to_con.float())
-        h_col = h_col + self.con_to_col_1(h_con, h_col, edge_index_con_to_col, edge_attr_col_to_con.float())
-        h_con = h_con + self.col_to_con_2(h_col, h_con, edge_index_col_to_con, edge_attr_col_to_con.float())
-        h_col = h_col + self.con_to_col_2(h_con, h_col, edge_index_con_to_col, edge_attr_col_to_con.float())
+        h_con = self.constraint_norm1(
+            h_con + self.col_to_con_1(h_col, h_con, edge_index_col_to_con, edge_attr_col_to_con.float())
+        )
+        h_col = self.column_norm1(
+            h_col + self.con_to_col_1(h_con, h_col, edge_index_con_to_col, edge_attr_col_to_con.float())
+        )
+        h_con = self.constraint_norm2(
+            h_con + self.col_to_con_2(h_col, h_con, edge_index_col_to_con, edge_attr_col_to_con.float())
+        )
+        h_col = self.column_norm2(
+            h_col + self.con_to_col_2(h_con, h_col, edge_index_con_to_col, edge_attr_col_to_con.float())
+        )
 
         return h_col, h_con
 
@@ -159,7 +173,7 @@ class BiGATColumnScorer(nn.Module):
     def load(cls, path: str | Path, map_location: str | torch.device = "cpu") -> "BiGATColumnScorer":
         checkpoint = torch.load(path, map_location=map_location)
         model = cls(**checkpoint.get("config", {}))
-        model.load_state_dict(checkpoint["state_dict"])
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
         return model
 
 
@@ -173,4 +187,3 @@ def score_graph(model: BiGATColumnScorer, graph: Dict[str, torch.Tensor]) -> tor
             graph["edge_index_col_to_con"],
             graph["edge_attr_col_to_con"],
         )
-

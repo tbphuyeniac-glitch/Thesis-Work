@@ -28,8 +28,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    data_dir = "GNN/data/irplt_tiny"
-    model_dir = "GNN/trained_models/irplt_tiny/bigat/0"
+    data_dir = "GNN/data/irplt_synthetic_debug"
+    model_dir = "GNN/trained_models/irplt_synthetic_debug/bigat/pairwise_rank"
     checkpoint = f"{model_dir}/best_model.pt"
     test_csv = "GNN/results/irplt_tiny_test.csv"
     selected_json = "GNN/results/irplt_tiny_selected_columns.json"
@@ -65,6 +65,8 @@ def main() -> None:
         data_dir,
         "--out-dir",
         model_dir,
+        "--dataset-type",
+        "synthetic",
         "--epochs",
         "5",
         "--hidden-dim",
@@ -90,7 +92,7 @@ def main() -> None:
         ])
 
     if args.stage in ("all", "evaluate"):
-        run_step("STEP 4 - Export selected top-k LT columns", [
+        run_step("STEP 4 - Export adaptive selected LT columns", [
         PYTHON,
         "GNN/evaluate_result.py",
         "--data-dir",
@@ -99,8 +101,8 @@ def main() -> None:
         checkpoint,
         "--split",
         "test",
-        "--top-k",
-        "3",
+        "--mass-threshold",
+        "0.70",
         "--out-file",
         selected_json,
         "--device",

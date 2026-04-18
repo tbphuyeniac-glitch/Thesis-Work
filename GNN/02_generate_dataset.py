@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Generate synthetic IRP-LT BiGAT graph samples for debugging/pretraining.
+
+These samples use heuristic labels. They are useful for smoke tests and
+optional warm-up only; final thesis training should use solver-derived
+teacher rows exported from the column-generation pipeline.
+"""
+
 import argparse
 import shutil
 from pathlib import Path
@@ -34,13 +41,13 @@ def generate_split(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate IRP-LT BiGAT graph samples.")
-    parser.add_argument("--out-dir", default="GNN/data/irplt_tiny", help="Output dataset root.")
+    parser = argparse.ArgumentParser(description="Generate synthetic/debug IRP-LT BiGAT graph samples, not final teacher-labeled thesis data.")
+    parser.add_argument("--out-dir", default="GNN/data/irplt_synthetic_debug", help="Output synthetic/debug dataset root.")
     parser.add_argument("--seed", type=utilities.valid_seed, default=0)
-    parser.add_argument("--train-size", type=int, default=8)
-    parser.add_argument("--valid-size", type=int, default=4)
-    parser.add_argument("--test-size", type=int, default=4)
-    parser.add_argument("--n-columns", type=int, default=8)
+    parser.add_argument("--train-size", type=int, default=200)
+    parser.add_argument("--valid-size", type=int, default=100)
+    parser.add_argument("--test-size", type=int, default=60)
+    parser.add_argument("--n-columns", type=int, default=80)
     parser.add_argument("--n-need-constraints", type=int, default=4)
     parser.add_argument("--n-surplus-constraints", type=int, default=4)
     parser.add_argument("--max-pairs-per-column", type=int, default=2)

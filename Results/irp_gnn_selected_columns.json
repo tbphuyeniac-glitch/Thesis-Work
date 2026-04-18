@@ -1,23 +1,16 @@
 [
   {
+    "branch_node_id": null,
     "episode": 1,
-    "n_candidates": 4,
-    "n_selected": 2,
-    "selected": [
-      {
-        "rank": 1,
-        "pattern_id": "PRICED_E1_shortage_ratio_ORION CHOCOPIE 33/36.3G*12P_T1_1",
-        "score": 0.9999998807907104,
-        "reduced_cost": -27629.766,
-        "column_cost": 3.275371
-      },
-      {
-        "rank": 2,
-        "pattern_id": "PRICED_E1_surplus_ratio_ORION CHOCOPIE 33/36.3G*12P_T1_1",
-        "score": 0.9999998807907104,
-        "reduced_cost": -27629.766,
-        "column_cost": 3.275371
-      }
-    ]
+    "n_candidates": 15,
+    "n_selected": 15,
+    "selection_mode": "teacher_full_batch_no_gnn_prefilter",
+    "adaptive_k_star": 15,
+    "negative_reduced_cost_candidates": 15,
+    "classical_fallback_enabled": false,
+    "classical_fallback_used": false,
+    "fallback_idx": null,
+    "selected": [],
+    "selected_by_gnn_in_rmp": 0
   }
 ]

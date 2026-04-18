@@ -1,0 +1,3 @@
+model,gurobi_runtime_seconds,lp_iterations,barrier_iterations,nodes_explored,lp_relaxations_solved_estimate,rmp_solves,branch_price_nodes_explored,branch_price_nodes_remaining
+baseline_irpt,0.07115507125854492,452.0,0.0,1.0,1.0,,,
+cg_rmp_total,0.004524946212768555,108.0,0.0,0.0,4.0,4.0,15.0,4.0

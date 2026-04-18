@@ -1,0 +1,13 @@
+{
+  "best_valid_loss": 0.7152343988418579,
+  "objective": "pairwise_rank",
+  "dataset_type": "teacher",
+  "data_dir": "GNN/data/irplt_teacher",
+  "resume_checkpoint": "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt",
+  "label_sources": {
+    "teacher_rmp": 6
+  },
+  "checkpoint": "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt",
+  "history": "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json",
+  "loss_chart": "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png"
+}

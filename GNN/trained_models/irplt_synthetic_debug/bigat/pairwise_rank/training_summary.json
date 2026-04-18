@@ -1,0 +1,12 @@
+{
+  "best_valid_loss": 0.46056343096753827,
+  "objective": "pairwise_rank",
+  "dataset_type": "synthetic",
+  "data_dir": "GNN/data/irplt_synthetic_debug",
+  "label_sources": {
+    "synthetic_heuristic": 12
+  },
+  "checkpoint": "GNN/trained_models/irplt_synthetic_debug/bigat/pairwise_rank/best_model.pt",
+  "history": "GNN/trained_models/irplt_synthetic_debug/bigat/pairwise_rank/training_history.json",
+  "loss_chart": "GNN/trained_models/irplt_synthetic_debug/bigat/pairwise_rank/training_loss_curve.png"
+}

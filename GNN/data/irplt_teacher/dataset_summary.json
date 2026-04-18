@@ -1,0 +1,54 @@
+{
+  "teacher_csv": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/cg_teacher_dataset.csv",
+  "out_dir": "GNN/data/irplt_teacher",
+  "n_raw_rows": 68,
+  "n_groups": 4,
+  "splits": {
+    "train": {
+      "groups": 3,
+      "samples_written": 3,
+      "total_columns": 66,
+      "total_positive_columns": 31,
+      "column_count_min": 5,
+      "column_count_mean": 22.0,
+      "column_count_max": 50,
+      "positive_count_min": 3,
+      "positive_count_mean": 10.333333333333334,
+      "positive_count_max": 21,
+      "adaptive_k_star_min": 2.0,
+      "adaptive_k_star_mean": 6.666666666666667,
+      "adaptive_k_star_max": 15.0
+    },
+    "valid": {
+      "groups": 1,
+      "samples_written": 1,
+      "total_columns": 2,
+      "total_positive_columns": 1,
+      "column_count_min": 2,
+      "column_count_mean": 2.0,
+      "column_count_max": 2,
+      "positive_count_min": 1,
+      "positive_count_mean": 1.0,
+      "positive_count_max": 1,
+      "adaptive_k_star_min": 2.0,
+      "adaptive_k_star_mean": 2.0,
+      "adaptive_k_star_max": 2.0
+    },
+    "test": {
+      "groups": 0,
+      "samples_written": 0,
+      "total_columns": 0,
+      "total_positive_columns": 0,
+      "column_count_min": 0,
+      "column_count_mean": 0.0,
+      "column_count_max": 0,
+      "positive_count_min": 0,
+      "positive_count_mean": 0.0,
+      "positive_count_max": 0,
+      "adaptive_k_star_min": null,
+      "adaptive_k_star_mean": null,
+      "adaptive_k_star_max": null
+    }
+  },
+  "skipped_groups": []
+}

@@ -1,0 +1,15 @@
+[2026-04-13 17:44:16.807859] train_samples=8 valid_samples=4
+[2026-04-13 17:44:16.808198] dataset_type=synthetic data_dir=GNN/data/irplt_synthetic_debug label_sources={'synthetic_heuristic': 12}
+[2026-04-13 17:44:16.808353] model=BiGAT device=cpu hidden_dim=16
+[2026-04-13 17:44:16.893417] epoch=001 objective=pairwise_rank train_loss=0.7376 valid_loss=0.5444 valid_f1=0.7424 valid_top1=0.7500 valid_mrr=0.8333 pos_score=0.5303 neg_score=0.5354 score_gap=-0.0050 col_emb_norm=4.0083 con_emb_norm=3.9975 param_update_norm=0.266810
+[2026-04-13 17:44:16.896753] saved best BiGAT model
+[2026-04-13 17:44:16.942204] epoch=002 objective=pairwise_rank train_loss=0.6698 valid_loss=0.5208 valid_f1=0.8141 valid_top1=0.7500 valid_mrr=0.8750 pos_score=0.5397 neg_score=0.5271 score_gap=0.0126 col_emb_norm=4.0107 con_emb_norm=3.9999 param_update_norm=0.189901
+[2026-04-13 17:44:16.943588] saved best BiGAT model
+[2026-04-13 17:44:16.988795] epoch=003 objective=pairwise_rank train_loss=0.6233 valid_loss=0.5035 valid_f1=0.9030 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5477 neg_score=0.5209 score_gap=0.0267 col_emb_norm=4.0207 con_emb_norm=4.0016 param_update_norm=0.163639
+[2026-04-13 17:44:16.990113] saved best BiGAT model
+[2026-04-13 17:44:17.035140] epoch=004 objective=pairwise_rank train_loss=0.6267 valid_loss=0.4825 valid_f1=0.8683 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5474 neg_score=0.5037 score_gap=0.0437 col_emb_norm=4.0293 con_emb_norm=4.0017 param_update_norm=0.167428
+[2026-04-13 17:44:17.036450] saved best BiGAT model
+[2026-04-13 17:44:17.081187] epoch=005 objective=pairwise_rank train_loss=0.5973 valid_loss=0.4606 valid_f1=0.9148 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5459 neg_score=0.4856 score_gap=0.0603 col_emb_norm=4.0363 con_emb_norm=4.0038 param_update_norm=0.161589
+[2026-04-13 17:44:17.082558] saved best BiGAT model
+[2026-04-13 17:44:17.200191] saved training history to GNN/trained_models/irplt_synthetic_debug/bigat/pairwise_rank/training_history.json
+[2026-04-13 17:44:17.200427] saved training loss chart to GNN/trained_models/irplt_synthetic_debug/bigat/pairwise_rank/training_loss_curve.png

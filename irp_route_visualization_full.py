@@ -14,28 +14,72 @@ def extract_routes_from_solution(solution):
         if val > 0.5:
             arcs_by_v_t.setdefault((v, t), []).append((i, j))
 
-    for (v, t), arcs in arcs_by_v_t.items():
-        next_node = {i: j for (i, j) in arcs}
+    for (v, t), arcs in sorted(arcs_by_v_t.items(), key=lambda item: (item[0][1], item[0][0])):
+        outgoing = {}
+        incoming = {}
+        for i, j in arcs:
+            outgoing.setdefault(i, []).append(j)
+            incoming.setdefault(j, []).append(i)
+
+        degree_warnings = []
+        for node in sorted(set(outgoing) | set(incoming)):
+            in_deg = len(incoming.get(node, []))
+            out_deg = len(outgoing.get(node, []))
+            if in_deg > 1 or out_deg > 1:
+                degree_warnings.append(f"{node}:in={in_deg},out={out_deg}")
+
+        next_node = {i: js[0] for i, js in outgoing.items() if js}
+        if "CW" not in next_node:
+            routes.append({
+                "period": t,
+                "vehicle": v,
+                "route": [f"UNRESOLVED_ARCS::{arcs}"],
+                "arcs": arcs,
+                "degree_warnings": degree_warnings,
+                "unvisited_arcs": arcs,
+                "load_departure": _get_solution_load(solution, "CW", v, t),
+            })
+            continue
 
         route = ["CW"]
         current = "CW"
         visited = set()
 
-        while current in next_node and current not in visited:
-            visited.add(current)
+        while current in next_node and (current, next_node[current]) not in visited:
             nxt = next_node[current]
+            visited.add((current, nxt))
             route.append(nxt)
             current = nxt
             if current == "CW":
                 break
+        unvisited_arcs = [arc for arc in arcs if arc not in visited]
+
+        total_direct_qty = 0.0
+        if hasattr(solution, "deliv"):
+            total_direct_qty = sum(
+                float(qty)
+                for (s, p, vv, tt), qty in solution.deliv.items()
+                if vv == v and tt == t and qty > 1e-9
+            )
 
         routes.append({
             "period": t,
             "vehicle": v,
-            "route": route
+            "route": route,
+            "arcs": arcs,
+            "degree_warnings": degree_warnings,
+            "unvisited_arcs": unvisited_arcs,
+            "total_direct_qty": round(total_direct_qty, 6),
+            "load_departure": _get_solution_load(solution, "CW", v, t),
         })
 
     return routes
+
+
+def _get_solution_load(solution, node, vehicle, period):
+    if not hasattr(solution, "load"):
+        return 0.0
+    return round(float(solution.load.get((node, vehicle, period), 0.0)), 6)
 
 
 # =========================
@@ -129,7 +173,16 @@ def run_pipeline(data, AchamrahFullIRPTModel):
 
     print("\nExtracted Routes:")
     for r in routes:
-        print(f"t={r['period']} | v={r['vehicle']} | route={r['route']}")
+        print(
+            f"t={r['period']} | v={r['vehicle']} | route={r['route']} "
+            f"| direct_qty={r.get('total_direct_qty', 0.0)} "
+            f"| load_departure={r.get('load_departure', 0.0)}"
+        )
+        if r.get("degree_warnings") or r.get("unvisited_arcs"):
+            print(
+                f"  route_warning degree={r.get('degree_warnings', [])} "
+                f"unvisited_arcs={r.get('unvisited_arcs', [])}"
+            )
 
     visualize_routes_by_period(routes)
 

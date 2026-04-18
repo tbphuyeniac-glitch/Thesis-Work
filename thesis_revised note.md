@@ -1,420 +1,640 @@
-# IRP + LT Column Generation + BiGAT GNN
-## Fix Notes and Recommended Revisions
+# Baseline Routing Code Review and Improvement Plan
 
-This note summarizes the main issues identified in the current implementation and the concrete changes recommended for the next revision of the code.
+## File reviewed
+`irp_gurobi_converted.py`
 
----
+This note focuses only on the **baseline model** currently implemented in:
+- `AchamrahFullIRPTModel.solve(...)`
 
-## 1. Current Flow in the Code
+The goal is to answer one practical question:
 
-The current pipeline runs in the following order:
-
-1. Solve the baseline Achamrah-style full IRPT model with `allow_lateral_transshipment=False`.
-2. Use the baseline solution to build LT need/surplus proxies.
-3. Generate random initial LT patterns.
-4. Solve the restricted master problem (RMP).
-5. Run pricing from dual values.
-6. Apply Stackelberg acceptance logic.
-7. Build candidate LT patterns.
-8. Use the BiGAT GNN to score and keep the top-k priced patterns.
-9. Add non-duplicate patterns to the pattern pool.
-10. Re-optimize the RMP and repeat.
-
-This means the GNN is currently used only as a **selector/ranker over already-generated priced columns**. It does not generate columns itself.
+> Is the current baseline already a fully correct routing model, and if not, what should be fixed in code?
 
 ---
 
-## 2. Main Problems Identified
+## 1. Final conclusion
 
-### 2.1 Frozen need/surplus proxy across CG iterations
+The current baseline is **not yet a fully completed routing model**.
 
-#### Current behavior
-The function `_build_need_and_surplus_proxies()` always uses:
-- `self.baseline.shortage`
-- `self.baseline.inv_store`
+It already contains some routing elements:
+- depot/CW,
+- vehicles,
+- binary route arcs,
+- vehicle usage variables,
+- arc-capacity linking,
+- route extraction,
+- store and warehouse inventory balance.
 
-These values come from the initial no-LT baseline solution and stay unchanged across CG iterations.
+However, it is still better described as a **routing-flavored network-flow IRPT prototype** rather than a fully correct multi-stop delivery routing model.
 
-#### Why this is a problem
-Even if dual values change after each RMP re-optimization, the pricing routine still sees almost the same primal proxy state. As a result, it tends to regenerate very similar candidate patterns in later episodes.
-
-#### Recommended fix
-Update the pricing proxy after each iteration using the current master solution, not only the original baseline.
-
-Possible directions:
-- Use `master_solution.implied_net_lt` to update effective surplus/need.
-- Recompute residual shortage after applying currently selected LT patterns.
-- Maintain an iteration-dependent proxy state instead of a fixed baseline-only proxy.
-
-#### Expected benefit
-This makes pricing responsive to the evolving RMP solution and increases the chance of generating genuinely new columns across episodes.
+The main weaknesses are:
+1. **direct delivery is tied only to arc `CW -> store`**, so multi-stop delivery is not modeled correctly;
+2. **vehicle load progression along the route is missing**;
+3. **subtour elimination is incomplete**;
+4. **vehicle usage cost is not explicitly charged in the objective**;
+5. **synthetic distance matrix is too simple**, so routes may look artificially easy and solver runtime becomes misleadingly fast.
 
 ---
 
-### 2.2 LT activation threshold is too restrictive for small instances
+## 2. What the current code already does correctly
 
-#### Current behavior
-A product-period pair becomes active only if:
-- total need >= `lt_activation_threshold`
-- total surplus >= `lt_activation_threshold`
+### 2.1 Depot and vehicles exist
+The baseline defines:
+- `CW` as the warehouse/depot,
+- `V` as the vehicle set,
+- `x[(i,j,v,t)]` as binary route decisions,
+- `u[(v,t)]` as vehicle activation,
+- `z[(i,v,t)]` as node-visit indicators.
 
-The threshold is currently set to `10.0`.
+This means the model is **not** a pure inventory-only model. It does contain a route skeleton.
 
-#### Why this is a problem
-For small instances with only a few stores and SKUs, this threshold may deactivate many `(product, period)` pairs before CG even starts.
-
-#### Recommended fix
-Test smaller thresholds, such as:
-- `2.0`
-- `5.0`
-
-Also export the number of active `(product, period)` pairs per run.
-
-#### Expected benefit
-This opens more pricing opportunities and gives the GNN a larger candidate pool to work on.
-
----
-
-### 2.3 Candidate pool is too small before the GNN step
-
-#### Current behavior
-The current configuration is very restrictive:
-- `store_limit = 3`
-- `sku_limit = 2`
-- `n_initial_patterns_per_product_period = 2`
-- `max_pairs_per_pattern = 3`
-- `top_pairs_per_feature = 8`
-- `top_patterns_per_feature = 2`
-- `cg_iterations = 3`
-
-#### Why this is a problem
-The pool of feasible donor-receiver combinations is already very small in the small instance. After pruning and Stackelberg filtering, only a few patterns remain. Then the GNN is asked to select from a tiny set, so it cannot materially change the outcome.
-
-#### Recommended fix
-Increase candidate diversity in pricing. Suggested test values:
-- `top_pairs_per_feature: 8 -> 20`
-- `top_patterns_per_feature: 2 -> 5`
-- `max_pairs_per_pattern: 3 -> 4` or `5`
-- `n_initial_patterns_per_product_period: 2 -> 5`
-- `cg_iterations: 3 -> 5` or more for experiments
-
-#### Expected benefit
-A larger and more diverse candidate set allows the GNN to act as a real ranking mechanism rather than a near-pass-through filter.
-
----
-
-### 2.4 Pattern IDs are not unique across pricing episodes
-
-#### Current behavior
-Pattern IDs are generated using:
+### 2.2 Vehicle capacity is partially enforced
+The code already includes:
 
 ```python
-pattern_id=f"PRICED_{feature_name}_{p}_T{t}_{built_here}"
+mdl.addConstr(gp.quicksum(q[(p, i, j, v, t)] for p in P) <= d.vehicle_capacity * u[(v, t)])
 ```
 
-The variable `built_here` resets every time the function is called.
-
-#### Why this is a problem
-Across multiple pricing episodes, the same feature/product/period combination can receive the same ID again. Then `add_patterns()` rejects the new pattern because the ID already exists.
-
-#### Recommended fix
-Make pattern IDs globally unique across episodes.
-
-Suggested format:
+and also:
 
 ```python
-pattern_id=f"PRICED_E{episode}_{feature_name}_{p}_T{t}_{built_here}"
+mdl.addConstr(q[(p, i, j, v, t)] <= d.vehicle_capacity * x[(i, j, v, t)])
 ```
 
-Alternative:
-- Use a global pattern counter stored in the CG engine.
-- Or append a hash/signature suffix.
+So the model does consider capacity, but only as an **arc-level carrying bound**, not as a true load evolution throughout the route.
 
-#### Expected benefit
-This prevents false duplicate rejection caused purely by repeated IDs.
+### 2.3 Route start from CW is enforced
+The code has:
 
----
+```python
+mdl.addConstr(gp.quicksum(x[(CW, j, v, t)] for j in N) == u[(v, t)])
+```
 
-### 2.5 Duplicate filtering may be rejecting too many new patterns
+So if a vehicle is active, it must leave the warehouse exactly once.
 
-#### Current behavior
-`add_patterns()` rejects new patterns if:
-- `pattern_id` already exists, or
-- the pattern signature already exists, or
-- the pattern flow dictionary is empty
+### 2.4 Flow conservation at stores exists
+For each store `j`, vehicle `v`, period `t`, the code enforces:
 
-#### Why this is a problem
-If the frozen proxy causes very similar patterns to be priced in later episodes, the signature filter may reject nearly all new patterns.
+```python
+gp.quicksum(x[(i, j, v, t)] for i in N0 if i != j)
+==
+gp.quicksum(x[(j, i, v, t)] for i in N0 if i != j)
+```
 
-#### Recommended fix
-Keep duplicate filtering, but add diagnostics that explicitly report the rejection reason:
-- duplicate ID
-- duplicate signature
-- empty flow
-
-Also log the pattern signature.
-
-#### Expected benefit
-This will show whether the real bottleneck is repeated pricing output or something else.
+This gives in-flow = out-flow at each visited store.
 
 ---
 
-### 2.6 GNN top-k may be too large relative to the number of priced patterns
+## 3. Main modeling problems and required fixes
 
-#### Current behavior
+---
+
+## Problem 1. Direct delivery is modeled incorrectly for multi-stop routes
+
+### 3.1 Current code
+The baseline currently defines direct shipment by:
+
+```python
+mdl.addConstr(Qdir[(s, p, t)] == gp.quicksum(q[(p, CW, s, v, t)] for v in V))
+```
+
+### 3.2 Why this is a problem
+This means product delivered to store `s` is counted **only** if it travels on arc `CW -> s`.
+
+So if a route is:
+
+`CW -> A -> B -> CW`
+
+then:
+- delivery to `A` can be captured,
+- but delivery to `B` is **not** naturally modeled as goods carried from CW through A and then unloaded at B.
+
+That is not how a real IRP/VRP delivery route works.
+
+### 3.3 Consequence
+The current model behaves much closer to:
+- direct shipment from CW to each served store,
+- plus store-to-store transshipment flow,
+- rather than a true delivery tour where a vehicle departs with load and unloads progressively along the path.
+
+This is the single most important reason the current baseline is **not yet a fully correct routing formulation**.
+
+### 3.4 Required fix
+Replace the current `Qdir` logic with an explicit **delivery/unloading variable at each store**.
+
+Suggested new variable:
+
+```python
+deliv = mdl.addVars([(s, p, v, t) for s in N for p in P for v in V for t in T],
+                    lb=0.0,
+                    vtype=flow_vtype,
+                    name="deliv")
+```
+
+Then define total direct delivery as:
+
+```python
+mdl.addConstr(
+    Qdir[(s, p, t)] == gp.quicksum(deliv[(s, p, v, t)] for v in V)
+)
+```
+
+And use `deliv` inside vehicle load balance instead of tying delivery to only `CW -> s` arcs.
+
+### 3.5 Priority
+**Critical / must fix first**.
+
+---
+
+## Problem 2. Vehicle load progression along the route is missing
+
+### 4.1 Current code
+The model uses arc-flow variables `q[(p,i,j,v,t)]`, but it does not explicitly track:
+- how much load vehicle `v` leaves CW with,
+- how much remains after visiting each store,
+- how the load decreases after deliveries.
+
+### 4.2 Why this is a problem
+A correct routing delivery model usually needs one of these:
+- commodity flow with proper depot-origin semantics,
+- or load propagation variables,
+- or cumulative load/order variables.
+
+Right now, `q` behaves more like a general network flow over arcs.
+
+### 4.3 Consequence
+This can create solutions that are mathematically feasible in the network sense, but operationally not very realistic.
+
+It also contributes to the feeling that:
+- routes solve too fast,
+- vehicles appear frequently full,
+- deliveries do not behave like normal truck unloading.
+
+### 4.4 Required fix
+Add explicit load variables, for example:
+
+```python
+load = mdl.addVars([(i, v, t) for i in N0 for v in V for t in T],
+                   lb=0.0,
+                   ub=d.vehicle_capacity,
+                   vtype=flow_vtype,
+                   name="load")
+```
+
+Then impose load transition constraints, for example using big-M:
+
+```python
+for i in N0:
+    for j in N:
+        if i == j:
+            continue
+        for v in V:
+            for t in T:
+                delivered_at_j = gp.quicksum(deliv[(j, p, v, t)] for p in P)
+                mdl.addConstr(
+                    load[(j, v, t)] <= load[(i, v, t)] - delivered_at_j + d.vehicle_capacity * (1 - x[(i, j, v, t)])
+                )
+                mdl.addConstr(
+                    load[(j, v, t)] >= load[(i, v, t)] - delivered_at_j - d.vehicle_capacity * (1 - x[(i, j, v, t)])
+                )
+```
+
+At depot:
+
+```python
+for v in V:
+    for t in T:
+        mdl.addConstr(load[(CW, v, t)] <= d.vehicle_capacity * u[(v, t)])
+```
+
+### 4.5 Priority
+**Critical / same priority as Problem 1**.
+
+---
+
+## Problem 3. Subtour elimination is not complete
+
+### 5.1 Current code status
+The file itself states that true disjoint path inequalities / branch-and-cut are **not fully implemented**.
+
+The model includes some strengthening inequalities `(16)–(20)`, but does **not** fully guarantee classical subtour elimination in all cases.
+
+### 5.2 Why this matters
+A route model without proper subtour elimination may still produce:
+- disconnected cycles,
+- route fragments,
+- or mathematically valid but operationally meaningless loops.
+
+Even if this does not always appear in small instances, it remains a formulation weakness.
+
+### 5.3 Required fix
+Choose one of these two options.
+
+#### Option A. MTZ-style subtour elimination
+Add node ordering variables per vehicle and period:
+
+```python
+ordv = mdl.addVars([(s, v, t) for s in N for v in V for t in T],
+                   lb=0,
+                   ub=len(N),
+                   vtype=GRB.CONTINUOUS,
+                   name="ordv")
+```
+
+Then add MTZ constraints:
+
+```python
+for i in N:
+    for j in N:
+        if i == j:
+            continue
+        for v in V:
+            for t in T:
+                mdl.addConstr(
+                    ordv[(i, v, t)] - ordv[(j, v, t)] + len(N) * x[(i, j, v, t)] <= len(N) - 1
+                )
+```
+
+#### Option B. SEC / callback
+If later you want stronger performance and a more academic formulation, migrate to lazy subtour cuts with callbacks.
+
+### 5.4 Priority
+**High**.
+
+---
+
+## Problem 4. Vehicle usage is not directly penalized in the objective
+
+### 6.1 Current code
+The objective includes:
+- store holding cost,
+- warehouse holding cost,
+- distance cost on arcs,
+- LT unit cost,
+- shortage cost.
+
+But there is **no explicit fixed vehicle usage cost** like:
+
+```python
+gp.quicksum(vehicle_fixed_cost * u[(v,t)] for v in V for t in T)
+```
+
+### 6.2 Why this matters
+Without an explicit vehicle-activation cost:
+- solver decisions are driven mostly by arc distance and shortage penalties,
+- the model may over-pack used vehicles,
+- or route structure may look distorted compared with real operating logic.
+
+### 6.3 Consequence
+This is one reason why you often observe quantities close to full capacity.
+
+That behavior is not automatically wrong, but the cost structure strongly encourages consolidation.
+
+### 6.4 Required fix
+Add a vehicle fixed cost parameter:
+
+In `IRPData`:
+
+```python
+vehicle_fixed_cost: float = 0.0
+```
+
+In mapper:
+
+```python
+data.vehicle_fixed_cost = 50.0  # example, calibrate later
+```
+
+In the objective:
+
+```python
++ gp.quicksum(d.vehicle_fixed_cost * u[(v, t)] for v in V for t in T)
+```
+
+### 6.5 Priority
+**Medium to high**.
+
+---
+
+## Problem 5. Distance matrix is too synthetic and too uniform
+
+### 7.1 Current code
+The mapper creates synthetic distances:
+- `CW <-> store = 10`
+- `store <-> store = 6`
+
+### 7.2 Why this is a problem
+Such a flat distance matrix makes routing artificially easy:
+- many route structures become nearly equivalent,
+- solver runtime becomes misleadingly short,
+- route quality is not operationally informative.
+
+### 7.3 Required fix
+If possible, replace the synthetic matrix with:
+- real store coordinates,
+- geodesic distance,
+- or at least a more heterogeneous proxy matrix.
+
+For example, if coordinates exist:
+
+```python
+from math import radians, sin, cos, sqrt, atan2
+```
+
+Then compute pairwise distances and populate `data.distance[(i,j)]` accordingly.
+
+### 7.4 Priority
+**Medium** for code correctness, **high** for thesis realism.
+
+---
+
+## Problem 6. Arc-capacity is linked to `u[(v,t)]` instead of only route activation
+
+### 8.1 Current code
 The code uses:
-- `gnn_top_k = 5`
 
-But if pricing only generates 3 to 5 patterns in a given episode, the GNN effectively keeps all of them.
+```python
+gp.quicksum(q[(p, i, j, v, t)] for p in P) <= d.vehicle_capacity * u[(v, t)]
+```
 
-#### Why this is a problem
-In that case the GNN does score patterns, but it does not actually filter the set, so its online optimization effect becomes negligible.
+This is valid as an upper bound, but weak.
 
-#### Recommended fix
-When the candidate pool is still small, use a stricter GNN filter, for example:
-- `gnn_top_k = 2`
-- `gnn_top_k = 3`
+### 8.2 Why this is weak
+If vehicle `v` is activated, then every arc for that vehicle gets the same broad upper bound, even if a specific arc is not traversed.
 
-Also compare:
-- raw pricing output count
-- count after GNN selection
+A tighter formulation is:
 
-#### Expected benefit
-This helps reveal whether the GNN is materially changing the candidate pool.
+```python
+gp.quicksum(q[(p, i, j, v, t)] for p in P) <= d.vehicle_capacity * x[(i, j, v, t)]
+```
+
+The file already has product-level arc linking:
+
+```python
+q[(p, i, j, v, t)] <= d.vehicle_capacity * x[(i, j, v, t)]
+```
+
+but the aggregate form should also be tightened.
+
+### 8.3 Required fix
+Replace or supplement the current aggregate capacity constraint with:
+
+```python
+for i in N0:
+    for j in N0:
+        if i == j:
+            continue
+        for v in V:
+            for t in T:
+                mdl.addConstr(
+                    gp.quicksum(q[(p, i, j, v, t)] for p in P)
+                    <= d.vehicle_capacity * x[(i, j, v, t)]
+                )
+```
+
+### 8.4 Priority
+**Medium**.
 
 ---
 
-### 2.7 Reduced-cost acceptance is strict for a small-instance prototype
+## Problem 7. Route extraction assumes a clean single next-node structure
 
-#### Current behavior
-A pattern is only accepted if:
+### 9.1 Current code
+The extraction helper uses:
 
 ```python
-if flows and reduced_cost < rc_tol:
+next_map = {i: j for i, j in arcs}
+```
+
+### 9.2 Why this is risky
+If due to weak subtour elimination or formulation looseness a node has multiple outgoing arcs, this helper will silently overwrite keys and may produce misleading route reports.
+
+### 9.3 Required fix
+Strengthen route extraction by:
+- validating out-degree and in-degree per active vehicle-period,
+- warning if more than one outgoing arc exists from any node,
+- printing unresolved route fragments separately.
+
+### 9.4 Priority
+**Medium** for debugging, low for formulation itself.
+
+---
+
+## 4. Suggested code changes by priority
+
+## Priority 1 — must fix now
+
+### A. Introduce explicit delivery variables
+Add:
+
+```python
+deliv[(s,p,v,t)]
+```
+
+Use this instead of tying `Qdir` only to `q[(p,CW,s,v,t)]`.
+
+### B. Add vehicle load progression
+Add:
+
+```python
+load[(i,v,t)]
+```
+
+Track remaining truck load through the route.
+
+### C. Rebuild direct-delivery flow logic
+The vehicle should depart from CW with a load, then unload at stores along the route.
+
+---
+
+## Priority 2 — strongly recommended
+
+### D. Add subtour elimination
+Use MTZ first because it is easier to code.
+
+### E. Tighten arc-capacity constraints
+Use `x[(i,j,v,t)]` instead of only `u[(v,t)]` for tighter linking.
+
+### F. Add vehicle fixed cost
+This improves realism and helps avoid distorted consolidation patterns.
+
+---
+
+## Priority 3 — improve realism and debugging
+
+### G. Replace synthetic distances
+Use real or at least more heterogeneous distances.
+
+### H. Improve route extraction diagnostics
+Detect fragmented or ambiguous routes.
+
+### I. Add sanity-check reports after solve
+For each vehicle-period, export:
+- total load leaving CW,
+- total delivered quantity,
+- remaining load after each visited node,
+- degree in/out by node,
+- whether a clean cycle exists.
+
+---
+
+## 5. Recommended revised baseline architecture
+
+If you want the baseline to become a thesis-grade routing formulation, the clean structure should be:
+
+### Inventory variables
+- `I_s[(s,p,t)]`
+- `I_w[(p,t)]`
+- `B[(s,p,t)]`
+
+### Routing variables
+- `x[(i,j,v,t)]`
+- `u[(v,t)]`
+- optional `z[(i,v,t)]`
+- subtour/order variables if MTZ is used
+
+### Delivery variables
+- `deliv[(s,p,v,t)]`
+
+### Vehicle load variables
+- `load[(i,v,t)]`
+
+### LT variables
+If baseline is run without LT, keep LT shut off exactly as you already do:
+
+```python
+allow_lateral_transshipment=False
+```
+
+That part is fine for a pure baseline run.
+
+---
+
+## 6. Why the current solver runtime may look too fast
+
+The model may solve fast because of all of the following together:
+- synthetic and simple distances,
+- incomplete subtour handling,
+- no full delivery-on-route logic,
+- no full load-propagation structure,
+- continuous product flows by default.
+
+So fast runtime should **not** be interpreted as proof that the routing baseline is already correct.
+
+---
+
+## 7. Why vehicles often appear close to full capacity
+
+This can happen because:
+1. shortage cost encourages large replenishment;
+2. route cost is mostly distance-based, encouraging consolidation;
+3. no explicit fixed vehicle cost calibration exists yet;
+4. delivery logic is still simplified;
+5. truck load does not decrease along route in an explicitly modeled way.
+
+Therefore, the “full-capacity-looking” result is not enough to conclude the routing is correct.
+It may actually be a symptom that the current formulation is still too loose or too stylized.
+
+---
+
+## 8. Practical patch plan for your code
+
+## Patch block 1 — new variables
+Inside `AchamrahFullIRPTModel.solve(...)`, add:
+
+```python
+deliv_keys = [(s, p, v, t) for s in N for p in P for v in V for t in T]
+load_keys = [(i, v, t) for i in N0 for v in V for t in T]
+
+
+deliv = mdl.addVars(deliv_keys, lb=0.0, vtype=flow_vtype, name="deliv")
+load = mdl.addVars(load_keys, lb=0.0, ub=d.vehicle_capacity, vtype=flow_vtype, name="load")
+```
+
+---
+
+## Patch block 2 — redefine direct shipment
+Replace:
+
+```python
+mdl.addConstr(Qdir[(s, p, t)] == gp.quicksum(q[(p, CW, s, v, t)] for v in V))
 ```
 
 with:
-- `rc_tol = -1e-6`
-
-There is also pair-level filtering that can skip non-attractive pairs once the pattern already contains at least one flow.
-
-#### Why this is a problem
-In a small instance with fixed LT costs and small quantities, many patterns may fail to achieve sufficiently negative reduced cost.
-
-#### Recommended fix
-Keep the negative reduced-cost logic, but perform sensitivity tests on:
-- fixed LT cost
-- unit LT cost
-- activation threshold
-- pattern size limits
-- rc tolerance used only for diagnostics
-
-Also log the reduced cost of every candidate pattern before rejection.
-
-#### Expected benefit
-This reveals whether the issue is economic infeasibility or simply over-restrictive filtering.
-
----
-
-### 2.8 Selected-column history may be empty because pricing never produced enough usable patterns
-
-#### Current behavior
-`gnn_selection_history` is populated only if `_select_patterns_with_gnn()` receives non-empty priced patterns and runs successfully.
-
-#### Why this is a problem
-An empty selected-column file does not necessarily mean the GNN failed. It may simply mean:
-- no active product-period pairs,
-- no acceptable patterns built,
-- no negative reduced-cost columns,
-- or GNN loading/scoring was skipped.
-
-#### Recommended fix
-Log the following per episode:
-- number of active product-period pairs
-- number of candidate pairs before pruning
-- number after pruning
-- number accepted after Stackelberg
-- number of patterns built before GNN
-- number of patterns kept by GNN
-- number of truly new patterns added to the pool
-
-#### Expected benefit
-This makes the bottleneck visible and avoids ambiguous interpretation of an empty JSON output.
-
----
-
-## 3. Priority Ranking of Bottlenecks
-
-The issues should be prioritized in the following order:
-
-1. **Frozen need/surplus proxy across iterations**
-2. **Candidate pool too small due to threshold and pruning limits**
-3. **Pattern ID duplication across episodes**
-4. **Duplicate filtering rejecting nearly identical repeated patterns**
-5. **GNN top-k too loose relative to pool size**
-6. **Reduced-cost acceptance too strict for current small instance**
-
-This means the current flat CG behavior is not mainly a GNN problem. It is mostly a pricing-space and flow-design problem upstream of the GNN.
-
----
-
-## 4. Concrete Code Changes Recommended
-
-### 4.1 Update proxy state by iteration
-
-Revise `_build_need_and_surplus_proxies()` so it can take the current master solution as input.
-
-Suggested direction:
-- add an optional argument like `master_solution: Optional[CGSolution] = None`
-- if `master_solution` is provided, adjust store-level need/surplus using current selected LT effect
-- use this updated state inside `pricing_step()`
-
----
-
-### 4.2 Add episode-aware pattern IDs
-
-Add an episode counter in the CG engine, then pass it into `_build_patterns_from_pruned_pairs()`.
-
-Suggested pattern ID:
 
 ```python
-PRICED_E{episode}_{feature_name}_{product}_T{period}_{local_idx}
+mdl.addConstr(
+    Qdir[(s, p, t)] == gp.quicksum(deliv[(s, p, v, t)] for v in V)
+)
 ```
 
 ---
 
-### 4.3 Relax activation and diversity parameters for experiments
-
-Recommended test configuration for small instances:
+## Patch block 3 — vehicle initial load at depot
+Add:
 
 ```python
-lt_activation_threshold = 2.0 or 5.0
-top_pairs_per_feature = 20
-top_patterns_per_feature = 5
-max_pairs_per_pattern = 4
-gnn_top_k = 2 or 3
-n_initial_patterns_per_product_period = 5
-cg_iterations = 5
+for v in V:
+    for t in T:
+        mdl.addConstr(
+            load[(CW, v, t)] == gp.quicksum(deliv[(s, p, v, t)] for s in N for p in P)
+        )
+        mdl.addConstr(load[(CW, v, t)] <= d.vehicle_capacity * u[(v, t)])
 ```
 
-These are experimental settings for validation, not necessarily final production values.
+This is the simplest first version.
 
 ---
 
-### 4.4 Add detailed diagnostics export
+## Patch block 4 — load progression after each visited node
+For each traveled arc, propagate truck load after delivery.
 
-Create a new CSV such as `column_pool_diagnostics.csv` with fields like:
-
-- episode
-- product
-- period
-- feature_name
-- donor_store
-- receiver_store
-- qty_cap
-- reduced_cost_proxy
-- stackelberg_accepted
-- acceptance_score
-- compensation
-- pattern_id
-- pattern_reduced_cost
-- gnn_score
-- gnn_selected
-- duplicate_id_reject
-- duplicate_signature_reject
-- added_to_pool
-
-This file will be essential for validation and thesis presentation.
+This part needs careful coding with big-M and node visit logic. Start simple and debug on small instances.
 
 ---
 
-### 4.5 Add episode-level summary logging
-
-For each CG episode, record:
-
-- active product-period count
-- candidate pairs before pruning
-- pairs after pruning by feature
-- pairs accepted after Stackelberg
-- patterns built before GNN
-- patterns kept after GNN
-- patterns rejected as duplicates
-- patterns added to pool
-- selected patterns in RMP
-- objective value
-- improvement from previous episode
-
-This can be saved as `cg_episode_diagnostics.csv`.
+## Patch block 5 — MTZ constraints
+Add ordering variables and subtour elimination constraints.
 
 ---
 
-## 5. Suggested Experimental Validation Plan
+## Patch block 6 — objective update
+Add:
 
-After the code changes, compare at least the following settings:
-
-### Setting A — LT + CG without GNN
-Use the revised pricing pipeline but disable the GNN.
-
-### Setting B — LT + CG + GNN
-Use the revised pricing pipeline and enable BiGAT selection.
-
-### Setting C — LT + CG + simple heuristic ranking
-Use a simpler selector such as top reduced-cost patterns only.
-
-### Setting D — No LT baseline
-Use the original no-LT baseline model for reference.
-
-Compare:
-- total cost
-- number of CG episodes
-- number of proposed columns
-- number of added columns
-- number of selected patterns
-- runtime
-- inventory validation metrics
-
-This will make it possible to isolate the contribution of the GNN from the contribution of the LT-CG framework itself.
+```python
++ gp.quicksum(d.vehicle_fixed_cost * u[(v, t)] for v in V for t in T)
+```
 
 ---
 
-## 6. Interpretation for the Current Results
-
-Based on the current implementation, the flat total-cost curve and zero added columns are most likely explained by the following combination:
-
-- the pricing proxy is effectively frozen at the baseline no-LT state,
-- the active LT space is already small,
-- pruning and Stackelberg filtering shrink it further,
-- repeated pattern IDs and duplicate signatures block pattern growth,
-- and the GNN only scores a pool that is already too small and too similar.
-
-Therefore, the current results should not be interpreted as evidence that the GNN is ineffective. Instead, they indicate that the upstream pricing space is too constrained for the GNN to demonstrate meaningful impact.
+## Patch block 7 — diagnostic export
+After solving, export for each vehicle-period:
+- total route distance,
+- total delivered quantity,
+- total load leaving CW,
+- route sequence,
+- any degree violations,
+- any disconnected cycles detected.
 
 ---
 
-## 7. Immediate Next Steps
+## 9. Best interpretation for thesis writing
 
-The next revision should do these first:
+If you describe the current code in the thesis, the most accurate statement is:
 
-1. Make pattern IDs unique across episodes.
-2. Add rejection-reason diagnostics in `add_patterns()`.
-3. Lower the LT activation threshold for small-instance tests.
-4. Increase candidate diversity before the GNN stage.
-5. Reduce `gnn_top_k` so the GNN actually filters.
-6. Update need/surplus proxies using the current master solution rather than only the initial baseline.
-7. Export detailed diagnostics at pair-level and pattern-level.
+> The current baseline already integrates inventory balance with a vehicle-routing skeleton, including depot departure, arc decisions, and vehicle-capacity linkage. However, it does not yet represent a fully detailed multi-stop delivery routing model because direct deliveries are still tied to depot-to-store arcs, explicit truck load propagation is absent, and complete subtour elimination is not yet enforced.
 
-If these changes are implemented, the next run will make it much easier to identify whether the remaining bottleneck is in pricing, Stackelberg filtering, duplicate suppression, or the GNN ranking itself.
+That wording is accurate and defensible.
 
 ---
 
-## 8. Final Conclusion
+## 10. Recommended next action
 
-The main issue in the current code is not that the BiGAT GNN is fundamentally wrong. The main issue is that the column-generation flow becomes too restricted before the GNN can meaningfully influence the search.
+The best next coding step is:
 
-In other words:
+1. fix direct delivery logic;
+2. add truck load progression;
+3. add MTZ subtour elimination;
+4. then validate again on a very small instance and inspect routes manually.
 
-- the GNN is downstream,
-- but the pricing space is already too narrow upstream.
-
-So the next development focus should be on reopening and instrumenting the pricing pipeline first, then reevaluating the GNN contribution under a healthier candidate-generation process.
-
+Only after these are stable should you treat the baseline as a true routing baseline for comparison with LT / CG / GNN layers.

@@ -1,0 +1,25 @@
+# IRP/IRPT Thesis Prototype Dependencies
+# ========================================
+
+# Core Data Processing & Analysis
+pandas>=1.3.0
+numpy>=1.21.0
+scipy>=1.7.0
+openpyxl>=3.6.0
+
+# Optimization Solver
+gurobipy>=10.0.0
+
+# Deep Learning (for GNN models)
+torch>=1.9.0
+torchvision>=0.10.0
+
+# Visualization
+matplotlib>=3.4.0
+
+# Optional: Machine Learning utilities
+scikit-learn>=0.24.0
+
+# Note: Gurobi requires a license. Install with:
+# pip install gurobipy
+# Then activate license with: gurobi.sh
