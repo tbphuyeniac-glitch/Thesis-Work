@@ -13,12 +13,18 @@ gurobipy>=10.0.0
 # Deep Learning (for GNN models)
 torch>=1.9.0
 torchvision>=0.10.0
+tensorflow>=2.8.0
 
 # Visualization
 matplotlib>=3.4.0
 
 # Optional: Machine Learning utilities
 scikit-learn>=0.24.0
+pyltr>=0.2.6
+
+# Optional competitor model dependency:
+# svmrank is imported by GNN/03_train_competitor.py when using --model svmrank,
+# but installation is platform-specific and may not be available from PyPI.
 
 # Note: Gurobi requires a license. Install with:
 # pip install gurobipy
