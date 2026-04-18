@@ -1202,20 +1202,34 @@ def format_pattern_detail(pat):
 
 def apply_hidden_local_reallocation_demand_shocks(
     data: IRPData,
+    baseline_solution: Optional[FullIRPTSolution] = None,
     shock_probability: float = 0.5,
     max_reallocation_fraction: float = 0.35,
+    reallocations_per_product_period: int = 3,
+    non_dispatch_shock_multiplier: float = 1.8,
+    cw_dispatch_cycle: Optional[int] = 5,
     seed: int = 20260418,
 ) -> Dict[str, Any]:
     rng = random.Random(seed)
     shock_probability = min(1.0, max(0.0, float(shock_probability)))
     max_reallocation_fraction = min(1.0, max(0.0, float(max_reallocation_fraction)))
+    reallocations_per_product_period = max(1, int(reallocations_per_product_period))
+    non_dispatch_shock_multiplier = max(1.0, float(non_dispatch_shock_multiplier))
     data.realized_demand = {key: float(value) for key, value in data.demand.items()}
 
     n_shocked = 0
+    shocked_product_periods: Set[Tuple[Product, Period]] = set()
     total_reallocated = 0.0
+    first_t = min(data.periods) if data.periods else 0
+    cycle = int(cw_dispatch_cycle) if cw_dispatch_cycle is not None else 0
     for p in data.products:
         for t in data.periods:
-            if rng.random() > shock_probability:
+            is_dispatch_period = True
+            if cycle > 1:
+                is_dispatch_period = ((t - first_t) % cycle == 0)
+            period_multiplier = 1.0 if is_dispatch_period else non_dispatch_shock_multiplier
+            effective_probability = min(1.0, shock_probability * period_multiplier)
+            if rng.random() > effective_probability:
                 continue
             candidates = [
                 s for s in data.stores
@@ -1224,29 +1238,55 @@ def apply_hidden_local_reallocation_demand_shocks(
             if len(candidates) < 2:
                 continue
 
-            receiver = rng.choice(candidates)
-            donor_candidates = [s for s in candidates if s != receiver]
-            donor = max(donor_candidates, key=lambda s: float(data.demand.get((s, p, t), 0.0)))
-            receiver_forecast = float(data.demand.get((receiver, p, t), 0.0))
-            donor_forecast = float(data.demand.get((donor, p, t), 0.0))
-            delta = min(
-                max_reallocation_fraction * max(receiver_forecast, 1.0),
-                max_reallocation_fraction * donor_forecast,
-            )
-            if delta <= 1e-9:
-                continue
+            for _ in range(reallocations_per_product_period):
+                def receiver_score(store: Store) -> float:
+                    forecast = float(data.demand.get((store, p, t), 0.0))
+                    if baseline_solution is None:
+                        return forecast
+                    ending_inv = float(baseline_solution.inv_store.get((store, p, t), 0.0))
+                    shortage = float(baseline_solution.shortage.get((store, p, t), 0.0))
+                    fragility = shortage + max(0.0, forecast - ending_inv)
+                    return fragility * period_multiplier + 0.01 * forecast
 
-            data.realized_demand[(receiver, p, t)] = data.realized_demand.get((receiver, p, t), 0.0) + delta
-            data.realized_demand[(donor, p, t)] = max(0.0, data.realized_demand.get((donor, p, t), 0.0) - delta)
-            n_shocked += 1
-            total_reallocated += delta
+                receiver = max(candidates, key=receiver_score)
+                donor_candidates = [s for s in candidates if s != receiver]
+                if not donor_candidates:
+                    continue
+
+                def donor_score(store: Store) -> float:
+                    realized = float(data.realized_demand.get((store, p, t), 0.0))
+                    if baseline_solution is None:
+                        return realized
+                    ending_inv = float(baseline_solution.inv_store.get((store, p, t), 0.0))
+                    shortage = float(baseline_solution.shortage.get((store, p, t), 0.0))
+                    return ending_inv - shortage + 0.01 * realized
+
+                donor = max(donor_candidates, key=donor_score)
+                receiver_forecast = float(data.demand.get((receiver, p, t), 0.0))
+                donor_realized = float(data.realized_demand.get((donor, p, t), 0.0))
+                delta = min(
+                    period_multiplier * max_reallocation_fraction * max(receiver_forecast, 1.0),
+                    max_reallocation_fraction * donor_realized,
+                )
+                if delta <= 1e-9:
+                    continue
+
+                data.realized_demand[(receiver, p, t)] = data.realized_demand.get((receiver, p, t), 0.0) + delta
+                data.realized_demand[(donor, p, t)] = max(0.0, donor_realized - delta)
+                n_shocked += 1
+                shocked_product_periods.add((p, t))
+                total_reallocated += delta
 
     return {
         "shock_model": "hidden_local_reallocation",
         "shock_probability": shock_probability,
         "max_reallocation_fraction": max_reallocation_fraction,
+        "reallocations_per_product_period": reallocations_per_product_period,
+        "non_dispatch_shock_multiplier": non_dispatch_shock_multiplier,
+        "cw_dispatch_cycle": cw_dispatch_cycle,
         "shock_seed": seed,
         "n_store_sku_period_reallocations": n_shocked,
+        "n_shocked_product_periods": len(shocked_product_periods),
         "total_reallocated_units": round(total_reallocated, 6),
     }
 
@@ -1283,6 +1323,28 @@ def build_post_shock_inventory_state(
         "total_realized_demand": round(total_realized_demand, 6),
         "total_post_shock_shortage": round(total_shortage, 6),
         "total_post_shock_inventory": round(sum(data.post_shock_inventory.values()), 6),
+    }
+
+
+def build_post_shock_lt_diagnostics(
+    data: IRPData,
+    baseline_solution: FullIRPTSolution,
+    lt_activation_threshold: float = 0.0,
+) -> Dict[str, Any]:
+    cg = LateralTransshipmentCG(
+        data=data,
+        baseline_solution=baseline_solution,
+        initial_patterns=None,
+        lt_activation_threshold=lt_activation_threshold,
+    )
+    need, surplus = cg._build_need_and_surplus_proxies()
+    active_product_periods = cg._compute_active_product_periods(need, surplus)
+    return {
+        "n_active_product_periods_after_shock": len(active_product_periods),
+        "total_need_after_shock": round(sum(need.values()), 6),
+        "total_surplus_after_shock": round(sum(surplus.values()), 6),
+        "max_need_after_shock": round(max(need.values()) if need else 0.0, 6),
+        "max_surplus_after_shock": round(max(surplus.values()) if surplus else 0.0, 6),
     }
 
 
@@ -3139,6 +3201,25 @@ def build_demand_fulfillment_df(data: IRPData, solution: FullIRPTSolution) -> pd
     return pd.DataFrame(rows)
 
 
+def build_post_shock_fulfillment_df(data: IRPData) -> pd.DataFrame:
+    rows = []
+    for s in data.stores:
+        for t in data.periods:
+            total_demand = sum(float(data.realized_demand.get((s, p, t), 0.0)) for p in data.products)
+            total_shortage = sum(float(data.post_shock_shortage.get((s, p, t), 0.0)) for p in data.products)
+            fulfilled_demand = max(0.0, total_demand - total_shortage)
+            fulfillment_rate = fulfilled_demand / total_demand if total_demand > 1e-9 else 1.0
+            rows.append({
+                "store": s,
+                "period": t,
+                "total_realized_demand": round(total_demand, 6),
+                "fulfilled_demand": round(fulfilled_demand, 6),
+                "post_shock_shortage": round(total_shortage, 6),
+                "post_shock_fulfillment_rate": round(fulfillment_rate, 6),
+            })
+    return pd.DataFrame(rows)
+
+
 def print_demand_fulfillment(fulfillment_df: pd.DataFrame) -> None:
     print("\n[Demand Fulfillment Rate By Store-Period]")
     if fulfillment_df.empty:
@@ -3151,6 +3232,21 @@ def print_demand_fulfillment(fulfillment_df: pd.DataFrame) -> None:
             f"| fulfilled={row['fulfilled_demand']:.6f} "
             f"| shortage={row['shortage']:.6f} "
             f"| fulfillment_rate={row['demand_fulfillment_rate']:.2%}"
+        )
+
+
+def print_post_shock_fulfillment(fulfillment_df: pd.DataFrame) -> None:
+    print("\n[Post-Shock Demand Fulfillment Rate By Store-Period]")
+    if fulfillment_df.empty:
+        print("  No post-shock demand fulfillment rows available.")
+        return
+    for _, row in fulfillment_df.sort_values(["period", "store"]).iterrows():
+        print(
+            f"  period={row['period']} | store={row['store']} "
+            f"| realized_demand={row['total_realized_demand']:.6f} "
+            f"| fulfilled={row['fulfilled_demand']:.6f} "
+            f"| post_shock_shortage={row['post_shock_shortage']:.6f} "
+            f"| fulfillment_rate={row['post_shock_fulfillment_rate']:.2%}"
         )
 
 
@@ -3633,8 +3729,10 @@ class IRPResearchPipeline:
         bp_max_nodes: int = 15,
         bp_max_depth: int = 6,
         lt_activation_threshold: float = 0.0,
-        demand_shock_probability: float = 0.5,
-        demand_shock_reallocation_fraction: float = 0.35,
+        demand_shock_probability: float = 0.85,
+        demand_shock_reallocation_fraction: float = 0.60,
+        demand_shock_reallocations_per_product_period: int = 3,
+        demand_shock_non_dispatch_multiplier: float = 1.8,
         demand_shock_seed: int = 20260418,
     ) -> Dict:
         pipeline_started_at = time.perf_counter()
@@ -3654,23 +3752,34 @@ class IRPResearchPipeline:
         baseline_cost_breakdown = build_full_irpt_cost_breakdown(self.data, baseline_sol)
         print_cost_breakdown("Baseline Full IRPT Cost Breakdown", baseline_cost_breakdown)
         baseline_routes = extract_routes_from_solution(baseline_sol, warehouse=self.data.warehouse)
-        demand_fulfillment_df = build_demand_fulfillment_df(self.data, baseline_sol)
-        print_demand_fulfillment(demand_fulfillment_df)
 
         print("\n" + "=" * 80)
         print("STEP 1B - Apply hidden realized-demand shock after DC shipment")
         print("=" * 80)
         shock_summary = apply_hidden_local_reallocation_demand_shocks(
             self.data,
+            baseline_solution=baseline_sol,
             shock_probability=demand_shock_probability,
             max_reallocation_fraction=demand_shock_reallocation_fraction,
+            reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+            non_dispatch_shock_multiplier=demand_shock_non_dispatch_multiplier,
+            cw_dispatch_cycle=cw_dispatch_cycle,
             seed=demand_shock_seed,
         )
         post_shock_summary = build_post_shock_inventory_state(self.data, baseline_sol)
+        post_shock_lt_diagnostics = build_post_shock_lt_diagnostics(
+            self.data,
+            baseline_sol,
+            lt_activation_threshold=lt_activation_threshold,
+        )
+        demand_fulfillment_df = build_post_shock_fulfillment_df(self.data)
         print("[Hidden Demand Shock Summary]")
         pprint.pprint(shock_summary)
         print("[Post-Shock Inventory State Summary]")
         pprint.pprint(post_shock_summary)
+        print("[Post-Shock LT Diagnostics]")
+        pprint.pprint(post_shock_lt_diagnostics)
+        print_post_shock_fulfillment(demand_fulfillment_df)
 
         initial_patterns = []
         if use_random_initial_patterns:
@@ -3795,6 +3904,7 @@ class IRPResearchPipeline:
             "realized_with_lt_cost_breakdown": realized_with_lt_cost_breakdown,
             "demand_shock_summary": shock_summary,
             "post_shock_summary": post_shock_summary,
+            "post_shock_lt_diagnostics": post_shock_lt_diagnostics,
             "cg_solution": cg_sol,
             "lt_plan": lt_plan_df,
             "comparison": comparison,
@@ -3856,8 +3966,10 @@ if __name__ == "__main__":
     train_gnn_after_teacher = os.environ.get("IRP_TRAIN_GNN_AFTER_TEACHER", "1").lower() not in {"0", "false", "no"}
     gnn_train_epochs = int(os.environ.get("IRP_GNN_TRAIN_EPOCHS", "5"))
     lt_activation_threshold = float(os.environ.get("IRP_LT_ACTIVATION_THRESHOLD", "0.0"))
-    demand_shock_probability = float(os.environ.get("IRP_DEMAND_SHOCK_PROBABILITY", "0.5"))
-    demand_shock_reallocation_fraction = float(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATION_FRACTION", "0.35"))
+    demand_shock_probability = float(os.environ.get("IRP_DEMAND_SHOCK_PROBABILITY", "0.85"))
+    demand_shock_reallocation_fraction = float(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATION_FRACTION", "0.60"))
+    demand_shock_reallocations_per_product_period = int(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD", "3"))
+    demand_shock_non_dispatch_multiplier = float(os.environ.get("IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER", "1.8"))
     demand_shock_seed = int(os.environ.get("IRP_DEMAND_SHOCK_SEED", "20260418"))
 
     env_time_limit = os.environ.get("IRP_TIME_LIMIT")
@@ -3883,6 +3995,8 @@ if __name__ == "__main__":
         lt_activation_threshold=lt_activation_threshold,
         demand_shock_probability=demand_shock_probability,
         demand_shock_reallocation_fraction=demand_shock_reallocation_fraction,
+        demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+        demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
         demand_shock_seed=demand_shock_seed,
     )
 
@@ -3910,7 +4024,7 @@ if __name__ == "__main__":
 
     fulfillment_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_demand_fulfillment.csv"
     results["demand_fulfillment"].to_csv(fulfillment_path, index=False)
-    print(f"Saved demand fulfillment rates to: {fulfillment_path}")
+    print(f"Saved post-shock demand fulfillment rates to: {fulfillment_path}")
 
     solver_metrics_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_solver_efficiency_metrics.csv"
     pd.DataFrame([
@@ -3931,7 +4045,11 @@ if __name__ == "__main__":
     print(f"Saved realized operating cost breakdown to: {realized_cost_breakdown_path}")
 
     demand_shock_summary_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_hidden_demand_shock_summary.csv"
-    pd.DataFrame([{**results["demand_shock_summary"], **results["post_shock_summary"]}]).to_csv(demand_shock_summary_path, index=False)
+    pd.DataFrame([{
+        **results["demand_shock_summary"],
+        **results["post_shock_summary"],
+        **results["post_shock_lt_diagnostics"],
+    }]).to_csv(demand_shock_summary_path, index=False)
     print(f"Saved hidden demand shock summary to: {demand_shock_summary_path}")
 
     lt_plan_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_lt_plan.csv"
