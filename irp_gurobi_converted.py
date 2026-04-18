@@ -138,6 +138,7 @@ def _safe_var_value(model: gp.Model, var: gp.Var) -> float:
 
 
 DEFAULT_GNN_CHECKPOINT = "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt"
+RESULTS_DIR = Path(__file__).resolve().parent / "Results"
 
 
 def _project_path(path: str) -> Path:
@@ -4094,9 +4095,8 @@ if __name__ == "__main__":
                 train_epochs=gnn_train_epochs,
             )
             refreshed_history = load_gnn_training_history(DEFAULT_GNN_CHECKPOINT)
-            if refreshed_history:
-                pd.DataFrame(refreshed_history).to_csv(gnn_training_history_path, index=False)
-                print(f"Refreshed GNN training loss history after teacher update: {gnn_training_history_path}")
+            pd.DataFrame(refreshed_history).to_csv(f"{RESULTS_DIR}/irp_gnn_training_history.csv", index=False)
+            print("Refreshed GNN history rows:", len(refreshed_history))
 
     cg_cost_chart_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_cg_total_cost_curve.png"
     saved_chart = save_cg_cost_curve(results["cg_episode_history"], cg_cost_chart_path)
