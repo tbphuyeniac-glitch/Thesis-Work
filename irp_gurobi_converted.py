@@ -4749,8 +4749,8 @@ if __name__ == "__main__":
     data, base_df, validation_target, meta = mapper.build_irp_data(
         wh_inventory_multiplier=0.8,
         store_capacity_multiplier=1.2,
-        shortage_cost_rate=0.25,
-        holding_cost_rate=0.01,
+        shortage_cost_rate=0.05,
+        holding_cost_rate=100,
         cw_ship_cost_flat=1.0,
         lt_ship_cost_flat=0.6,
         fixed_dispatch_cw=8.0,
