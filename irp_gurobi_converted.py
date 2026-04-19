@@ -3797,7 +3797,13 @@ class LateralTransshipmentCG:
                     "selected_patterns": len(best_sol.selected_patterns),
                 })
                 self.cg_episode_diagnostics.append(episode_summary)
-                print("[CG] No negative reduced-cost columns found. Stop.")
+                if new_patterns:
+                    print(
+                        f"[CG] {len(new_patterns)} negative-RC column(s) priced but all already in pool "
+                        f"(degenerate cycling). Stop."
+                    )
+                else:
+                    print("[CG] No negative reduced-cost columns found. LP optimal. Stop.")
                 self._print_cg_episode_history()
                 return best_sol
 
@@ -3831,6 +3837,7 @@ class LateralTransshipmentCG:
                     print("  " + format_pattern_detail(pat) + f" | lambda={sol.lambda_values[pat_id]:.4f}")
 
             if improvement <= improvement_tol:
+                print(f"[CG] Improvement {improvement:.2e} <= tol {improvement_tol:.2e}. Converged.")
                 self._print_cg_episode_history()
                 sol.efficiency_metrics = dict(rmp_metrics_total)
                 return sol
