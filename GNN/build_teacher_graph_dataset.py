@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import shutil
@@ -14,10 +15,18 @@ from typing import Any, Dict, Iterable, List, Tuple
 import utilities
 
 
-def group_key(row: Dict[str, Any]) -> Tuple[str, str]:
+GroupKey = Tuple[str, str, str, str, str, str]
+
+
+def group_key(row: Dict[str, Any]) -> GroupKey:
     source_instance = str(row.get("source_instance") or row.get("instance_id") or "default")
+    branch_node = str(row.get("branch_node_id") or row.get("node_id") or "root")
     episode = str(row.get("episode") or row.get("episode_id") or "0")
-    return source_instance, episode
+    product = str(row.get("product") or row.get("sku") or "unknown_product")
+    period = str(row.get("period") or row.get("time_period") or "unknown_period")
+    constraint_json = str(row.get("constraint_features_json") or "")
+    constraint_state = hashlib.sha1(constraint_json.encode("utf-8")).hexdigest()[:12] if constraint_json else "no_constraints"
+    return source_instance, branch_node, episode, product, period, constraint_state
 
 
 def read_teacher_rows(path: Path) -> List[Dict[str, Any]]:
@@ -26,11 +35,11 @@ def read_teacher_rows(path: Path) -> List[Dict[str, Any]]:
 
 
 def split_groups(
-    keys: List[Tuple[str, str]],
+    keys: List[GroupKey],
     train_ratio: float,
     valid_ratio: float,
     rng: random.Random,
-) -> Dict[str, List[Tuple[str, str]]]:
+) -> Dict[str, List[GroupKey]]:
     shuffled = list(keys)
     rng.shuffle(shuffled)
     n = len(shuffled)
@@ -50,8 +59,8 @@ def split_groups(
 
 
 def write_samples(
-    grouped_rows: Dict[Tuple[str, str], List[Dict[str, Any]]],
-    split_keys: Iterable[Tuple[str, str]],
+    grouped_rows: Dict[GroupKey, List[Dict[str, Any]]],
+    split_keys: Iterable[GroupKey],
     split_dir: Path,
 ) -> Tuple[int, List[str], Dict[str, Any]]:
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -61,15 +70,22 @@ def write_samples(
     n_positive: List[int] = []
     adaptive_k_values: List[float] = []
     for key in split_keys:
-        source_instance, episode = key
+        source_instance, branch_node, episode, product, period, constraint_state = key
         try:
             sample = utilities.build_training_sample_from_exported_teacher_rows(
                 grouped_rows[key],
                 episode_id=episode,
                 source_instance=source_instance,
+                product=product,
+                period=period,
+                branch_node_id=branch_node,
+                decision_state_id=constraint_state,
             )
         except Exception as exc:
-            skipped.append(f"{source_instance}/episode={episode}: {exc}")
+            skipped.append(
+                f"{source_instance}/branch={branch_node}/episode={episode}/"
+                f"product={product}/period={period}/state={constraint_state}: {exc}"
+            )
             continue
         written += 1
         n_columns.append(int(sample["column_features"].shape[0]))
@@ -121,7 +137,7 @@ def main() -> None:
             f"No teacher rows found in {teacher_csv}. Run the CG pipeline first so it exports rich teacher rows."
         )
 
-    grouped_rows: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    grouped_rows: Dict[GroupKey, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped_rows[group_key(row)].append(row)
 
@@ -142,6 +158,7 @@ def main() -> None:
         "out_dir": str(out_dir),
         "n_raw_rows": len(rows),
         "n_groups": len(grouped_rows),
+        "group_key_fields": ["source_instance", "branch_node_id", "episode", "product", "period", "constraint_state_hash"],
         "splits": {},
         "skipped_groups": [],
     }

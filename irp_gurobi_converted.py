@@ -179,6 +179,8 @@ def run_teacher_graph_and_gnn_training(
     build_graphs: bool = True,
     train_gnn: bool = True,
     train_epochs: int = 5,
+    resume_checkpoint: bool = False,
+    checkpoint_path: str = DEFAULT_GNN_CHECKPOINT,
 ) -> None:
     teacher_csv = _project_path(teacher_csv_path)
     if not teacher_csv.exists() or teacher_csv.stat().st_size <= 1:
@@ -214,8 +216,8 @@ def run_teacher_graph_and_gnn_training(
             "--objective",
             "pairwise_rank",
         ]
-        checkpoint = _project_path(DEFAULT_GNN_CHECKPOINT)
-        if checkpoint.exists():
+        checkpoint = _project_path(checkpoint_path)
+        if resume_checkpoint and checkpoint.exists():
             cmd.extend(["--resume-checkpoint", str(checkpoint)])
         print("\n[Teacher BiGAT Training Update]")
         subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent), check=True)
@@ -3929,10 +3931,10 @@ if __name__ == "__main__":
     mapper = DatasetToIRPValidationMapper(
         excel_path=EXCEL_PATH,
         sheet_name="Sheet1",
-        store_limit=5,
-        sku_limit=1,
-        start_date="2025-08-01",
-        end_date="2025-08-15",
+        store_limit=7,
+        sku_limit=3,
+        start_date="None",
+        end_date="None",
     )
 
     data, base_df, validation_target, meta = mapper.build_irp_data(
@@ -3972,6 +3974,8 @@ if __name__ == "__main__":
     demand_shock_reallocations_per_product_period = int(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD", "3"))
     demand_shock_non_dispatch_multiplier = float(os.environ.get("IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER", "1.8"))
     demand_shock_seed = int(os.environ.get("IRP_DEMAND_SHOCK_SEED", "20260418"))
+    resume_gnn_checkpoint = os.environ.get("IRP_RESUME_GNN_CHECKPOINT", "0").lower() not in {"0", "false", "no"}
+    gnn_checkpoint_path = os.environ.get("IRP_GNN_CHECKPOINT", DEFAULT_GNN_CHECKPOINT)
 
     env_time_limit = os.environ.get("IRP_TIME_LIMIT")
 
@@ -3985,7 +3989,7 @@ if __name__ == "__main__":
         use_gnn=runtime_gnn_mode,
         collect_teacher_mode=collect_teacher_mode,
         runtime_gnn_mode=runtime_gnn_mode,
-        gnn_checkpoint=DEFAULT_GNN_CHECKPOINT,
+        gnn_checkpoint=gnn_checkpoint_path,
         use_classical_fallback=False,
         gnn_mass_threshold=0.55,
         gnn_max_keep=150,
@@ -4093,8 +4097,10 @@ if __name__ == "__main__":
                 build_graphs=build_teacher_graphs,
                 train_gnn=train_gnn_after_teacher,
                 train_epochs=gnn_train_epochs,
+                resume_checkpoint=resume_gnn_checkpoint,
+                checkpoint_path=gnn_checkpoint_path,
             )
-            refreshed_history = load_gnn_training_history(DEFAULT_GNN_CHECKPOINT)
+            refreshed_history = load_gnn_training_history(gnn_checkpoint_path)
             pd.DataFrame(refreshed_history).to_csv(f"{RESULTS_DIR}/irp_gnn_training_history.csv", index=False)
             print("Refreshed GNN history rows:", len(refreshed_history))
 

@@ -457,6 +457,10 @@ def build_training_sample_from_exported_teacher_rows(
     teacher_rows: Sequence[Dict[str, Any]],
     episode_id: int | str | None = None,
     source_instance: str | None = None,
+    product: str | None = None,
+    period: int | str | None = None,
+    branch_node_id: int | str | None = None,
+    decision_state_id: str | None = None,
 ) -> Dict[str, Any]:
     """Build a graph sample from rich CG teacher rows exported to CSV.
 
@@ -540,6 +544,10 @@ def build_training_sample_from_exported_teacher_rows(
             "label_source": "teacher_rmp",
             "episode_id": episode_id,
             "source_instance": source_instance,
+            "product": product,
+            "period": period,
+            "branch_node_id": branch_node_id,
+            "decision_state_id": decision_state_id,
             "n_teacher_rows": len(rows),
             "n_selected_columns": int(sum(1 for value in labels if value > 0.5)),
             "columns": metadata_columns,
@@ -694,6 +702,12 @@ def topk_accuracy(scores: torch.Tensor, labels: torch.Tensor, ks: Iterable[int] 
 
 
 def binary_metrics(scores: torch.Tensor, labels: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
+    """Secondary threshold metrics for classification-style diagnostics.
+
+    Pairwise ranking runs should primarily use ranking metrics such as MRR,
+    mean positive rank, and top-k hits; these binary metrics remain useful as
+    auxiliary checks but depend on the arbitrary sigmoid threshold.
+    """
     probs = torch.sigmoid(scores)
     preds = probs >= threshold
     gold = labels > 0.5

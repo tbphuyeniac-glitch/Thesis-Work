@@ -1,640 +1,477 @@
-# Baseline Routing Code Review and Improvement Plan
+# Thesis-Work code fix plan for GNN + teacher pipeline
 
-## File reviewed
-`irp_gurobi_converted.py`
-
-This note focuses only on the **baseline model** currently implemented in:
-- `AchamrahFullIRPTModel.solve(...)`
-
-The goal is to answer one practical question:
-
-> Is the current baseline already a fully correct routing model, and if not, what should be fixed in code?
+## Mục tiêu của file này
+File này tổng hợp các lỗi/chỗ yếu chính trong pipeline hiện tại và chỉ ra:
+1. **File nào cần sửa**
+2. **Vấn đề hiện tại là gì**
+3. **Vì sao nó làm kết quả train bị méo / khó đọc**
+4. **Nên sửa theo hướng nào**
+5. **Thứ tự ưu tiên sửa**
 
 ---
 
-## 1. Final conclusion
+# 1) Kết luận tổng quan
 
-The current baseline is **not yet a fully completed routing model**.
+## 1.1. Solver baseline
+- Baseline phía Gurobi **không có dấu hiệu hỏng hoàn toàn**.
+- Phần đáng lo hơn nằm ở **teacher dataset -> graph dataset -> GNN training/evaluation**.
 
-It already contains some routing elements:
-- depot/CW,
-- vehicles,
-- binary route arcs,
-- vehicle usage variables,
-- arc-capacity linking,
-- route extraction,
-- store and warehouse inventory balance.
+## 1.2. Vấn đề chính hiện tại
+Hiện tại pipeline GNN có 4 điểm yếu lớn:
 
-However, it is still better described as a **routing-flavored network-flow IRPT prototype** rather than a fully correct multi-stop delivery routing model.
+### (A) Graph grouping quá thô
+- Nhiều teacher rows bị gom thành quá ít graph samples.
+- Hậu quả: train/valid/test sample cực ít, metrics không đáng tin.
 
-The main weaknesses are:
-1. **direct delivery is tied only to arc `CW -> store`**, so multi-stop delivery is not modeled correctly;
-2. **vehicle load progression along the route is missing**;
-3. **subtour elimination is incomplete**;
-4. **vehicle usage cost is not explicitly charged in the objective**;
-5. **synthetic distance matrix is too simple**, so routes may look artificially easy and solver runtime becomes misleadingly fast.
+### (B) Auto-resume checkpoint
+- Training đang dễ tự động resume model cũ.
+- Nhưng history, best_valid, epoch, optimizer state lại không resume sạch.
+- Hậu quả: history khó hiểu, khó biết model thật sự học gì ở run mới.
 
----
+### (C) Metric đánh giá chưa khớp objective
+- Bạn đang train chủ yếu theo `pairwise_rank`.
+- Nhưng lại đọc thêm F1 theo threshold 0.5 kiểu classification.
+- Hậu quả: có thể xuất hiện tình trạng top1/MRR đẹp nhưng F1 rất xấu.
 
-## 2. What the current code already does correctly
-
-### 2.1 Depot and vehicles exist
-The baseline defines:
-- `CW` as the warehouse/depot,
-- `V` as the vehicle set,
-- `x[(i,j,v,t)]` as binary route decisions,
-- `u[(v,t)]` as vehicle activation,
-- `z[(i,v,t)]` as node-visit indicators.
-
-This means the model is **not** a pure inventory-only model. It does contain a route skeleton.
-
-### 2.2 Vehicle capacity is partially enforced
-The code already includes:
-
-```python
-mdl.addConstr(gp.quicksum(q[(p, i, j, v, t)] for p in P) <= d.vehicle_capacity * u[(v, t)])
-```
-
-and also:
-
-```python
-mdl.addConstr(q[(p, i, j, v, t)] <= d.vehicle_capacity * x[(i, j, v, t)])
-```
-
-So the model does consider capacity, but only as an **arc-level carrying bound**, not as a true load evolution throughout the route.
-
-### 2.3 Route start from CW is enforced
-The code has:
-
-```python
-mdl.addConstr(gp.quicksum(x[(CW, j, v, t)] for j in N) == u[(v, t)])
-```
-
-So if a vehicle is active, it must leave the warehouse exactly once.
-
-### 2.4 Flow conservation at stores exists
-For each store `j`, vehicle `v`, period `t`, the code enforces:
-
-```python
-gp.quicksum(x[(i, j, v, t)] for i in N0 if i != j)
-==
-gp.quicksum(x[(j, i, v, t)] for i in N0 if i != j)
-```
-
-This gives in-flow = out-flow at each visited store.
+### (D) Teacher label còn khá nhị phân
+- Label hiện tại thiên về `selected_in_rmp`.
+- Điều này hợp lệ, nhưng còn nghèo thông tin cho ranking learning.
 
 ---
 
-## 3. Main modeling problems and required fixes
+# 2) File cần sửa và lý do
+
+## 2.1. `GNN/build_teacher_graph_dataset.py`
+
+### Vấn đề hiện tại
+Hàm `group_key(...)` đang group teacher rows chỉ theo:
+- `source_instance`
+- `episode`
+
+Điều này quá thô.
+
+Nếu một run có:
+- 1 source_instance
+- 5 episode
+
+thì dù teacher CSV có hàng trăm rows, sau cùng bạn vẫn chỉ có khoảng 5 graph groups.
+
+### Hậu quả
+- `teacher rows` có thể nhiều
+- nhưng `n_groups` vẫn rất thấp
+- train sample cực ít
+- valid sample cực ít
+- test sample có thể bằng 0
+
+Đây là nguyên nhân rất mạnh giải thích hiện tượng kiểu:
+- 672 rows
+- chỉ còn 5 graph groups
+
+### Nên sửa như thế nào
+Bạn cần đổi cách group để mỗi graph sample phản ánh đúng **một decision state có ý nghĩa cho GNN**.
+
+## Gợi ý group key tốt hơn
+Ưu tiên:
+- `source_instance`
+- `episode`
+- `product`
+- `period`
+
+Ví dụ:
+```python
+def group_key(row):
+    source_instance = str(row.get("source_instance") or row.get("instance_id") or "default")
+    episode = str(row.get("episode") or row.get("episode_id") or "0")
+    product = str(row.get("product") or row.get("sku") or "unknown_product")
+    period = str(row.get("period") or row.get("time_period") or "unknown_period")
+    return source_instance, episode, product, period
+```
+
+### Lợi ích
+- Một episode có thể tách thành nhiều graph samples
+- số group tăng mạnh
+- dataset hữu ích hơn cho train/valid/test
+
+### Lưu ý
+Chỉ thêm `product`, `period` nếu teacher CSV thật sự có các field đó và chúng phản ánh đúng một pricing/RMP state.
+Nếu sau này bạn có field tốt hơn như:
+- `pricing_problem_id`
+- `episode_product_period_id`
+- `column_pool_state_id`
+
+thì nên dùng các field này thay vì đoán từ `product` và `period`.
 
 ---
 
-## Problem 1. Direct delivery is modeled incorrectly for multi-stop routes
+## 2.2. `irp_gurobi_converted.py`
 
-### 3.1 Current code
-The baseline currently defines direct shipment by:
+### Vấn đề hiện tại
+Trong `run_teacher_graph_and_gnn_training(...)`, code đang:
+- build graph dataset
+- rồi nếu `DEFAULT_GNN_CHECKPOINT` tồn tại thì **tự động thêm** `--resume-checkpoint`
 
-```python
-mdl.addConstr(Qdir[(s, p, t)] == gp.quicksum(q[(p, CW, s, v, t)] for v in V))
-```
+Điều này làm train run mới dễ bị nhiễm checkpoint cũ mà người chạy không để ý.
 
-### 3.2 Why this is a problem
-This means product delivered to store `s` is counted **only** if it travels on arc `CW -> s`.
+### Hậu quả
+- Bạn nghĩ đang train mới
+- nhưng thật ra đang fine-tune model cũ
+- trong khi history hiện tại không phản ánh sạch quá trình đó
 
-So if a route is:
-
-`CW -> A -> B -> CW`
-
-then:
-- delivery to `A` can be captured,
-- but delivery to `B` is **not** naturally modeled as goods carried from CW through A and then unloaded at B.
-
-That is not how a real IRP/VRP delivery route works.
-
-### 3.3 Consequence
-The current model behaves much closer to:
-- direct shipment from CW to each served store,
-- plus store-to-store transshipment flow,
-- rather than a true delivery tour where a vehicle departs with load and unloads progressively along the path.
-
-This is the single most important reason the current baseline is **not yet a fully correct routing formulation**.
-
-### 3.4 Required fix
-Replace the current `Qdir` logic with an explicit **delivery/unloading variable at each store**.
-
-Suggested new variable:
+### Nên sửa như thế nào
+Thêm cờ điều khiển rõ ràng, ví dụ:
 
 ```python
-deliv = mdl.addVars([(s, p, v, t) for s in N for p in P for v in V for t in T],
-                    lb=0.0,
-                    vtype=flow_vtype,
-                    name="deliv")
+def run_teacher_graph_and_gnn_training(
+    teacher_csv_path,
+    build_graphs=True,
+    train_gnn=True,
+    train_epochs=10,
+    resume_checkpoint=False,
+):
+    ...
+    if train_gnn:
+        cmd = [...]
+        if resume_checkpoint:
+            checkpoint = _project_path(DEFAULT_GNN_CHECKPOINT)
+            if checkpoint.exists():
+                cmd.extend(["--resume-checkpoint", str(checkpoint)])
 ```
 
-Then define total direct delivery as:
+### Khuyến nghị
+- Mặc định: `resume_checkpoint=False`
+- Chỉ bật khi bạn thật sự muốn fine-tune
 
-```python
-mdl.addConstr(
-    Qdir[(s, p, t)] == gp.quicksum(deliv[(s, p, v, t)] for v in V)
-)
-```
-
-And use `deliv` inside vehicle load balance instead of tying delivery to only `CW -> s` arcs.
-
-### 3.5 Priority
-**Critical / must fix first**.
+### Ngoài ra
+Nên cho phép truyền custom checkpoint path thay vì luôn bám vào `DEFAULT_GNN_CHECKPOINT`.
 
 ---
 
-## Problem 2. Vehicle load progression along the route is missing
+## 2.3. `GNN/03_train_bigat.py`
 
-### 4.1 Current code
-The model uses arc-flow variables `q[(p,i,j,v,t)]`, but it does not explicitly track:
-- how much load vehicle `v` leaves CW with,
-- how much remains after visiting each store,
-- how the load decreases after deliveries.
+### Vấn đề hiện tại số 1: resume không sạch
+Hiện tại nếu resume:
+- model weights được load
+- nhưng `best_valid` lại reset về `inf`
+- `history = []`
+- epoch chạy lại từ 1
+- optimizer state không thấy được resume như một training continuation thật sự
 
-### 4.2 Why this is a problem
-A correct routing delivery model usually needs one of these:
-- commodity flow with proper depot-origin semantics,
-- or load propagation variables,
-- or cumulative load/order variables.
+### Hậu quả
+- file `training_history.json` chỉ phản ánh session hiện tại
+- best model của run mới không được so với best cũ
+- khó phân tích learning trajectory thật
 
-Right now, `q` behaves more like a general network flow over arcs.
+### Hướng sửa A: nếu muốn “train mới”
+Không truyền `--resume-checkpoint`.
 
-### 4.3 Consequence
-This can create solutions that are mathematically feasible in the network sense, but operationally not very realistic.
+### Hướng sửa B: nếu muốn “resume thật sự”
+Bạn cần sửa để:
+1. load optimizer state (nếu checkpoint có)
+2. load `best_valid`
+3. load `history` cũ
+4. `start_epoch = last_epoch + 1`
 
-It also contributes to the feeling that:
-- routes solve too fast,
-- vehicles appear frequently full,
-- deliveries do not behave like normal truck unloading.
-
-### 4.4 Required fix
-Add explicit load variables, for example:
-
-```python
-load = mdl.addVars([(i, v, t) for i in N0 for v in V for t in T],
-                   lb=0.0,
-                   ub=d.vehicle_capacity,
-                   vtype=flow_vtype,
-                   name="load")
-```
-
-Then impose load transition constraints, for example using big-M:
+Ví dụ logic:
 
 ```python
-for i in N0:
-    for j in N:
-        if i == j:
-            continue
-        for v in V:
-            for t in T:
-                delivered_at_j = gp.quicksum(deliv[(j, p, v, t)] for p in P)
-                mdl.addConstr(
-                    load[(j, v, t)] <= load[(i, v, t)] - delivered_at_j + d.vehicle_capacity * (1 - x[(i, j, v, t)])
-                )
-                mdl.addConstr(
-                    load[(j, v, t)] >= load[(i, v, t)] - delivered_at_j - d.vehicle_capacity * (1 - x[(i, j, v, t)])
-                )
+history = []
+start_epoch = 1
+best_valid = float("inf")
+
+if args.resume_checkpoint:
+    checkpoint = torch.load(...)
+    model.load_state_dict(...)
+    if "optimizer_state" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+    best_valid = checkpoint.get("best_valid_loss", float("inf"))
+    start_epoch = int(checkpoint.get("last_epoch", 0)) + 1
+
+    history_path = out_dir / "training_history.json"
+    if history_path.exists():
+        with open(history_path, "r", encoding="utf-8") as f:
+            history = json.load(f)
 ```
 
-At depot:
-
+và vòng train:
 ```python
-for v in V:
-    for t in T:
-        mdl.addConstr(load[(CW, v, t)] <= d.vehicle_capacity * u[(v, t)])
+for epoch in range(start_epoch, start_epoch + args.epochs):
+    ...
 ```
 
-### 4.5 Priority
-**Critical / same priority as Problem 1**.
+### Vấn đề hiện tại số 2: objective và metric đang lệch nhau
+Bạn train với:
+- `pairwise_rank`
+
+Nhưng trong `run_epoch(...)` lại luôn log:
+- `binary_metrics`
+- `topk_accuracy`
+- `mrr`
+- `mean_positive_rank`
+
+Điều này không sai hoàn toàn, nhưng dễ gây hiểu nhầm nếu bạn đọc F1 như metric chính.
+
+### Nên sửa như thế nào
+Khi `objective == "pairwise_rank"`:
+- metric chính nên là:
+  - `valid_loss`
+  - `mrr`
+  - `mean_positive_rank`
+  - `top1_hit`, `top3_hit`, `top5_hit`
+- metric phụ mới là:
+  - `precision`
+  - `recall`
+  - `f1`
+
+### Gợi ý hiển thị
+Trong log, tách rõ:
+- **Ranking metrics**
+- **Binary threshold metrics**
+
+Ví dụ:
+```python
+if objective == "pairwise_rank":
+    primary_metric = "mrr"
+else:
+    primary_metric = "f1"
+```
+
+và trong console/logfile ghi rõ:
+- `ranking_valid_mrr`
+- `ranking_mean_positive_rank`
+- `binary_valid_f1`
+
+để tránh đọc nhầm.
 
 ---
 
-## Problem 3. Subtour elimination is not complete
+## 2.4. `GNN/utilities.py`
 
-### 5.1 Current code status
-The file itself states that true disjoint path inequalities / branch-and-cut are **not fully implemented**.
+### Vấn đề hiện tại số 1: binary_metrics dùng threshold 0.5
+Hàm `binary_metrics(...)` đang:
+- `probs = sigmoid(scores)`
+- `preds = probs >= 0.5`
 
-The model includes some strengthening inequalities `(16)–(20)`, but does **not** fully guarantee classical subtour elimination in all cases.
+Đây là logic classification bình thường, nhưng không phải thước đo tốt nhất cho ranking objective.
 
-### 5.2 Why this matters
-A route model without proper subtour elimination may still produce:
-- disconnected cycles,
-- route fragments,
-- or mathematically valid but operationally meaningless loops.
+### Hậu quả
+Có thể xảy ra:
+- top1 đúng
+- mrr tốt
+- nhưng F1 thấp
 
-Even if this does not always appear in small instances, it remains a formulation weakness.
+Điều này không nhất thiết nghĩa là model học tệ.
 
-### 5.3 Required fix
-Choose one of these two options.
+### Nên sửa như thế nào
+Giữ `binary_metrics(...)` nhưng xem nó là **secondary metrics**.
 
-#### Option A. MTZ-style subtour elimination
-Add node ordering variables per vehicle and period:
-
-```python
-ordv = mdl.addVars([(s, v, t) for s in N for v in V for t in T],
-                   lb=0,
-                   ub=len(N),
-                   vtype=GRB.CONTINUOUS,
-                   name="ordv")
-```
-
-Then add MTZ constraints:
-
-```python
-for i in N:
-    for j in N:
-        if i == j:
-            continue
-        for v in V:
-            for t in T:
-                mdl.addConstr(
-                    ordv[(i, v, t)] - ordv[(j, v, t)] + len(N) * x[(i, j, v, t)] <= len(N) - 1
-                )
-```
-
-#### Option B. SEC / callback
-If later you want stronger performance and a more academic formulation, migrate to lazy subtour cuts with callbacks.
-
-### 5.4 Priority
-**High**.
+Không dùng F1 làm kết luận chính cho pairwise ranking run.
 
 ---
 
-## Problem 4. Vehicle usage is not directly penalized in the objective
+### Vấn đề hiện tại số 2: teacher label còn hơi “cứng”
+Khi build sample từ teacher rows:
+- nếu có `teacher_label` thì dùng
+- nếu không thì fallback thành:
+  - `1.0` nếu `selected_in_rmp`
+  - `0.0` nếu không
 
-### 6.1 Current code
-The objective includes:
-- store holding cost,
-- warehouse holding cost,
-- distance cost on arcs,
-- LT unit cost,
-- shortage cost.
+Điều này tạo label khá nhị phân.
 
-But there is **no explicit fixed vehicle usage cost** like:
+### Hậu quả
+- ranking signal nghèo
+- khó phân biệt:
+  - cột thực sự tốt
+  - cột gần tốt nhưng không được chọn
+  - cột rất xấu
 
-```python
-gp.quicksum(vehicle_fixed_cost * u[(v,t)] for v in V for t in T)
-```
+### Nên sửa như thế nào
+Nếu teacher CSV đã có `teacher_score`, hãy dùng nó mạnh hơn.
 
-### 6.2 Why this matters
-Without an explicit vehicle-activation cost:
-- solver decisions are driven mostly by arc distance and shortage penalties,
-- the model may over-pack used vehicles,
-- or route structure may look distorted compared with real operating logic.
+## Gợi ý
+### Phương án 1: Giữ pairwise ranking nhưng lấy positive/negative từ score mềm hơn
+Ví dụ:
+- positive = top-ranked or selected
+- hard negative = reduced cost tệ / score thấp
+- semi-hard negative = gần selected nhưng không selected
 
-### 6.3 Consequence
-This is one reason why you often observe quantities close to full capacity.
+### Phương án 2: thử `score_regression`
+Nếu `teacher_score` có ý nghĩa và ổn định, bạn có thể thử một nhánh training phụ với:
+- objective = `score_regression`
 
-That behavior is not automatically wrong, but the cost structure strongly encourages consolidation.
+Mục tiêu:
+- so sánh `pairwise_rank` vs `score_regression`
+- xem objective nào ổn hơn với teacher score hiện có
 
-### 6.4 Required fix
-Add a vehicle fixed cost parameter:
-
-In `IRPData`:
-
-```python
-vehicle_fixed_cost: float = 0.0
-```
-
-In mapper:
-
-```python
-data.vehicle_fixed_cost = 50.0  # example, calibrate later
-```
-
-In the objective:
-
-```python
-+ gp.quicksum(d.vehicle_fixed_cost * u[(v, t)] for v in V for t in T)
-```
-
-### 6.5 Priority
-**Medium to high**.
+### Phương án 3: export thêm teacher supervision giàu thông tin hơn
+Từ solver side, export thêm:
+- reduced cost
+- normalized reduced cost
+- rank trong candidate pool
+- selected_in_rmp
+- selected_after_branching
+- marginal contribution / improvement proxy
 
 ---
 
-## Problem 5. Distance matrix is too synthetic and too uniform
+# 3) Thứ tự ưu tiên sửa
 
-### 7.1 Current code
-The mapper creates synthetic distances:
-- `CW <-> store = 10`
-- `store <-> store = 6`
+## Mức ưu tiên 1
+### Sửa grouping key
+Đây là việc quan trọng nhất.
 
-### 7.2 Why this is a problem
-Such a flat distance matrix makes routing artificially easy:
-- many route structures become nearly equivalent,
-- solver runtime becomes misleadingly short,
-- route quality is not operationally informative.
-
-### 7.3 Required fix
-If possible, replace the synthetic matrix with:
-- real store coordinates,
-- geodesic distance,
-- or at least a more heterogeneous proxy matrix.
-
-For example, if coordinates exist:
-
-```python
-from math import radians, sin, cos, sqrt, atan2
-```
-
-Then compute pairwise distances and populate `data.distance[(i,j)]` accordingly.
-
-### 7.4 Priority
-**Medium** for code correctness, **high** for thesis realism.
+Nếu không sửa, bạn sẽ vẫn bị:
+- teacher rows nhiều
+- graph samples quá ít
+- GNN không có đủ data để học
 
 ---
 
-## Problem 6. Arc-capacity is linked to `u[(v,t)]` instead of only route activation
-
-### 8.1 Current code
-The code uses:
-
-```python
-gp.quicksum(q[(p, i, j, v, t)] for p in P) <= d.vehicle_capacity * u[(v, t)]
-```
-
-This is valid as an upper bound, but weak.
-
-### 8.2 Why this is weak
-If vehicle `v` is activated, then every arc for that vehicle gets the same broad upper bound, even if a specific arc is not traversed.
-
-A tighter formulation is:
-
-```python
-gp.quicksum(q[(p, i, j, v, t)] for p in P) <= d.vehicle_capacity * x[(i, j, v, t)]
-```
-
-The file already has product-level arc linking:
-
-```python
-q[(p, i, j, v, t)] <= d.vehicle_capacity * x[(i, j, v, t)]
-```
-
-but the aggregate form should also be tightened.
-
-### 8.3 Required fix
-Replace or supplement the current aggregate capacity constraint with:
-
-```python
-for i in N0:
-    for j in N0:
-        if i == j:
-            continue
-        for v in V:
-            for t in T:
-                mdl.addConstr(
-                    gp.quicksum(q[(p, i, j, v, t)] for p in P)
-                    <= d.vehicle_capacity * x[(i, j, v, t)]
-                )
-```
-
-### 8.4 Priority
-**Medium**.
+## Mức ưu tiên 2
+### Tắt auto-resume mặc định
+Để mỗi run train đều “sạch” và dễ đọc.
 
 ---
 
-## Problem 7. Route extraction assumes a clean single next-node structure
-
-### 9.1 Current code
-The extraction helper uses:
-
-```python
-next_map = {i: j for i, j in arcs}
-```
-
-### 9.2 Why this is risky
-If due to weak subtour elimination or formulation looseness a node has multiple outgoing arcs, this helper will silently overwrite keys and may produce misleading route reports.
-
-### 9.3 Required fix
-Strengthen route extraction by:
-- validating out-degree and in-degree per active vehicle-period,
-- warning if more than one outgoing arc exists from any node,
-- printing unresolved route fragments separately.
-
-### 9.4 Priority
-**Medium** for debugging, low for formulation itself.
+## Mức ưu tiên 3
+### Làm sạch training history / resume workflow
+Nếu resume thì resume thật sự.
+Nếu train mới thì train mới thật sự.
 
 ---
 
-## 4. Suggested code changes by priority
-
-## Priority 1 — must fix now
-
-### A. Introduce explicit delivery variables
-Add:
-
-```python
-deliv[(s,p,v,t)]
-```
-
-Use this instead of tying `Qdir` only to `q[(p,CW,s,v,t)]`.
-
-### B. Add vehicle load progression
-Add:
-
-```python
-load[(i,v,t)]
-```
-
-Track remaining truck load through the route.
-
-### C. Rebuild direct-delivery flow logic
-The vehicle should depart from CW with a load, then unload at stores along the route.
+## Mức ưu tiên 4
+### Tách ranking metrics và binary metrics
+Để khỏi đọc nhầm F1.
 
 ---
 
-## Priority 2 — strongly recommended
-
-### D. Add subtour elimination
-Use MTZ first because it is easier to code.
-
-### E. Tighten arc-capacity constraints
-Use `x[(i,j,v,t)]` instead of only `u[(v,t)]` for tighter linking.
-
-### F. Add vehicle fixed cost
-This improves realism and helps avoid distorted consolidation patterns.
+## Mức ưu tiên 5
+### Làm giàu teacher supervision
+Cái này quan trọng nhưng có thể làm sau khi 4 bước trên đã sạch.
 
 ---
 
-## Priority 3 — improve realism and debugging
+# 4) Patch đề xuất ngắn gọn theo từng file
 
-### G. Replace synthetic distances
-Use real or at least more heterogeneous distances.
+## File: `GNN/build_teacher_graph_dataset.py`
+### Việc cần làm
+- sửa `group_key(...)`
+- group chi tiết hơn theo decision state
 
-### H. Improve route extraction diagnostics
-Detect fragmented or ambiguous routes.
-
-### I. Add sanity-check reports after solve
-For each vehicle-period, export:
-- total load leaving CW,
-- total delivered quantity,
-- remaining load after each visited node,
-- degree in/out by node,
-- whether a clean cycle exists.
+### Mục tiêu
+- tăng `n_groups`
+- tăng số train/valid/test samples thật
 
 ---
 
-## 5. Recommended revised baseline architecture
+## File: `irp_gurobi_converted.py`
+### Việc cần làm
+- bỏ auto-resume mặc định
+- thêm cờ `resume_checkpoint=False`
 
-If you want the baseline to become a thesis-grade routing formulation, the clean structure should be:
-
-### Inventory variables
-- `I_s[(s,p,t)]`
-- `I_w[(p,t)]`
-- `B[(s,p,t)]`
-
-### Routing variables
-- `x[(i,j,v,t)]`
-- `u[(v,t)]`
-- optional `z[(i,v,t)]`
-- subtour/order variables if MTZ is used
-
-### Delivery variables
-- `deliv[(s,p,v,t)]`
-
-### Vehicle load variables
-- `load[(i,v,t)]`
-
-### LT variables
-If baseline is run without LT, keep LT shut off exactly as you already do:
-
-```python
-allow_lateral_transshipment=False
-```
-
-That part is fine for a pure baseline run.
+### Mục tiêu
+- kiểm soát run mới vs fine-tune
 
 ---
 
-## 6. Why the current solver runtime may look too fast
+## File: `GNN/03_train_bigat.py`
+### Việc cần làm
+- nếu resume:
+  - load optimizer state
+  - load best_valid
+  - load history cũ
+  - start_epoch tiếp nối
+- nếu không resume:
+  - clear history đúng nghĩa
 
-The model may solve fast because of all of the following together:
-- synthetic and simple distances,
-- incomplete subtour handling,
-- no full delivery-on-route logic,
-- no full load-propagation structure,
-- continuous product flows by default.
-
-So fast runtime should **not** be interpreted as proof that the routing baseline is already correct.
-
----
-
-## 7. Why vehicles often appear close to full capacity
-
-This can happen because:
-1. shortage cost encourages large replenishment;
-2. route cost is mostly distance-based, encouraging consolidation;
-3. no explicit fixed vehicle cost calibration exists yet;
-4. delivery logic is still simplified;
-5. truck load does not decrease along route in an explicitly modeled way.
-
-Therefore, the “full-capacity-looking” result is not enough to conclude the routing is correct.
-It may actually be a symptom that the current formulation is still too loose or too stylized.
+### Mục tiêu
+- training history sạch
+- so sánh run được
 
 ---
 
-## 8. Practical patch plan for your code
+## File: `GNN/utilities.py`
+### Việc cần làm
+- giữ `binary_metrics(...)` nhưng coi là metric phụ
+- ưu tiên ranking metrics khi objective là `pairwise_rank`
+- cân nhắc tận dụng `teacher_score` tốt hơn
 
-## Patch block 1 — new variables
-Inside `AchamrahFullIRPTModel.solve(...)`, add:
-
-```python
-deliv_keys = [(s, p, v, t) for s in N for p in P for v in V for t in T]
-load_keys = [(i, v, t) for i in N0 for v in V for t in T]
-
-
-deliv = mdl.addVars(deliv_keys, lb=0.0, vtype=flow_vtype, name="deliv")
-load = mdl.addVars(load_keys, lb=0.0, ub=d.vehicle_capacity, vtype=flow_vtype, name="load")
-```
+### Mục tiêu
+- đánh giá đúng thứ model đang học
 
 ---
 
-## Patch block 2 — redefine direct shipment
-Replace:
+# 5) Sau khi sửa code, nên chạy lại thế nào
 
-```python
-mdl.addConstr(Qdir[(s, p, t)] == gp.quicksum(q[(p, CW, s, v, t)] for v in V))
-```
+## Giai đoạn 1: kiểm tra pipeline sạch
+Chạy 1 instance vừa phải:
+- 7 stores
+- 3 SKU
+- 2 đến 3 tháng
+- vehicle_capacity khoảng 500
 
-with:
+Mục tiêu:
+- teacher CSV không rỗng
+- `n_groups` tăng rõ rệt
+- train/valid/test đều có sample
 
-```python
-mdl.addConstr(
-    Qdir[(s, p, t)] == gp.quicksum(deliv[(s, p, v, t)] for v in V)
-)
-```
+## Giai đoạn 2: train mới hoàn toàn
+- không resume checkpoint
+- train vài epoch ngắn
+- đọc:
+  - valid loss
+  - MRR
+  - mean positive rank
+  - top-k hit
 
----
-
-## Patch block 3 — vehicle initial load at depot
-Add:
-
-```python
-for v in V:
-    for t in T:
-        mdl.addConstr(
-            load[(CW, v, t)] == gp.quicksum(deliv[(s, p, v, t)] for s in N for p in P)
-        )
-        mdl.addConstr(load[(CW, v, t)] <= d.vehicle_capacity * u[(v, t)])
-```
-
-This is the simplest first version.
-
----
-
-## Patch block 4 — load progression after each visited node
-For each traveled arc, propagate truck load after delivery.
-
-This part needs careful coding with big-M and node visit logic. Start simple and debug on small instances.
+## Giai đoạn 3: mới tính chuyện tăng data lớn hơn
+Chỉ khi pipeline sạch thì mới:
+- tăng stores
+- tăng SKU
+- tăng horizon
+- gom nhiều runs
 
 ---
 
-## Patch block 5 — MTZ constraints
-Add ordering variables and subtour elimination constraints.
+# 6) Dấu hiệu cho thấy code đã sửa đúng
+
+## Dấu hiệu tốt
+- `dataset_summary.json` cho thấy `n_groups` tăng đáng kể
+- train/valid/test đều có nhiều sample hơn
+- history mỗi run rõ ràng, không lẫn run cũ
+- MRR / mean positive rank cải thiện dần
+- F1 có thể không hoàn hảo, nhưng không còn là metric gây nhiễu chính
+
+## Dấu hiệu chưa ổn
+- rows rất nhiều nhưng groups vẫn rất thấp
+- training history vẫn “mất”
+- mỗi lần train lại đều không rõ là run mới hay resume
+- metric vẫn mâu thuẫn mà không giải thích được
 
 ---
 
-## Patch block 6 — objective update
-Add:
+# 7) Khuyến nghị thực tế cho bạn lúc này
 
-```python
-+ gp.quicksum(d.vehicle_fixed_cost * u[(v, t)] for v in V for t in T)
-```
+Đừng sửa tất cả cùng lúc.
 
----
+## Nên sửa theo thứ tự:
+1. `build_teacher_graph_dataset.py`
+2. `irp_gurobi_converted.py`
+3. `03_train_bigat.py`
+4. `utilities.py`
 
-## Patch block 7 — diagnostic export
-After solving, export for each vehicle-period:
-- total route distance,
-- total delivered quantity,
-- total load leaving CW,
-- route sequence,
-- any degree violations,
-- any disconnected cycles detected.
+Sau mỗi bước, chạy lại một run nhỏ để kiểm tra.
 
 ---
 
-## 9. Best interpretation for thesis writing
+# 8) Chốt
 
-If you describe the current code in the thesis, the most accurate statement is:
+Hiện tại bài của bạn **không phải solver chết hay mô hình GNN sai hoàn toàn**.
 
-> The current baseline already integrates inventory balance with a vehicle-routing skeleton, including depot departure, arc decisions, and vehicle-capacity linkage. However, it does not yet represent a fully detailed multi-stop delivery routing model because direct deliveries are still tied to depot-to-store arcs, explicit truck load propagation is absent, and complete subtour elimination is not yet enforced.
+Vấn đề lớn nhất là:
+- dữ liệu teacher sau grouping bị co lại quá mạnh
+- training workflow không sạch vì auto-resume
+- metric đang bị đọc lệch mục tiêu học
 
-That wording is accurate and defensible.
+Sửa đúng 4 điểm trên thì pipeline sẽ dễ tin cậy hơn rất nhiều.
 
----
-
-## 10. Recommended next action
-
-The best next coding step is:
-
-1. fix direct delivery logic;
-2. add truck load progression;
-3. add MTZ subtour elimination;
-4. then validate again on a very small instance and inspect routes manually.
-
-Only after these are stable should you treat the baseline as a true routing baseline for comparison with LT / CG / GNN layers.

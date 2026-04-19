@@ -121,19 +121,25 @@ def run_epoch(model, samples, optimizer=None, device="cpu", objective="pairwise_
         total_loss += float(loss.detach().cpu()) * labels.numel()
         total_cols += int(labels.numel())
         with torch.no_grad():
-            row = utilities.binary_metrics(logits.detach().cpu(), labels.detach().cpu())
-            row.update(utilities.topk_accuracy(logits.detach().cpu(), labels.detach().cpu(), ks=(1, 3, 5)))
+            row = {
+                f"binary_{key}": value
+                for key, value in utilities.binary_metrics(logits.detach().cpu(), labels.detach().cpu()).items()
+            }
+            row.update({
+                f"ranking_{key}": value
+                for key, value in utilities.topk_accuracy(logits.detach().cpu(), labels.detach().cpu(), ks=(1, 3, 5)).items()
+            })
             pos = torch.nonzero(labels.detach().cpu() > 0.5, as_tuple=False).flatten()
             if pos.numel() > 0:
                 order = torch.argsort(logits.detach().cpu(), descending=True)
                 ranks = torch.empty_like(order)
                 ranks[order] = torch.arange(1, order.numel() + 1)
                 pos_ranks = ranks[pos].float()
-                row["mean_positive_rank"] = float(pos_ranks.mean())
-                row["mrr"] = float((1.0 / pos_ranks.min()).item())
+                row["ranking_mean_positive_rank"] = float(pos_ranks.mean())
+                row["ranking_mrr"] = float((1.0 / pos_ranks.min()).item())
             else:
-                row["mean_positive_rank"] = float("nan")
-                row["mrr"] = float("nan")
+                row["ranking_mean_positive_rank"] = float("nan")
+                row["ranking_mrr"] = float("nan")
             metric_rows.append(row)
 
     metrics = {"loss": total_loss / max(total_cols, 1)}
@@ -216,6 +222,16 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
     ).to(args.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    best_valid = float("inf")
+    bad_epochs = 0
+    best_path = out_dir / "best_model.pt"
+    chart_path = out_dir / "training_loss_curve.png"
+    history_path = out_dir / "training_history.json"
+    history = []
+    start_epoch = 1
+    checkpoint = None
     if args.resume_checkpoint:
         resume_path = Path(args.resume_checkpoint)
         if not resume_path.exists():
@@ -235,20 +251,36 @@ def main() -> None:
         utilities.log(f"resumed from checkpoint={resume_path}", logfile)
         if skipped:
             utilities.log(f"skipped incompatible checkpoint tensors={len(skipped)}", logfile)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    best_valid = float("inf")
-    bad_epochs = 0
-    best_path = out_dir / "best_model.pt"
-    chart_path = out_dir / "training_loss_curve.png"
-    history_path = out_dir / "training_history.json"
-    history = []
+        if checkpoint is not None and "optimizer_state" in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state"])
+                utilities.log("resumed optimizer state", logfile)
+            except ValueError as exc:
+                utilities.log(f"skipped incompatible optimizer state: {exc}", logfile)
+        if checkpoint is not None:
+            best_valid = float(checkpoint.get("best_valid_loss", checkpoint.get("valid_metrics", {}).get("loss", float("inf"))))
+            start_epoch = int(checkpoint.get("last_epoch", 0)) + 1
+        if history_path.exists():
+            with open(history_path, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            if history:
+                start_epoch = max(start_epoch, int(history[-1].get("epoch", 0)) + 1)
+            utilities.log(f"loaded existing training history rows={len(history)}", logfile)
 
     utilities.log(f"train_samples={len(train_samples)} valid_samples={len(valid_samples)}", logfile)
     utilities.log(f"dataset_type={args.dataset_type} data_dir={args.data_dir} label_sources={label_sources}", logfile)
     utilities.log(f"model=BiGAT device={args.device} hidden_dim={args.hidden_dim}", logfile)
+    primary_metric = "ranking_mrr" if args.objective == "pairwise_rank" else "binary_f1"
+    if args.objective == "score_regression":
+        primary_metric = "valid_loss"
+    utilities.log(
+        f"objective={args.objective} primary_metric={primary_metric} "
+        "ranking_metrics=valid_loss,mrr,mean_positive_rank,topk "
+        "binary_threshold_metrics=secondary",
+        logfile,
+    )
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, start_epoch + args.epochs):
         random.shuffle(train_samples)
         before_params = parameter_vector(model)
         train_metrics = run_epoch(model, train_samples, optimizer=optimizer, device=args.device, objective=args.objective)
@@ -260,10 +292,19 @@ def main() -> None:
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
             "valid_loss": valid_metrics["loss"],
-            "valid_f1": valid_metrics["f1"],
-            "valid_top1": valid_metrics["top1_hit"],
-            "valid_mrr": valid_metrics.get("mrr", float("nan")),
-            "valid_mean_positive_rank": valid_metrics.get("mean_positive_rank", float("nan")),
+            "primary_metric": primary_metric,
+            "ranking_valid_mrr": valid_metrics.get("ranking_mrr", float("nan")),
+            "ranking_valid_mean_positive_rank": valid_metrics.get("ranking_mean_positive_rank", float("nan")),
+            "ranking_valid_top1": valid_metrics.get("ranking_top1_hit", float("nan")),
+            "ranking_valid_top3": valid_metrics.get("ranking_top3_hit", float("nan")),
+            "ranking_valid_top5": valid_metrics.get("ranking_top5_hit", float("nan")),
+            "binary_valid_f1": valid_metrics.get("binary_f1", float("nan")),
+            "binary_valid_precision": valid_metrics.get("binary_precision", float("nan")),
+            "binary_valid_recall": valid_metrics.get("binary_recall", float("nan")),
+            "valid_f1": valid_metrics.get("binary_f1", float("nan")),
+            "valid_top1": valid_metrics.get("ranking_top1_hit", float("nan")),
+            "valid_mrr": valid_metrics.get("ranking_mrr", float("nan")),
+            "valid_mean_positive_rank": valid_metrics.get("ranking_mean_positive_rank", float("nan")),
             "pos_score": trace["pos_score"],
             "neg_score": trace["neg_score"],
             "score_gap": trace["score_gap"],
@@ -275,8 +316,11 @@ def main() -> None:
         utilities.log(
             f"epoch={epoch:03d} objective={args.objective} "
             f"train_loss={train_metrics['loss']:.4f} valid_loss={valid_metrics['loss']:.4f} "
-            f"valid_f1={valid_metrics['f1']:.4f} valid_top1={valid_metrics['top1_hit']:.4f} "
-            f"valid_mrr={valid_metrics.get('mrr', float('nan')):.4f} "
+            f"ranking_valid_mrr={valid_metrics.get('ranking_mrr', float('nan')):.4f} "
+            f"ranking_valid_top1={valid_metrics.get('ranking_top1_hit', float('nan')):.4f} "
+            f"ranking_valid_top3={valid_metrics.get('ranking_top3_hit', float('nan')):.4f} "
+            f"ranking_mean_positive_rank={valid_metrics.get('ranking_mean_positive_rank', float('nan')):.4f} "
+            f"binary_valid_f1={valid_metrics.get('binary_f1', float('nan')):.4f} "
             f"pos_score={trace['pos_score']:.4f} neg_score={trace['neg_score']:.4f} "
             f"score_gap={trace['score_gap']:.4f} "
             f"col_emb_norm={trace['column_embedding_norm']:.4f} "
@@ -304,6 +348,9 @@ def main() -> None:
                     "edge": utilities.EDGE_FEATURE_NAMES,
                 },
                 "valid_metrics": valid_metrics,
+                "optimizer_state": optimizer.state_dict(),
+                "best_valid_loss": best_valid,
+                "last_epoch": epoch,
                 "objective": args.objective,
                 "dataset_type": args.dataset_type,
                 "label_sources": label_sources,
@@ -329,6 +376,8 @@ def main() -> None:
             "data_dir": args.data_dir,
             "resume_checkpoint": args.resume_checkpoint,
             "label_sources": label_sources,
+            "last_epoch": history[-1]["epoch"] if history else 0,
+            "history_rows": len(history),
             "checkpoint": str(best_path),
             "history": str(history_path),
             "loss_chart": str(chart_path),
