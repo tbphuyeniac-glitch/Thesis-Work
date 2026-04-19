@@ -781,7 +781,807 @@ class BaselineIRPModel:
 
 
 # ============================================================================
-# ACHAMRAH-STYLE FULLER IRPT MODEL
+# BASELINE ALNS MODEL (Song et al. 2023 adaptation, DC->stores only, no LT)
+# ============================================================================
+#
+# Replaces the Gurobi-based Step 1 solver. The ALNS produces a FullIRPTSolution
+# with the exact same field schema (direct_ship_q, inv_store, inv_wh, shortage,
+# x, u, z, q, y, deliv, load, efficiency_metrics) so downstream Step 1B / CG /
+# LT stages remain unchanged. Lateral transshipment (y) is always zero here;
+# inter-store rebalancing happens only in later stages via column generation.
+
+
+@dataclass
+class _ALNSState:
+    """ALNS solution state: per-period vehicle routes + per-(store, product, vehicle, period) deliveries."""
+    routes: Dict[Tuple[Period, Vehicle], List[Store]] = field(default_factory=dict)
+    deliv: Dict[Tuple[Store, Product, Vehicle, Period], float] = field(default_factory=dict)
+
+    def clone(self) -> "_ALNSState":
+        return _ALNSState(
+            routes={k: list(v) for k, v in self.routes.items()},
+            deliv=dict(self.deliv),
+        )
+
+
+class BaselineALNSModel:
+    """
+    Adaptive Large Neighborhood Search baseline (DC -> stores -> DC, no LT).
+
+    Keeps the IRPT baseline's constraints and objective from AchamrahFullIRPTModel
+    when allow_lateral_transshipment=False:
+      * inventory balance (warehouse, stores) with shortage B,
+      * vehicle capacity and single-visit-per-store-per-period routing,
+      * warehouse/store node capacities,
+      * cw_dispatch_cycle periodicity,
+      * min_visit_activity_qty,
+      * max_vehicles_used.
+
+    Objective components (identical to the Gurobi baseline with y=0):
+      direct shipping cost  + store holding + warehouse holding
+      + alpha * distance (routing) + vehicle fixed cost
+      + shortage cost.
+    """
+
+    SIGMA_NEW_BEST = 33.0
+    SIGMA_BETTER = 13.0
+    SIGMA_ACCEPTED = 9.0
+
+    def __init__(self, data: IRPData):
+        self.data = data
+
+    # ------------------------------------------------------------------ public
+
+    def solve(
+        self,
+        msg: bool = False,
+        time_limit: Optional[int] = None,
+        enforce_integer_flows: bool = False,
+        add_valid_16_20: bool = True,
+        allow_lateral_transshipment: bool = False,
+        min_visit_activity_qty: float = 1.0,
+        min_visit_delivery_qty: float = 0.0,
+        cw_dispatch_cycle: Optional[int] = 5,
+        max_iterations: int = 2000,
+        seed: int = 20260419,
+        initial_temperature: Optional[float] = None,
+        cooling_rate: float = 0.998,
+        segment_size: int = 40,
+        reaction_factor: float = 0.1,
+    ) -> FullIRPTSolution:
+        # allow_lateral_transshipment is accepted for API parity; LT is never produced here.
+        if allow_lateral_transshipment:
+            if msg:
+                print("[ALNS] allow_lateral_transshipment=True ignored: baseline ALNS keeps y=0 by design.")
+        _ = add_valid_16_20, enforce_integer_flows  # kept for signature parity
+        self._min_visit_activity_qty = max(0.0, float(min_visit_activity_qty))
+        self._min_visit_delivery_qty = max(0.0, float(min_visit_delivery_qty))
+        self._msg = bool(msg)
+        self._rng = random.Random(int(seed))
+
+        d = self.data
+        self._dispatch_periods = self._compute_dispatch_periods(cw_dispatch_cycle)
+
+        t0 = time.perf_counter()
+        deadline = (t0 + float(time_limit)) if time_limit is not None else None
+
+        current = self._build_greedy_initial_solution()
+        curr_cost, curr_feasible = self._evaluate(current)
+        best = current.clone()
+        best_cost = curr_cost
+        best_feasible = curr_feasible
+
+        temperature = float(initial_temperature) if initial_temperature is not None else max(1.0, abs(curr_cost) * 0.05 + 1.0)
+
+        destroy_ops = [
+            ("destroy_random_delivery", self._destroy_random_delivery),
+            ("destroy_worst_delivery", self._destroy_worst_delivery),
+            ("destroy_random_route", self._destroy_random_route),
+            ("destroy_random_period", self._destroy_random_period),
+            ("destroy_shaw_stores", self._destroy_shaw_stores),
+            ("destroy_low_demand_stores", self._destroy_low_demand_stores),
+        ]
+        repair_ops = [
+            ("repair_greedy", self._repair_greedy),
+            ("repair_regret2", self._repair_regret2),
+            ("repair_random", self._repair_random),
+        ]
+        w_destroy = [1.0] * len(destroy_ops)
+        w_repair = [1.0] * len(repair_ops)
+        pi_destroy = [0.0] * len(destroy_ops)
+        pi_repair = [0.0] * len(repair_ops)
+        theta_destroy = [0] * len(destroy_ops)
+        theta_repair = [0] * len(repair_ops)
+
+        n_accept = 0
+        n_improve = 0
+        n_new_best = 0
+
+        for iteration in range(1, int(max_iterations) + 1):
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+
+            d_idx = self._roulette_pick(w_destroy)
+            r_idx = self._roulette_pick(w_repair)
+            candidate = current.clone()
+
+            # Intensity: remove between 5% and 25% of served store-period assignments
+            served_pairs = [key for key, qty in candidate.deliv.items() if qty > 1e-9]
+            n_remove = max(1, min(len(served_pairs), int(round(self._rng.uniform(0.05, 0.25) * max(1, len(served_pairs))))))
+
+            destroy_ops[d_idx][1](candidate, n_remove)
+            repair_ops[r_idx][1](candidate)
+
+            cand_cost, cand_feasible = self._evaluate(candidate)
+            theta_destroy[d_idx] += 1
+            theta_repair[r_idx] += 1
+
+            delta = cand_cost - curr_cost
+            accepted = False
+            if cand_feasible and (not curr_feasible or delta <= 0.0):
+                accepted = True
+            elif cand_feasible and self._rng.random() < math.exp(-delta / max(temperature, 1e-9)):
+                accepted = True
+
+            score = 0.0
+            if cand_feasible and (cand_cost < best_cost - 1e-9 or (not best_feasible)):
+                best = candidate.clone()
+                best_cost = cand_cost
+                best_feasible = True
+                score = self.SIGMA_NEW_BEST
+                n_new_best += 1
+                n_improve += 1
+                current = candidate
+                curr_cost = cand_cost
+                curr_feasible = True
+                n_accept += 1
+            elif accepted:
+                n_accept += 1
+                if delta < 0.0:
+                    score = self.SIGMA_BETTER
+                    n_improve += 1
+                else:
+                    score = self.SIGMA_ACCEPTED
+                current = candidate
+                curr_cost = cand_cost
+                curr_feasible = cand_feasible
+
+            pi_destroy[d_idx] += score
+            pi_repair[r_idx] += score
+
+            temperature = max(1e-6, temperature * cooling_rate)
+
+            if iteration % segment_size == 0:
+                for i in range(len(w_destroy)):
+                    if theta_destroy[i] > 0:
+                        w_destroy[i] = (1.0 - reaction_factor) * w_destroy[i] + reaction_factor * (pi_destroy[i] / theta_destroy[i])
+                        w_destroy[i] = max(0.05, w_destroy[i])
+                    pi_destroy[i] = 0.0
+                    theta_destroy[i] = 0
+                for i in range(len(w_repair)):
+                    if theta_repair[i] > 0:
+                        w_repair[i] = (1.0 - reaction_factor) * w_repair[i] + reaction_factor * (pi_repair[i] / theta_repair[i])
+                        w_repair[i] = max(0.05, w_repair[i])
+                    pi_repair[i] = 0.0
+                    theta_repair[i] = 0
+                if self._msg:
+                    print(f"[ALNS] iter={iteration} best={best_cost:.4f} curr={curr_cost:.4f} T={temperature:.3f}")
+
+        runtime = time.perf_counter() - t0
+        return self._build_full_irpt_solution(
+            best,
+            runtime_seconds=runtime,
+            iterations=iteration,
+            n_accept=n_accept,
+            n_improve=n_improve,
+            n_new_best=n_new_best,
+            final_cost=best_cost,
+            feasible=best_feasible,
+        )
+
+    # ---------------------------------------------------------- initial build
+
+    def _compute_dispatch_periods(self, cw_dispatch_cycle: Optional[int]) -> Set[Period]:
+        d = self.data
+        if cw_dispatch_cycle is None or int(cw_dispatch_cycle) <= 1:
+            return set(d.periods)
+        cycle = int(cw_dispatch_cycle)
+        t0 = min(d.periods) if d.periods else 0
+        return {t for t in d.periods if (t - t0) % cycle == 0}
+
+    def _target_delivery(self, s: Store, p: Product, t: Period, prev_inv: float) -> float:
+        """How much to push to (s,p) in period t: cover current demand + small safety buffer, bounded by max store inv."""
+        d = self.data
+        demand = float(d.demand.get((s, p, t), 0.0))
+        # Look-ahead: if the next period is not a dispatch period, add its demand too.
+        future_need = 0.0
+        remaining_periods = [tau for tau in d.periods if tau > t]
+        for tau in remaining_periods:
+            future_need += float(d.demand.get((s, p, tau), 0.0))
+            if tau in self._dispatch_periods:
+                break
+        need = max(0.0, demand + future_need - prev_inv)
+        max_room = max(0.0, float(d.max_inventory_store.get((s, p), float("inf"))) - prev_inv)
+        return min(need, max_room)
+
+    def _build_greedy_initial_solution(self) -> _ALNSState:
+        d = self.data
+        state = _ALNSState()
+        inv_store = {(s, p): float(d.init_inventory_store.get((s, p), 0.0)) for s in d.stores for p in d.products}
+        inv_wh = {p: float(d.init_inventory_wh.get(p, 0.0)) for p in d.products}
+
+        for t in d.periods:
+            for p in d.products:
+                inv_wh[p] = inv_wh[p] + float(d.replenishment_wh.get((p, t), 0.0))
+
+            if t not in self._dispatch_periods:
+                for s in d.stores:
+                    for p in d.products:
+                        demand = float(d.demand.get((s, p, t), 0.0))
+                        inv_store[(s, p)] = max(0.0, inv_store[(s, p)] - demand)
+                continue
+
+            # Compute targets per (store, product); subject to WH availability.
+            targets: Dict[Tuple[Store, Product], float] = {}
+            for s in d.stores:
+                for p in d.products:
+                    tgt = self._target_delivery(s, p, t, inv_store[(s, p)])
+                    if tgt > 1e-9:
+                        targets[(s, p)] = tgt
+            # Cap by warehouse inventory per product
+            for p in d.products:
+                total = sum(q for (s, pp), q in targets.items() if pp == p)
+                if total > inv_wh[p] + 1e-9 and total > 0:
+                    scale = inv_wh[p] / total
+                    for key in list(targets.keys()):
+                        if key[1] == p:
+                            targets[key] *= scale
+
+            # Assign to vehicles via nearest-neighbor, capacity-respecting
+            stores_need = sorted({s for (s, p) in targets if sum(targets.get((s, q), 0.0) for q in d.products) > 1e-9},
+                                 key=lambda s: -sum(targets.get((s, q), 0.0) for q in d.products))
+            remaining_stores = list(stores_need)
+            for v in d.vehicles:
+                if not remaining_stores:
+                    break
+                capacity = float(d.vehicle_capacity)
+                route: List[Store] = []
+                current_node: Node = d.warehouse
+                while remaining_stores:
+                    # pick nearest store whose total target fits
+                    candidates = []
+                    for s in remaining_stores:
+                        load_s = sum(targets.get((s, q), 0.0) for q in d.products)
+                        if load_s <= capacity + 1e-9:
+                            dist = float(d.distance.get((current_node, s), 0.0))
+                            candidates.append((dist, load_s, s))
+                    if not candidates:
+                        break
+                    candidates.sort(key=lambda item: (item[0], -item[1]))
+                    _, load_s, s = candidates[0]
+                    route.append(s)
+                    capacity -= load_s
+                    current_node = s
+                    remaining_stores.remove(s)
+                    for p in d.products:
+                        q = float(targets.get((s, p), 0.0))
+                        if q > 1e-9:
+                            state.deliv[(s, p, v, t)] = q
+                if route:
+                    state.routes[(t, v)] = route
+
+            # Update inventories after scheduled dispatches in period t
+            for p in d.products:
+                shipped = sum(state.deliv.get((s, p, v, t), 0.0) for s in d.stores for v in d.vehicles)
+                inv_wh[p] = max(0.0, inv_wh[p] - shipped)
+            for s in d.stores:
+                for p in d.products:
+                    demand = float(d.demand.get((s, p, t), 0.0))
+                    qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
+                    inv_store[(s, p)] = max(0.0, inv_store[(s, p)] + qdir - demand)
+        return state
+
+    # ------------------------------------------------------------ evaluation
+
+    def _evaluate(self, state: _ALNSState) -> Tuple[float, bool]:
+        d = self.data
+        cost = 0.0
+        feasible = True
+
+        inv_store = {(s, p): float(d.init_inventory_store.get((s, p), 0.0)) for s in d.stores for p in d.products}
+        inv_wh = {p: float(d.init_inventory_wh.get(p, 0.0)) for p in d.products}
+
+        for t in d.periods:
+            for p in d.products:
+                inv_wh[p] += float(d.replenishment_wh.get((p, t), 0.0))
+
+            # Aggregate direct shipments
+            qdir_pt: Dict[Tuple[Store, Product], float] = {}
+            for (s, p, v, tau), qty in state.deliv.items():
+                if tau == t and qty > 0.0:
+                    qdir_pt[(s, p)] = qdir_pt.get((s, p), 0.0) + qty
+
+            # Dispatch cycle check
+            if t not in self._dispatch_periods:
+                if any(q > 1e-6 for q in qdir_pt.values()):
+                    feasible = False
+                    cost += 1e6 * sum(qdir_pt.values())
+
+            # Warehouse balance
+            for p in d.products:
+                ship_p = sum(q for (s, pp), q in qdir_pt.items() if pp == p)
+                inv_wh[p] -= ship_p
+                if inv_wh[p] < -1e-6:
+                    feasible = False
+                    cost += 1e6 * (-inv_wh[p])
+                    inv_wh[p] = 0.0
+                cost += float(d.holding_cost_wh.get(p, 0.0)) * max(0.0, inv_wh[p])
+                # Direct shipping cost
+                for s in d.stores:
+                    q = qdir_pt.get((s, p), 0.0)
+                    cost += float(d.ship_cost_cw.get((s, p), 0.0)) * q
+
+            # Warehouse aggregate capacity
+            wh_total = sum(inv_wh[p] for p in d.products)
+            cap_wh = float(d.node_capacity.get(d.warehouse, float("inf")))
+            if wh_total > cap_wh + 1e-6:
+                feasible = False
+                cost += 1e5 * (wh_total - cap_wh)
+
+            # Store balance
+            for s in d.stores:
+                for p in d.products:
+                    demand = float(d.demand.get((s, p, t), 0.0))
+                    q = qdir_pt.get((s, p), 0.0)
+                    new_inv = inv_store[(s, p)] + q - demand
+                    shortage = max(0.0, -new_inv)
+                    inv_store[(s, p)] = max(0.0, new_inv)
+                    cost += float(d.holding_cost_store.get((s, p), 0.0)) * inv_store[(s, p)]
+                    cost += float(d.shortage_cost.get((s, p), 0.0)) * shortage
+                    if inv_store[(s, p)] > float(d.max_inventory_store.get((s, p), float("inf"))) + 1e-6:
+                        feasible = False
+                        cost += 1e5 * (inv_store[(s, p)] - float(d.max_inventory_store.get((s, p), 0.0)))
+                # Node capacity
+                cap_s = float(d.node_capacity.get(s, float("inf")))
+                total_inv_s = sum(inv_store[(s, q)] for q in d.products)
+                if total_inv_s > cap_s + 1e-6:
+                    feasible = False
+                    cost += 1e5 * (total_inv_s - cap_s)
+
+            # Single-visit-per-period: each store must appear in at most one vehicle's route in period t.
+            visit_counts: Dict[Store, int] = {}
+            for (tt, vv), rt in state.routes.items():
+                if tt != t:
+                    continue
+                for s in rt:
+                    visit_counts[s] = visit_counts.get(s, 0) + 1
+            for s, cnt in visit_counts.items():
+                if cnt > 1:
+                    feasible = False
+                    cost += 1e5 * (cnt - 1)
+
+            # Routing cost and vehicle/route feasibility per period
+            vehicles_used = 0
+            for v in d.vehicles:
+                route = list(state.routes.get((t, v), []))
+                load_total = sum(state.deliv.get((s, p, v, t), 0.0) for s in route for p in d.products)
+                if not route and load_total <= 1e-9:
+                    continue
+                if load_total > float(d.vehicle_capacity) + 1e-6:
+                    feasible = False
+                    cost += 1e5 * (load_total - float(d.vehicle_capacity))
+                if load_total > 1e-9 or route:
+                    vehicles_used += 1
+                    cost += float(d.vehicle_fixed_cost)
+                # Distance cost along CW -> s1 -> ... -> sk -> CW
+                path = [d.warehouse] + route + [d.warehouse]
+                for i, j in zip(path[:-1], path[1:]):
+                    cost += float(d.alpha) * float(d.distance.get((i, j), 0.0))
+                # min_visit_activity_qty: each visited store must receive at least the threshold
+                if self._min_visit_activity_qty > 0:
+                    for s in route:
+                        got = sum(state.deliv.get((s, p, v, t), 0.0) for p in d.products)
+                        if got < self._min_visit_activity_qty - 1e-6:
+                            feasible = False
+                            cost += 1e4 * (self._min_visit_activity_qty - got)
+                if self._min_visit_delivery_qty > 0:
+                    for s in route:
+                        got = sum(state.deliv.get((s, p, v, t), 0.0) for p in d.products)
+                        if got < self._min_visit_delivery_qty - 1e-6:
+                            feasible = False
+                            cost += 1e4 * (self._min_visit_delivery_qty - got)
+            if vehicles_used > int(d.max_vehicles_used):
+                feasible = False
+                cost += 1e5 * (vehicles_used - int(d.max_vehicles_used))
+
+        return cost, feasible
+
+    # ---------------------------------------------------------- destroy ops
+
+    def _served_keys(self, state: _ALNSState) -> List[Tuple[Store, Product, Vehicle, Period]]:
+        return [k for k, v in state.deliv.items() if v > 1e-9]
+
+    def _drop_empty_route_entries(self, state: _ALNSState, t: Period, v: Vehicle) -> None:
+        route = state.routes.get((t, v), [])
+        new_route = [s for s in route if any(state.deliv.get((s, p, v, t), 0.0) > 1e-9 for p in self.data.products)]
+        if new_route:
+            state.routes[(t, v)] = new_route
+        else:
+            state.routes.pop((t, v), None)
+
+    def _destroy_random_delivery(self, state: _ALNSState, k: int) -> None:
+        keys = self._served_keys(state)
+        if not keys:
+            return
+        self._rng.shuffle(keys)
+        for key in keys[:k]:
+            state.deliv[key] = 0.0
+            state.deliv.pop(key, None)
+            _, _, v, t = key
+            self._drop_empty_route_entries(state, t, v)
+
+    def _destroy_worst_delivery(self, state: _ALNSState, k: int) -> None:
+        d = self.data
+        keys = self._served_keys(state)
+        if not keys:
+            return
+        # score = direct_ship_cost * qty / (demand + 1)  (expensive deliveries relative to demand)
+        scored = []
+        for (s, p, v, t) in keys:
+            qty = state.deliv[(s, p, v, t)]
+            dem = float(d.demand.get((s, p, t), 1.0)) + 1.0
+            score = float(d.ship_cost_cw.get((s, p), 0.0)) * qty / dem
+            scored.append((score, (s, p, v, t)))
+        scored.sort(reverse=True)
+        for _, key in scored[:k]:
+            state.deliv.pop(key, None)
+            _, _, v, t = key
+            self._drop_empty_route_entries(state, t, v)
+
+    def _destroy_random_route(self, state: _ALNSState, k: int) -> None:
+        route_keys = list(state.routes.keys())
+        if not route_keys:
+            return
+        self._rng.shuffle(route_keys)
+        for (t, v) in route_keys[: max(1, k // 4)]:
+            route = state.routes.pop((t, v), [])
+            for s in route:
+                for p in self.data.products:
+                    state.deliv.pop((s, p, v, t), None)
+
+    def _destroy_random_period(self, state: _ALNSState, k: int) -> None:
+        periods = sorted({t for (t, _) in state.routes.keys()})
+        if not periods:
+            return
+        t = self._rng.choice(periods)
+        keys_to_drop = [key for key in state.routes if key[0] == t]
+        for key in keys_to_drop:
+            _, v = key
+            for s in state.routes.pop(key, []):
+                for p in self.data.products:
+                    state.deliv.pop((s, p, v, t), None)
+
+    def _destroy_shaw_stores(self, state: _ALNSState, k: int) -> None:
+        """Remove geographically close stores across a single period."""
+        d = self.data
+        periods_with_routes = sorted({t for (t, _) in state.routes.keys()})
+        if not periods_with_routes:
+            return
+        t = self._rng.choice(periods_with_routes)
+        visited = [s for (tt, v), route in state.routes.items() if tt == t for s in route]
+        if not visited:
+            return
+        seed_store = self._rng.choice(visited)
+        scored = sorted(visited, key=lambda s: float(d.distance.get((seed_store, s), 0.0)))
+        remove = set(scored[: max(1, k // 3)])
+        for (tt, v) in list(state.routes.keys()):
+            if tt != t:
+                continue
+            new_route = [s for s in state.routes[(tt, v)] if s not in remove]
+            if new_route:
+                state.routes[(tt, v)] = new_route
+            else:
+                state.routes.pop((tt, v), None)
+            for s in remove:
+                for p in d.products:
+                    state.deliv.pop((s, p, v, tt), None)
+
+    def _destroy_low_demand_stores(self, state: _ALNSState, k: int) -> None:
+        d = self.data
+        keys = self._served_keys(state)
+        if not keys:
+            return
+        scored = []
+        for (s, p, v, t) in keys:
+            dem = float(d.demand.get((s, p, t), 0.0))
+            scored.append((dem, (s, p, v, t)))
+        scored.sort()
+        for _, key in scored[: max(1, k // 2)]:
+            state.deliv.pop(key, None)
+            _, _, v, t = key
+            self._drop_empty_route_entries(state, t, v)
+
+    # ---------------------------------------------------------- repair ops
+
+    def _collect_unserved_requests(self, state: _ALNSState) -> List[Tuple[Store, Product, Period, float]]:
+        d = self.data
+        requests: List[Tuple[Store, Product, Period, float]] = []
+        inv_store = {(s, p): float(d.init_inventory_store.get((s, p), 0.0)) for s in d.stores for p in d.products}
+        inv_wh = {p: float(d.init_inventory_wh.get(p, 0.0)) for p in d.products}
+        for t in d.periods:
+            for p in d.products:
+                inv_wh[p] += float(d.replenishment_wh.get((p, t), 0.0))
+            for p in d.products:
+                for s in d.stores:
+                    qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
+                    inv_wh[p] = max(0.0, inv_wh[p] - qdir)
+            for s in d.stores:
+                for p in d.products:
+                    qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
+                    demand = float(d.demand.get((s, p, t), 0.0))
+                    ending = inv_store[(s, p)] + qdir - demand
+                    if t in self._dispatch_periods and ending < -1e-6:
+                        shortfall = -ending
+                        max_room = max(0.0, float(d.max_inventory_store.get((s, p), float("inf"))) - (inv_store[(s, p)] + qdir))
+                        addable = min(shortfall, max_room, inv_wh.get(p, 0.0))
+                        if addable > 1e-9:
+                            requests.append((s, p, t, addable))
+                    inv_store[(s, p)] = max(0.0, ending)
+        return requests
+
+    def _insertion_cost(self, state: _ALNSState, s: Store, p: Product, t: Period, v: Vehicle, qty: float) -> Optional[float]:
+        """Return incremental cost of inserting (s,p,t,qty) on vehicle v; None if infeasible."""
+        d = self.data
+        route = state.routes.get((t, v), [])
+        # Single-visit-per-period constraint: store s must not be on another vehicle's route in period t.
+        for (tt, vv), other_route in state.routes.items():
+            if tt == t and vv != v and s in other_route:
+                return None
+        load_total = sum(state.deliv.get((ss, pp, v, t), 0.0) for ss in route for pp in d.products)
+        if load_total + qty > float(d.vehicle_capacity) + 1e-6:
+            return None
+        ship_cost = float(d.ship_cost_cw.get((s, p), 0.0)) * qty
+        if s in route:
+            return ship_cost  # no new arc cost
+        # Finding best insertion position in route
+        best_delta = None
+        path = [d.warehouse] + route + [d.warehouse]
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            delta = float(d.distance.get((a, s), 0.0)) + float(d.distance.get((s, b), 0.0)) - float(d.distance.get((a, b), 0.0))
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+        added_vehicle_cost = 0.0 if route else float(d.vehicle_fixed_cost)
+        return ship_cost + float(d.alpha) * (best_delta or 0.0) + added_vehicle_cost
+
+    def _apply_insertion(self, state: _ALNSState, s: Store, p: Product, t: Period, v: Vehicle, qty: float) -> None:
+        d = self.data
+        route = state.routes.get((t, v), [])
+        if s not in route:
+            path = [d.warehouse] + route + [d.warehouse]
+            best_pos = 0
+            best_delta = None
+            for i in range(len(path) - 1):
+                a, b = path[i], path[i + 1]
+                delta = float(d.distance.get((a, s), 0.0)) + float(d.distance.get((s, b), 0.0)) - float(d.distance.get((a, b), 0.0))
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    best_pos = i
+            route.insert(best_pos, s)
+            state.routes[(t, v)] = route
+        state.deliv[(s, p, v, t)] = state.deliv.get((s, p, v, t), 0.0) + qty
+
+    def _repair_greedy(self, state: _ALNSState) -> None:
+        d = self.data
+        requests = self._collect_unserved_requests(state)
+        self._rng.shuffle(requests)
+        for (s, p, t, qty) in requests:
+            if t not in self._dispatch_periods:
+                continue
+            best_v = None
+            best_c = None
+            for v in d.vehicles:
+                c = self._insertion_cost(state, s, p, t, v, qty)
+                if c is None:
+                    continue
+                if best_c is None or c < best_c:
+                    best_c = c
+                    best_v = v
+            if best_v is None:
+                continue
+            # Respect max_vehicles per period
+            active_vehicles = {vv for (tt, vv) in state.routes if tt == t}
+            if best_v not in active_vehicles and len(active_vehicles) >= int(d.max_vehicles_used):
+                continue
+            self._apply_insertion(state, s, p, t, best_v, qty)
+
+    def _repair_regret2(self, state: _ALNSState) -> None:
+        d = self.data
+        requests = self._collect_unserved_requests(state)
+        while requests:
+            best_req_idx = None
+            best_regret = -1.0
+            best_v = None
+            best_insert_cost = None
+            for idx, (s, p, t, qty) in enumerate(requests):
+                if t not in self._dispatch_periods:
+                    continue
+                costs = []
+                for v in d.vehicles:
+                    c = self._insertion_cost(state, s, p, t, v, qty)
+                    if c is not None:
+                        costs.append((c, v))
+                if not costs:
+                    continue
+                costs.sort()
+                cheapest = costs[0][0]
+                second = costs[1][0] if len(costs) > 1 else cheapest + 1e6
+                regret = second - cheapest
+                if regret > best_regret:
+                    best_regret = regret
+                    best_req_idx = idx
+                    best_v = costs[0][1]
+                    best_insert_cost = cheapest
+            if best_req_idx is None:
+                break
+            (s, p, t, qty) = requests.pop(best_req_idx)
+            active_vehicles = {vv for (tt, vv) in state.routes if tt == t}
+            if best_v not in active_vehicles and len(active_vehicles) >= int(d.max_vehicles_used):
+                continue
+            self._apply_insertion(state, s, p, t, best_v, qty)
+
+    def _repair_random(self, state: _ALNSState) -> None:
+        d = self.data
+        requests = self._collect_unserved_requests(state)
+        self._rng.shuffle(requests)
+        for (s, p, t, qty) in requests:
+            if t not in self._dispatch_periods:
+                continue
+            feasible_vs = [v for v in d.vehicles if self._insertion_cost(state, s, p, t, v, qty) is not None]
+            if not feasible_vs:
+                continue
+            v = self._rng.choice(feasible_vs)
+            active_vehicles = {vv for (tt, vv) in state.routes if tt == t}
+            if v not in active_vehicles and len(active_vehicles) >= int(d.max_vehicles_used):
+                continue
+            self._apply_insertion(state, s, p, t, v, qty)
+
+    # ------------------------------------------------------- adaptive weights
+
+    def _roulette_pick(self, weights: List[float]) -> int:
+        total = sum(weights)
+        if total <= 0.0:
+            return self._rng.randint(0, len(weights) - 1)
+        r = self._rng.uniform(0.0, total)
+        upto = 0.0
+        for i, w in enumerate(weights):
+            upto += w
+            if upto >= r:
+                return i
+        return len(weights) - 1
+
+    # ----------------------------------------------- FullIRPTSolution builder
+
+    def _build_full_irpt_solution(
+        self,
+        state: _ALNSState,
+        runtime_seconds: float,
+        iterations: int,
+        n_accept: int,
+        n_improve: int,
+        n_new_best: int,
+        final_cost: float,
+        feasible: bool,
+    ) -> FullIRPTSolution:
+        d = self.data
+        N = d.stores
+        P = d.products
+        T = d.periods
+        V = d.vehicles
+        CW = d.warehouse
+        N0 = [CW] + N
+
+        # Initialize all decision dicts to zero
+        x = {(i, j, v, t): 0 for i in N0 for j in N0 if i != j for v in V for t in T}
+        u = {(v, t): 0 for v in V for t in T}
+        z = {(i, v, t): 0 for i in N0 for v in V for t in T}
+        q = {(p, i, j, v, t): 0.0 for p in P for i in N0 for j in N0 if i != j for v in V for t in T}
+        y = {(i, j, p, v, t): 0.0 for i in N for j in N if i != j for p in P for v in V for t in T}
+        deliv = {(s, p, v, t): 0.0 for s in N for p in P for v in V for t in T}
+        load = {(i, v, t): 0.0 for i in N0 for v in V for t in T}
+        direct_ship_q = {(s, p, t): 0.0 for s in N for p in P for t in T}
+        inv_store = {(s, p, t): 0.0 for s in N for p in P for t in T}
+        inv_wh = {(p, t): 0.0 for p in P for t in T}
+        shortage = {(s, p, t): 0.0 for s in N for p in P for t in T}
+
+        # Fill deliv and direct_ship_q
+        for (s, p, v, t), qty in state.deliv.items():
+            if qty > 0.0:
+                deliv[(s, p, v, t)] = float(qty)
+                direct_ship_q[(s, p, t)] = direct_ship_q.get((s, p, t), 0.0) + float(qty)
+
+        # Fill routing: x, u, z, q, load
+        for (t, v), route in state.routes.items():
+            if not route:
+                continue
+            u[(v, t)] = 1
+            z[(CW, v, t)] = 1
+            path = [CW] + list(route) + [CW]
+            for i, j in zip(path[:-1], path[1:]):
+                x[(i, j, v, t)] = 1
+                if j != CW:
+                    z[(j, v, t)] = 1
+            # q: cumulative remaining deliveries on each outbound arc
+            # Walk forward, starting with total load at CW and subtracting delivery at each stop.
+            for p in P:
+                remaining = sum(deliv.get((s, p, v, t), 0.0) for s in route)
+                load[(CW, v, t)] = load.get((CW, v, t), 0.0) + sum(deliv.get((s, pp, v, t), 0.0) for pp in P if pp == p)
+                prev = CW
+                for s in route:
+                    q[(p, prev, s, v, t)] = float(remaining)
+                    remaining -= float(deliv.get((s, p, v, t), 0.0))
+                    prev = s
+                q[(p, prev, CW, v, t)] = max(0.0, float(remaining))
+            # load per node = cumulative deliveries still to be made at that node
+            total_load = sum(deliv.get((s, p, v, t), 0.0) for s in route for p in P)
+            load[(CW, v, t)] = float(total_load)
+            running = total_load
+            for s in route:
+                running -= sum(deliv.get((s, p, v, t), 0.0) for p in P)
+                load[(s, v, t)] = max(0.0, float(running))
+
+        # Forward simulate inventories and shortages
+        cur_inv_store = {(s, p): float(d.init_inventory_store.get((s, p), 0.0)) for s in N for p in P}
+        cur_inv_wh = {p: float(d.init_inventory_wh.get(p, 0.0)) for p in P}
+        for t in T:
+            for p in P:
+                cur_inv_wh[p] += float(d.replenishment_wh.get((p, t), 0.0))
+                ship = sum(direct_ship_q.get((s, p, t), 0.0) for s in N)
+                cur_inv_wh[p] = max(0.0, cur_inv_wh[p] - ship)
+                inv_wh[(p, t)] = float(cur_inv_wh[p])
+            for s in N:
+                for p in P:
+                    qdir = direct_ship_q.get((s, p, t), 0.0)
+                    demand = float(d.demand.get((s, p, t), 0.0))
+                    new_inv = cur_inv_store[(s, p)] + qdir - demand
+                    shortage[(s, p, t)] = float(max(0.0, -new_inv))
+                    cur_inv_store[(s, p)] = max(0.0, new_inv)
+                    inv_store[(s, p, t)] = float(cur_inv_store[(s, p)])
+
+        efficiency_metrics = {
+            "alns_runtime_seconds": float(runtime_seconds),
+            "alns_iterations": float(iterations),
+            "alns_accepts": float(n_accept),
+            "alns_improvements": float(n_improve),
+            "alns_new_best": float(n_new_best),
+            # Parity keys used by print_efficiency_metrics
+            "gurobi_runtime_seconds": float(runtime_seconds),
+            "lp_iterations": 0.0,
+            "barrier_iterations": 0.0,
+            "nodes_explored": float(iterations),
+            "lp_relaxations_solved_estimate": 1.0,
+        }
+
+        return FullIRPTSolution(
+            status="ALNS-Feasible" if feasible else "ALNS-InfeasiblePenalized",
+            objective=float(final_cost),
+            direct_ship_q=direct_ship_q,
+            inv_store=inv_store,
+            inv_wh=inv_wh,
+            shortage=shortage,
+            x=x,
+            u=u,
+            z=z,
+            q=q,
+            y=y,
+            deliv=deliv,
+            load=load,
+            efficiency_metrics=efficiency_metrics,
+        )
+
+
+# ============================================================================
+# ACHAMRAH-STYLE FULLER IRPT MODEL  (kept for reference / other experiments)
 # ============================================================================
 
 class AchamrahFullIRPTModel:
@@ -3740,9 +4540,18 @@ class IRPResearchPipeline:
     ) -> Dict:
         pipeline_started_at = time.perf_counter()
         print("=" * 80)
-        print("STEP 1 - Solve baseline IRPT")
+        print("STEP 1 - Solve baseline IRPT  (ALNS, DC->stores->DC, no LT)")
         print("=" * 80)
-        baseline_sol = AchamrahFullIRPTModel(self.data).solve(
+        # --- DEPRECATED GUROBI BASELINE (kept commented for reference; ALNS replaces it) ---
+        # baseline_sol = AchamrahFullIRPTModel(self.data).solve(
+        #     msg=msg,
+        #     time_limit=time_limit,
+        #     enforce_integer_flows=enforce_integer_flows,
+        #     add_valid_16_20=True,
+        #     allow_lateral_transshipment=False,
+        #     cw_dispatch_cycle=cw_dispatch_cycle,
+        # )
+        baseline_sol = BaselineALNSModel(self.data).solve(
             msg=msg,
             time_limit=time_limit,
             enforce_integer_flows=enforce_integer_flows,
