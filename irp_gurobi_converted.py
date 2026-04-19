@@ -4998,6 +4998,102 @@ if __name__ == "__main__":
             )
             print("Refreshed GNN history rows:", len(refreshed_history))
 
+            deploy_gnn_after_training = os.environ.get(
+                "IRP_DEPLOY_GNN_AFTER_TRAINING", "1"
+            ).lower() not in {"0", "false", "no"}
+            checkpoint_ready = _project_path(gnn_checkpoint_path).exists()
+            if deploy_gnn_after_training and refreshed_history and checkpoint_ready:
+                print("\n" + "=" * 80)
+                print("PHASE 2 - Deploy trained BiGAT in CG (use_gnn=True, collect_teacher_mode=False)")
+                print("=" * 80)
+                gnn_data, _, _, _ = mapper.build_irp_data(
+                    wh_inventory_multiplier=0.8,
+                    store_capacity_multiplier=1.2,
+                    shortage_cost_rate=0.05,
+                    holding_cost_rate=100,
+                    cw_ship_cost_flat=1.0,
+                    lt_ship_cost_flat=0.6,
+                    fixed_dispatch_cw=8.0,
+                    fixed_dispatch_lt=2.0,
+                    vehicle_count=2,
+                    vehicle_capacity=500.0,
+                    vehicle_fixed_cost=50.0,
+                    alpha=1.0,
+                    cw_replenishment_factor=0.2,
+                    cw_capacity_factor=2.0,
+                    store_initial_inventory_multiplier=float(
+                        os.environ.get("IRP_STORE_INIT_MULTIPLIER", "0.2")
+                    ),
+                )
+                gnn_results = IRPResearchPipeline(gnn_data).run(
+                    use_random_initial_patterns=True,
+                    n_initial_patterns_per_product_period=5,
+                    cg_iterations=int(os.environ.get("IRP_CG_ITERATIONS", "15")),
+                    msg=False,
+                    time_limit=int(env_time_limit) if env_time_limit else None,
+                    enforce_integer_flows=False,
+                    use_gnn=True,
+                    collect_teacher_mode=False,
+                    runtime_gnn_mode=True,
+                    gnn_checkpoint=gnn_checkpoint_path,
+                    use_classical_fallback=True,
+                    gnn_mass_threshold=0.55,
+                    gnn_max_keep=150,
+                    gnn_max_keep_fraction=0.30,
+                    use_branch_and_price=use_branch_and_price,
+                    bp_max_nodes=int(os.environ.get("IRP_BP_MAX_NODES", "15")),
+                    bp_max_depth=int(os.environ.get("IRP_BP_MAX_DEPTH", "6")),
+                    lt_activation_threshold=lt_activation_threshold,
+                    demand_shock_probability=demand_shock_probability,
+                    demand_shock_reallocation_fraction=demand_shock_reallocation_fraction,
+                    demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+                    demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
+                    demand_shock_seed=demand_shock_seed,
+                )
+
+                gnn_lt_plan_path = f"{RESULTS_DIR}/irp_lt_plan_gnn_deployed.csv"
+                gnn_results["lt_plan"].to_csv(gnn_lt_plan_path, index=False)
+                print(f"Saved GNN-deployed LT plan to: {gnn_lt_plan_path}")
+
+                gnn_cost_path = f"{RESULTS_DIR}/irp_realized_operating_cost_breakdown_gnn_deployed.csv"
+                pd.DataFrame([
+                    {"scenario": "without_lt", **gnn_results["realized_no_lt_cost_breakdown"]},
+                    {"scenario": "with_gnn_cg_lt", **gnn_results["realized_with_lt_cost_breakdown"]},
+                ]).to_csv(gnn_cost_path, index=False)
+                print(f"Saved GNN-deployed realized cost breakdown to: {gnn_cost_path}")
+
+                gnn_cg_history_path = f"{RESULTS_DIR}/irp_gnn_cg_episode_history_gnn_deployed.csv"
+                pd.DataFrame(gnn_results["cg_episode_history"]).to_csv(gnn_cg_history_path, index=False)
+                print(f"Saved GNN-deployed CG episode history to: {gnn_cg_history_path}")
+
+                gnn_bp_history_path = f"{RESULTS_DIR}/irp_branch_price_history_gnn_deployed.csv"
+                pd.DataFrame(gnn_results["branch_price_history"]).to_csv(gnn_bp_history_path, index=False)
+                print(f"Saved GNN-deployed branch-and-price history to: {gnn_bp_history_path}")
+
+                gnn_selection_path = f"{RESULTS_DIR}/irp_gnn_selected_columns_gnn_deployed.json"
+                with open(gnn_selection_path, "w", encoding="utf-8") as f:
+                    json.dump(gnn_results["gnn_selection_history"], f, indent=2)
+                print(f"Saved GNN-deployed selected-column history to: {gnn_selection_path}")
+
+                gnn_comparison_path = f"{RESULTS_DIR}/irp_phase_comparison.csv"
+                teacher_cmp = results["comparison"]
+                gnn_cmp = gnn_results["comparison"]
+                pd.DataFrame([
+                    {"phase": "teacher_collection_classical_cg", **teacher_cmp},
+                    {"phase": "gnn_deployed_cg", **gnn_cmp},
+                ]).to_csv(gnn_comparison_path, index=False)
+                print(f"Saved phase comparison (classical vs GNN) to: {gnn_comparison_path}")
+            elif deploy_gnn_after_training and not checkpoint_ready:
+                print(
+                    f"[Phase 2] Skipped GNN deployment: checkpoint not found at "
+                    f"{_project_path(gnn_checkpoint_path)}"
+                )
+            elif deploy_gnn_after_training and not refreshed_history:
+                print(
+                    "[Phase 2] Skipped GNN deployment: training produced no history rows "
+                    "(teacher graph dataset was likely empty)."
+                )
+
     cg_cost_chart_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_cg_total_cost_curve.png"
     saved_chart = save_cg_cost_curve(results["cg_episode_history"], cg_cost_chart_path)
     if saved_chart:
