@@ -28,6 +28,7 @@ pip install pandas openpyxl gurobipy
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Iterable, Set, Any
+import hashlib
 import importlib
 import itertools
 import json
@@ -181,11 +182,20 @@ def run_teacher_graph_and_gnn_training(
     train_epochs: int = 5,
     resume_checkpoint: bool = False,
     checkpoint_path: str = DEFAULT_GNN_CHECKPOINT,
-) -> None:
+    training_history_csv_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Build teacher graph samples and train the BiGAT scorer.
+
+    Returns the training history (list of per-epoch dicts). If
+    `training_history_csv_path` is provided, also writes the history as a CSV
+    at that path. If it's left as None, the CSV is written next to the project
+    Results directory as `irp_gnn_training_history.csv` (so Kaggle exports
+    automatically produce the file without needing extra code downstream).
+    """
     teacher_csv = _project_path(teacher_csv_path)
     if not teacher_csv.exists() or teacher_csv.stat().st_size <= 1:
         print(f"[Teacher/GNN] No non-empty teacher CSV found; skip graph/GNN update: {teacher_csv}")
-        return
+        return []
 
     if build_graphs:
         print("\n[Teacher Graph Dataset Update]")
@@ -203,6 +213,7 @@ def run_teacher_graph_and_gnn_training(
             check=True,
         )
 
+    history: List[Dict[str, Any]] = []
     if train_gnn:
         cmd = [
             sys.executable,
@@ -219,8 +230,33 @@ def run_teacher_graph_and_gnn_training(
         checkpoint = _project_path(checkpoint_path)
         if resume_checkpoint and checkpoint.exists():
             cmd.extend(["--resume-checkpoint", str(checkpoint)])
-        print("\n[Teacher BiGAT Training Update]")
+            print("\n[Teacher BiGAT Training Update] (resume from existing checkpoint)")
+        else:
+            if not resume_checkpoint and checkpoint.exists():
+                print(f"\n[Teacher BiGAT Training Update] Found existing checkpoint at {checkpoint}; "
+                      f"training fresh because resume_checkpoint=False. Pass resume_checkpoint=True to fine-tune.")
+            else:
+                print("\n[Teacher BiGAT Training Update] (fresh training)")
         subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent), check=True)
+
+        history = load_gnn_training_history(checkpoint_path)
+        if not history:
+            print(
+                "[Teacher/GNN] Training subprocess exited cleanly but wrote no history rows. "
+                "This usually means build_teacher_graph_dataset.py produced zero samples — "
+                "check constraint_features_json diversity or group_key collapse."
+            )
+
+        resolved_csv_path = (
+            Path(training_history_csv_path)
+            if training_history_csv_path
+            else Path(RESULTS_DIR) / "irp_gnn_training_history.csv"
+        )
+        resolved_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(history).to_csv(resolved_csv_path, index=False)
+        print(f"[Teacher/GNN] Wrote training history CSV ({len(history)} rows) to: {resolved_csv_path}")
+
+    return history
 
 
 # ============================================================================
@@ -664,14 +700,24 @@ class DatasetToIRPValidationMapper:
         data.alpha = alpha
 
         # replenishment to warehouse by period/product
+        # cw_replenishment_factor controls the per-cycle top-up size relative to the
+        # cycle's forecast demand: factor=1.0 covers exactly one cycle's demand,
+        # factor<1.0 under-stocks (forces tighter planning + real LT opportunities),
+        # factor>1.0 over-stocks the warehouse.
         demand_by_sku_period = base.groupby(["sku", "period"])["sale_qty"].sum().to_dict()
         replenishment_cycle = 7   # replenish from DC every 7 days
+        cw_replenishment_factor = max(0.0, float(cw_replenishment_factor))
         for p in products:
             for t in periods:
                 if (t - 1) % replenishment_cycle == 0:
+                    cycle_demand = sum(
+                        float(demand_by_sku_period.get((p, tt), 0.0))
+                        for tt in periods
+                        if t <= tt < t + replenishment_cycle
+                    )
                     data.replenishment_wh[(p, t)] = max(
                         0.0,
-                        1.2 * float(demand_by_sku_period.get((p, t), 0.0))
+                        cw_replenishment_factor * cycle_demand,
                     )
                 else:
                     data.replenishment_wh[(p, t)] = 0.0
@@ -2181,6 +2227,7 @@ class LateralTransshipmentCG:
         gnn_max_keep_fraction: float = 0.30,
         gnn_root: str = "GNN",
         branch_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
+        diagnostic_verbosity: str = "summary",
     ):
         self.data = data
         self.baseline = baseline_solution
@@ -2241,6 +2288,11 @@ class LateralTransshipmentCG:
         self.last_added_patterns = 0
         self._last_candidate_pair_count = 0
         self._last_pricing_summary: Dict[str, Any] = {}
+        verbosity = str(diagnostic_verbosity or "summary").strip().lower()
+        if verbosity not in {"summary", "full"}:
+            verbosity = "summary"
+        self.diagnostic_verbosity = verbosity
+        self._log_candidate_pairs = verbosity == "full"
 
     def _compute_combined_column_scores(self, patterns: List[LTPattern], probs: List[float]) -> List[Dict[str, float]]:
         rc_gains = []
@@ -2412,12 +2464,24 @@ class LateralTransshipmentCG:
                 edge_constraint_ids_by_col.setdefault(col_idx, []).append(int(con_indices[edge_pos]))
                 edge_attrs_by_col.setdefault(col_idx, []).append([float(value) for value in edge_attrs[edge_pos]])
         constraint_features_json = json.dumps(constraint_features.tolist()) if constraint_features is not None else ""
+        # `constraint_features_json` is identical for every pattern exported by this
+        # batch (same branch node / episode / product / period / RMP state), but it
+        # can be ~20 KB per row. Write it only on the first row of the batch and leave
+        # subsequent rows empty — build_teacher_graph_dataset.py fills missing values
+        # from the first non-empty row in each group. This shrinks the teacher CSV by
+        # roughly the number of patterns per batch (55 MB → a few MB on realistic runs).
+        constraint_state_hash = (
+            hashlib.sha1(constraint_features_json.encode("utf-8")).hexdigest()[:12]
+            if constraint_features_json
+            else "no_constraints"
+        )
         full_negative_rc_count = sum(
             1 for pat in patterns
             if float(pat.metadata.get("reduced_cost", 0.0) or 0.0) < -1e-6
         )
         for idx, pat in enumerate(patterns):
             row = score_by_idx.get(idx, {})
+            per_row_constraint_json = constraint_features_json if idx == 0 else ""
             self.teacher_dataset_rows.append({
                 "source_instance": "irplt_cg",
                 "branch_node_id": self.current_branch_node_id,
@@ -2431,7 +2495,8 @@ class LateralTransshipmentCG:
                     for (donor, receiver), qty in pat.pattern_flows.items()
                 ]),
                 "column_features_json": json.dumps(column_features[idx].tolist()) if column_features is not None else "",
-                "constraint_features_json": constraint_features_json,
+                "constraint_features_json": per_row_constraint_json,
+                "constraint_state_hash": constraint_state_hash,
                 "edge_constraint_indices_json": json.dumps(edge_constraint_ids_by_col.get(idx, [])),
                 "edge_attrs_json": json.dumps(edge_attrs_by_col.get(idx, [])),
                 "gnn_prob": row.get("gnn_prob"),
@@ -3034,32 +3099,33 @@ class LateralTransshipmentCG:
                     payload_copy["feature_name"] = feature_name
                     payload_copy["feature_score"] = payload["base_rank_score"] + feature_bonus
                     pruned[feature_name].append(payload_copy)
-                    self.column_pool_diagnostics.append({
-                        "episode": episode,
-                        "stage": "candidate_pair_before_stackelberg",
-                        "product": p,
-                        "period": t,
-                        "feature_name": feature_name,
-                        "donor_store": i,
-                        "receiver_store": j,
-                        "qty_cap": qty_cap,
-                        "reduced_cost_proxy": reduced_cost_proxy,
-                        "stackelberg_accepted": None,
-                        "acceptance_score": None,
-                        "compensation": None,
-                        "pattern_id": "",
-                        "pattern_reduced_cost": None,
-                        "gnn_score": None,
-                        "gnn_combined_score": None,
-                        "gnn_selected": None,
-                        "gnn_selected_by_fallback": None,
-                        "adaptive_k_star": None,
-                        "duplicate_id_reject": False,
-                        "duplicate_signature_reject": False,
-                        "empty_flow_reject": False,
-                        "added_to_pool": False,
-                        "signature": "",
-                    })
+                    if self._log_candidate_pairs:
+                        self.column_pool_diagnostics.append({
+                            "episode": episode,
+                            "stage": "candidate_pair_before_stackelberg",
+                            "product": p,
+                            "period": t,
+                            "feature_name": feature_name,
+                            "donor_store": i,
+                            "receiver_store": j,
+                            "qty_cap": qty_cap,
+                            "reduced_cost_proxy": reduced_cost_proxy,
+                            "stackelberg_accepted": None,
+                            "acceptance_score": None,
+                            "compensation": None,
+                            "pattern_id": "",
+                            "pattern_reduced_cost": None,
+                            "gnn_score": None,
+                            "gnn_combined_score": None,
+                            "gnn_selected": None,
+                            "gnn_selected_by_fallback": None,
+                            "adaptive_k_star": None,
+                            "duplicate_id_reject": False,
+                            "duplicate_signature_reject": False,
+                            "empty_flow_reject": False,
+                            "added_to_pool": False,
+                            "signature": "",
+                        })
 
         for feature_name, rows in pruned.items():
             rows.sort(key=lambda x: x["feature_score"], reverse=True)
@@ -3985,7 +4051,10 @@ def build_predicted_inventory_df(solution) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_demand_fulfillment_df(data: IRPData, solution: FullIRPTSolution) -> pd.DataFrame:
+def build_forecast_fulfillment_df(data: IRPData, solution: FullIRPTSolution) -> pd.DataFrame:
+    """Pre-shock baseline fulfillment using forecast demand. Almost always 100%
+    because the baseline is planned against forecast demand with ample capacity —
+    included for comparison against the post-shock realization only."""
     rows = []
     for s in data.stores:
         for t in data.periods:
@@ -3996,12 +4065,17 @@ def build_demand_fulfillment_df(data: IRPData, solution: FullIRPTSolution) -> pd
             rows.append({
                 "store": s,
                 "period": t,
-                "total_demand": round(total_demand, 6),
-                "fulfilled_demand": round(fulfilled_demand, 6),
-                "shortage": round(total_shortage, 6),
-                "demand_fulfillment_rate": round(fulfillment_rate, 6),
+                "forecast_demand": round(total_demand, 6),
+                "forecast_fulfilled_demand": round(fulfilled_demand, 6),
+                "forecast_shortage": round(total_shortage, 6),
+                "forecast_fulfillment_rate": round(fulfillment_rate, 6),
             })
     return pd.DataFrame(rows)
+
+
+# Back-compat alias. Do not remove — keeps existing callers working while making
+# the pre-shock semantics explicit in code that's been updated.
+build_demand_fulfillment_df = build_forecast_fulfillment_df
 
 
 def build_post_shock_fulfillment_df(data: IRPData) -> pd.DataFrame:
@@ -4537,6 +4611,7 @@ class IRPResearchPipeline:
         demand_shock_reallocations_per_product_period: int = 3,
         demand_shock_non_dispatch_multiplier: float = 1.8,
         demand_shock_seed: int = 20260418,
+        diagnostic_verbosity: str = "summary",
     ) -> Dict:
         pipeline_started_at = time.perf_counter()
         print("=" * 80)
@@ -4584,6 +4659,7 @@ class IRPResearchPipeline:
             baseline_sol,
             lt_activation_threshold=lt_activation_threshold,
         )
+        forecast_fulfillment_df = build_forecast_fulfillment_df(self.data, baseline_sol)
         demand_fulfillment_df = build_post_shock_fulfillment_df(self.data)
         print("[Hidden Demand Shock Summary]")
         pprint.pprint(shock_summary)
@@ -4656,6 +4732,7 @@ class IRPResearchPipeline:
             gnn_relative_threshold=gnn_relative_threshold,
             gnn_max_keep=gnn_max_keep,
             gnn_max_keep_fraction=gnn_max_keep_fraction,
+            diagnostic_verbosity=diagnostic_verbosity,
         )
         if use_branch_and_price:
             cg_sol = cg_engine.run_branch_and_price(
@@ -4711,6 +4788,8 @@ class IRPResearchPipeline:
             "baseline_solution": baseline_sol,
             "baseline_routes": baseline_routes,
             "demand_fulfillment": demand_fulfillment_df,
+            "forecast_demand_fulfillment": forecast_fulfillment_df,
+            "post_shock_demand_fulfillment": demand_fulfillment_df,
             "baseline_cost_breakdown": baseline_cost_breakdown,
             "realized_no_lt_cost_breakdown": realized_no_lt_cost_breakdown,
             "realized_with_lt_cost_breakdown": realized_with_lt_cost_breakdown,
@@ -4836,9 +4915,13 @@ if __name__ == "__main__":
     baseline_routes_df.to_csv(routes_path, index=False)
     print(f"Saved baseline routes to: {routes_path}")
 
-    fulfillment_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_demand_fulfillment.csv"
-    results["demand_fulfillment"].to_csv(fulfillment_path, index=False)
-    print(f"Saved post-shock demand fulfillment rates to: {fulfillment_path}")
+    post_shock_fulfillment_path = f"{RESULTS_DIR}/irp_post_shock_demand_fulfillment.csv"
+    results["post_shock_demand_fulfillment"].to_csv(post_shock_fulfillment_path, index=False)
+    print(f"Saved post-shock demand fulfillment rates to: {post_shock_fulfillment_path}")
+
+    forecast_fulfillment_path = f"{RESULTS_DIR}/irp_forecast_demand_fulfillment.csv"
+    results["forecast_demand_fulfillment"].to_csv(forecast_fulfillment_path, index=False)
+    print(f"Saved pre-shock (forecast) demand fulfillment to: {forecast_fulfillment_path}")
 
     solver_metrics_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_solver_efficiency_metrics.csv"
     pd.DataFrame([
@@ -4870,9 +4953,13 @@ if __name__ == "__main__":
     results["lt_plan"].to_csv(lt_plan_path, index=False)
     print(f"Saved lateral transshipment plan to: {lt_plan_path}")
 
-    gnn_training_history_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_training_history.csv"
-    pd.DataFrame(results["gnn_training_history"]).to_csv(gnn_training_history_path, index=False)
-    print(f"Saved GNN training loss history to: {gnn_training_history_path}")
+    # irp_gnn_training_history.csv is now written directly inside
+    # run_teacher_graph_and_gnn_training() after every training run so that
+    # Kaggle-style scripts which don't go through __main__ also produce it.
+    if results.get("gnn_training_history"):
+        legacy_training_history_path = f"{RESULTS_DIR}/irp_gnn_training_history_runtime.csv"
+        pd.DataFrame(results["gnn_training_history"]).to_csv(legacy_training_history_path, index=False)
+        print(f"Saved runtime GNN training history (pre-refresh) to: {legacy_training_history_path}")
 
     cg_episode_history_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_cg_episode_history.csv"
     pd.DataFrame(results["cg_episode_history"]).to_csv(cg_episode_history_path, index=False)
@@ -4901,7 +4988,7 @@ if __name__ == "__main__":
         teacher_dataset_df.to_csv(teacher_dataset_path, index=False)
         print(f"Saved CG teacher dataset rows to: {teacher_dataset_path}")
         if collect_teacher_mode:
-            run_teacher_graph_and_gnn_training(
+            refreshed_history = run_teacher_graph_and_gnn_training(
                 teacher_csv_path=teacher_dataset_path,
                 build_graphs=build_teacher_graphs,
                 train_gnn=train_gnn_after_teacher,
@@ -4909,8 +4996,6 @@ if __name__ == "__main__":
                 resume_checkpoint=resume_gnn_checkpoint,
                 checkpoint_path=gnn_checkpoint_path,
             )
-            refreshed_history = load_gnn_training_history(gnn_checkpoint_path)
-            pd.DataFrame(refreshed_history).to_csv(f"{RESULTS_DIR}/irp_gnn_training_history.csv", index=False)
             print("Refreshed GNN history rows:", len(refreshed_history))
 
     cg_cost_chart_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_cg_total_cost_curve.png"

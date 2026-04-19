@@ -24,9 +24,39 @@ def group_key(row: Dict[str, Any]) -> GroupKey:
     episode = str(row.get("episode") or row.get("episode_id") or "0")
     product = str(row.get("product") or row.get("sku") or "unknown_product")
     period = str(row.get("period") or row.get("time_period") or "unknown_period")
-    constraint_json = str(row.get("constraint_features_json") or "")
-    constraint_state = hashlib.sha1(constraint_json.encode("utf-8")).hexdigest()[:12] if constraint_json else "no_constraints"
+    # Prefer the precomputed `constraint_state_hash` column written by recent
+    # teacher exports — those leave `constraint_features_json` blank on all
+    # rows except the first in each batch to save CSV size. Fall back to
+    # hashing the JSON for legacy CSVs that still carry it on every row.
+    stored_hash = str(row.get("constraint_state_hash") or "").strip()
+    if stored_hash:
+        constraint_state = stored_hash
+    else:
+        constraint_json = str(row.get("constraint_features_json") or "")
+        constraint_state = (
+            hashlib.sha1(constraint_json.encode("utf-8")).hexdigest()[:12]
+            if constraint_json
+            else "no_constraints"
+        )
     return source_instance, branch_node, episode, product, period, constraint_state
+
+
+def propagate_constraint_features_json(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Within each (group_key) bucket, fill the empty `constraint_features_json`
+    entries with the first non-empty value in the group. The teacher exporter
+    writes the full JSON only on the first row of each batch to keep the CSV
+    small; consumers that previously read the JSON per-row still get a full
+    value after this pass."""
+    first_by_group: Dict[GroupKey, str] = {}
+    for row in rows:
+        key = group_key(row)
+        value = str(row.get("constraint_features_json") or "").strip()
+        if value and key not in first_by_group:
+            first_by_group[key] = value
+    for row in rows:
+        if not str(row.get("constraint_features_json") or "").strip():
+            row["constraint_features_json"] = first_by_group.get(group_key(row), "")
+    return rows
 
 
 def read_teacher_rows(path: Path) -> List[Dict[str, Any]]:
@@ -136,6 +166,11 @@ def main() -> None:
         raise RuntimeError(
             f"No teacher rows found in {teacher_csv}. Run the CG pipeline first so it exports rich teacher rows."
         )
+
+    # Deduplicated teacher exports blank out `constraint_features_json` on all
+    # rows except the first of each batch. Fill them back in before grouping
+    # so `build_training_sample_from_exported_teacher_rows` has what it needs.
+    rows = propagate_constraint_features_json(rows)
 
     grouped_rows: Dict[GroupKey, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
