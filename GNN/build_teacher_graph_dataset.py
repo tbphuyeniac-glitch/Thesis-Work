@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -59,7 +60,52 @@ def propagate_constraint_features_json(rows: List[Dict[str, Any]]) -> List[Dict[
     return rows
 
 
+def _raise_csv_field_size_limit() -> int:
+    """Allow large JSON payloads in legacy teacher CSV fields."""
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return limit
+        except OverflowError:
+            limit = int(limit / 10)
+
+
+def _dataframe_to_records(df: Any) -> List[Dict[str, Any]]:
+    import pandas as pd
+
+    df = df.where(pd.notna(df), "")
+    return df.to_dict(orient="records")
+
+
 def read_teacher_rows(path: Path) -> List[Dict[str, Any]]:
+    name = path.name.lower()
+    if name.endswith((".pkl", ".pickle", ".pkl.gz", ".pickle.gz")):
+        import pandas as pd
+
+        return _dataframe_to_records(pd.read_pickle(path))
+    if name.endswith(".parquet"):
+        import pandas as pd
+
+        return _dataframe_to_records(pd.read_parquet(path))
+    if name.endswith(".jsonl"):
+        rows: List[Dict[str, Any]] = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+    if name.endswith(".json"):
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+            return payload["rows"]
+        raise ValueError(f"Unsupported teacher JSON shape in {path}; expected a row list or {{'rows': [...]}}")
+
+    _raise_csv_field_size_limit()
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
@@ -149,7 +195,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert CG teacher CSV rows into train/valid/test graph samples for teacher-supervised BiGAT training."
     )
-    parser.add_argument("--teacher-csv", default="Results/cg_teacher_dataset.csv")
+    parser.add_argument(
+        "--teacher-csv",
+        default="Results/cg_teacher_dataset.csv",
+        help="Teacher rows file. CSV is supported for legacy runs; .pkl.gz is preferred for large Kaggle exports.",
+    )
     parser.add_argument("--out-dir", default="GNN/data/irplt_teacher")
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--valid-ratio", type=float, default=0.15)

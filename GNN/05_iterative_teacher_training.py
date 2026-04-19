@@ -19,9 +19,20 @@ from pathlib import Path
 from typing import Dict, List
 
 
+def raise_csv_field_size_limit() -> int:
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return limit
+        except OverflowError:
+            limit = int(limit / 10)
+
+
 def read_csv_rows(path: Path) -> List[Dict[str, str]]:
     if not path.exists() or path.stat().st_size == 0:
         return []
+    raise_csv_field_size_limit()
     with open(path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 

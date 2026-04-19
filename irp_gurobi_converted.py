@@ -149,6 +149,39 @@ def _project_path(path: str) -> Path:
     return Path(__file__).resolve().parent / value
 
 
+def _preferred_teacher_rows_path(path: str | Path) -> Path:
+    """Prefer a compact binary teacher export when it exists next to a CSV."""
+    value = _project_path(str(path))
+    if value.name.lower().endswith(".csv"):
+        for candidate in (
+            value.with_suffix(".pkl.gz"),
+            value.with_suffix(".pickle.gz"),
+            value.with_suffix(".pkl"),
+            value.with_suffix(".pickle"),
+            value.with_suffix(".parquet"),
+        ):
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+    return value
+
+
+def _write_teacher_dataset_exports(df: pd.DataFrame, csv_path: str | Path) -> Path:
+    """Write teacher rows as CSV for inspection and as pkl.gz for robust graph builds."""
+    resolved_csv_path = _project_path(str(csv_path))
+    resolved_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_pickle_path = resolved_csv_path.with_suffix(".pkl.gz")
+    write_csv = os.environ.get("IRP_WRITE_TEACHER_CSV", "1").lower() not in {"0", "false", "no"}
+
+    df.to_pickle(resolved_pickle_path)
+    if write_csv:
+        df.to_csv(resolved_csv_path, index=False)
+        print(f"Saved CG teacher dataset CSV to: {resolved_csv_path}")
+    else:
+        print(f"Skipped full teacher CSV export because IRP_WRITE_TEACHER_CSV=0: {resolved_csv_path}")
+    print(f"Saved CG teacher dataset pickle to: {resolved_pickle_path}")
+    return resolved_pickle_path
+
+
 def load_gnn_training_history(checkpoint_path: str = DEFAULT_GNN_CHECKPOINT) -> List[Dict[str, Any]]:
     history_path = _project_path(checkpoint_path).parent / "training_history.json"
     if not history_path.exists():
@@ -192,10 +225,13 @@ def run_teacher_graph_and_gnn_training(
     Results directory as `irp_gnn_training_history.csv` (so Kaggle exports
     automatically produce the file without needing extra code downstream).
     """
-    teacher_csv = _project_path(teacher_csv_path)
-    if not teacher_csv.exists() or teacher_csv.stat().st_size <= 1:
-        print(f"[Teacher/GNN] No non-empty teacher CSV found; skip graph/GNN update: {teacher_csv}")
+    requested_teacher_path = _project_path(teacher_csv_path)
+    teacher_rows_path = _preferred_teacher_rows_path(requested_teacher_path)
+    if not teacher_rows_path.exists() or teacher_rows_path.stat().st_size <= 1:
+        print(f"[Teacher/GNN] No non-empty teacher rows file found; skip graph/GNN update: {teacher_rows_path}")
         return []
+    if teacher_rows_path != requested_teacher_path:
+        print(f"[Teacher/GNN] Using compact teacher rows file for graph build: {teacher_rows_path}")
 
     if build_graphs:
         print("\n[Teacher Graph Dataset Update]")
@@ -204,7 +240,7 @@ def run_teacher_graph_and_gnn_training(
                 sys.executable,
                 "GNN/build_teacher_graph_dataset.py",
                 "--teacher-csv",
-                str(teacher_csv),
+                str(teacher_rows_path),
                 "--out-dir",
                 "GNN/data/irplt_teacher",
                 "--overwrite",
@@ -4984,7 +5020,7 @@ if __name__ == "__main__":
     pd.DataFrame(results["column_pool_diagnostics"]).to_csv(column_pool_diagnostics_path, index=False)
     print(f"Saved column pool diagnostics to: {column_pool_diagnostics_path}")
 
-    teacher_dataset_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/cg_teacher_dataset.csv"
+    teacher_dataset_path = RESULTS_DIR / "cg_teacher_dataset.csv"
     teacher_dataset_df = pd.DataFrame(results["teacher_dataset_rows"])
     if teacher_dataset_df.empty:
         print(
@@ -4992,11 +5028,10 @@ if __name__ == "__main__":
             "skipping teacher CSV overwrite, graph rebuild, and GNN training update."
         )
     else:
-        teacher_dataset_df.to_csv(teacher_dataset_path, index=False)
-        print(f"Saved CG teacher dataset rows to: {teacher_dataset_path}")
+        teacher_graph_input_path = _write_teacher_dataset_exports(teacher_dataset_df, teacher_dataset_path)
         if collect_teacher_mode:
             refreshed_history = run_teacher_graph_and_gnn_training(
-                teacher_csv_path=teacher_dataset_path,
+                teacher_csv_path=str(teacher_graph_input_path),
                 build_graphs=build_teacher_graphs,
                 train_gnn=train_gnn_after_teacher,
                 train_epochs=gnn_train_epochs,
