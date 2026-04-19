@@ -3931,8 +3931,8 @@ if __name__ == "__main__":
     mapper = DatasetToIRPValidationMapper(
         excel_path=EXCEL_PATH,
         sheet_name="Sheet1",
-        store_limit=7,
-        sku_limit=3,
+        store_limit=10,
+        sku_limit=5,
         start_date="None",
         end_date="None",
     )
@@ -3947,7 +3947,7 @@ if __name__ == "__main__":
         fixed_dispatch_cw=8.0,
         fixed_dispatch_lt=2.0,
         vehicle_count=2,
-        vehicle_capacity=700.0,
+        vehicle_capacity=500.0,
         vehicle_fixed_cost=50.0,
         alpha=1.0,
         cw_replenishment_factor=0.2,
