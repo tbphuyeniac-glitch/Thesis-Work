@@ -4431,6 +4431,388 @@ def print_lt_plan(lt_plan_df: pd.DataFrame, title: str = "Lateral Transshipment 
         )
 
 
+def _mpl_agg():
+    """Return (matplotlib, pyplot) with Agg backend, or (None, None) if unavailable."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return matplotlib, plt
+    except Exception:
+        return None, None
+
+
+def _save_fig(plt, path: str, tight: bool = True) -> str:
+    if tight:
+        plt.tight_layout()
+    plt.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close()
+    return path
+
+
+def save_pipeline_charts(
+    results: Dict[str, Any],
+    out_dir: Path,
+    refreshed_gnn_history: Optional[List[Dict[str, Any]]] = None,
+    phase_comparison_df: Optional[pd.DataFrame] = None,
+) -> List[str]:
+    """Generate all pipeline visualisation charts and write them to *out_dir*.
+
+    Returns a list of paths that were actually written.
+    """
+    mpl, plt = _mpl_agg()
+    if plt is None:
+        print("[Charts] matplotlib not available; skipping all charts.")
+        return []
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[str] = []
+
+    # ------------------------------------------------------------------
+    # 1. GNN Training Loss Curve
+    # ------------------------------------------------------------------
+    gnn_history = refreshed_gnn_history or results.get("gnn_training_history") or []
+    if gnn_history:
+        try:
+            epochs = [int(r.get("epoch", r.get("episode", i))) for i, r in enumerate(gnn_history)]
+            train_loss = [float(r.get("train_loss", float("nan"))) for r in gnn_history]
+            valid_loss = [float(r.get("valid_loss", float("nan"))) for r in gnn_history]
+            valid_f1   = [float(r.get("valid_f1",   float("nan"))) for r in gnn_history]
+            valid_top1 = [float(r.get("valid_top1", float("nan"))) for r in gnn_history]
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            ax1, ax2 = axes
+
+            ax1.plot(epochs, train_loss, marker="o", label="Train Loss", linewidth=2)
+            ax1.plot(epochs, valid_loss, marker="s", linestyle="--", label="Valid Loss", linewidth=2)
+            ax1.set_xlabel("Epoch")
+            ax1.set_ylabel("Loss")
+            ax1.set_title("GNN Training Loss")
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+
+            ax2.plot(epochs, valid_f1,   marker="^", label="Valid F1",   linewidth=2, color="green")
+            ax2.plot(epochs, valid_top1, marker="D", linestyle="--", label="Valid Top-1", linewidth=2, color="darkorange")
+            ax2.set_xlabel("Epoch")
+            ax2.set_ylabel("Score")
+            ax2.set_title("GNN Validation Metrics")
+            ax2.set_ylim(0, 1.05)
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+
+            path = str(out_dir / "chart_01_gnn_training.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_01_gnn_training: {exc}")
+
+    # ------------------------------------------------------------------
+    # 2. CG Cost Convergence (all B&P nodes)
+    # ------------------------------------------------------------------
+    cg_all = results.get("cg_episode_history") or []
+    if cg_all:
+        try:
+            cg_df = pd.DataFrame(cg_all)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            node_ids = sorted(cg_df["branch_node_id"].unique()) if "branch_node_id" in cg_df.columns else [0]
+            cmap = mpl.colormaps.get_cmap("tab10")
+            for idx, nid in enumerate(node_ids):
+                sub = cg_df[cg_df["branch_node_id"] == nid] if "branch_node_id" in cg_df.columns else cg_df
+                label = f"Node {nid}"
+                ax.plot(sub["episode"], sub["total_cost"] / 1e6,
+                        marker="o", linewidth=1.5, color=cmap(idx % 10), label=label, markersize=4)
+            ax.set_xlabel("CG Episode (within node)")
+            ax.set_ylabel("Total Cost (M)")
+            ax.set_title("Column Generation Cost Convergence per B&P Node")
+            if len(node_ids) <= 10:
+                ax.legend(fontsize=7, ncol=2)
+            ax.grid(True, alpha=0.3)
+            path = str(out_dir / "chart_02_cg_convergence.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_02_cg_convergence: {exc}")
+
+    # ------------------------------------------------------------------
+    # 3. Cost Breakdown Comparison: baseline | without LT | with CG LT
+    # ------------------------------------------------------------------
+    no_lt  = results.get("realized_no_lt_cost_breakdown")  or {}
+    with_lt = results.get("realized_with_lt_cost_breakdown") or {}
+    baseline_bd = results.get("baseline_cost_breakdown") or {}
+    if no_lt and with_lt:
+        try:
+            components = [
+                ("DC Ship",      "direct_cw_unit_cost",                  "direct_cw_unit_cost_executed_plan"),
+                ("Store Hold",   "store_holding_cost",                   "store_holding_cost_realized"),
+                ("WH Hold",      "warehouse_holding_cost",               "warehouse_holding_cost_executed_plan"),
+                ("Route",        "route_distance_cost",                  "route_distance_cost_executed_plan"),
+                ("Vehicle",      "vehicle_fixed_cost",                   "vehicle_fixed_cost_executed_plan"),
+                ("LT Cost",      None,                                   "lateral_transshipment_cost_realized"),
+                ("Shortage",     "shortage_cost",                        "shortage_cost_realized"),
+            ]
+            labels = [c[0] for c in components]
+            baseline_vals = [float(baseline_bd.get(c[1], 0.0)) / 1e6 if c[1] else 0.0 for c in components]
+            nolt_vals    = [float(no_lt.get(c[2],  0.0)) / 1e6 for c in components]
+            withlt_vals  = [float(with_lt.get(c[2], 0.0)) / 1e6 for c in components]
+
+            x = range(len(labels))
+            width = 0.25
+            fig, ax = plt.subplots(figsize=(12, 5))
+            ax.bar([i - width for i in x], baseline_vals, width, label="Baseline (forecast)", color="#4C72B0")
+            ax.bar([i         for i in x], nolt_vals,    width, label="Realized — No LT",    color="#DD8452")
+            ax.bar([i + width for i in x], withlt_vals,  width, label="Realized — With LT",  color="#55A868")
+            ax.set_xticks(list(x))
+            ax.set_xticklabels(labels, rotation=20, ha="right")
+            ax.set_ylabel("Cost (M)")
+            ax.set_title("Cost Breakdown: Baseline vs Realized Without/With LT")
+            ax.legend()
+            ax.grid(True, axis="y", alpha=0.3)
+            path = str(out_dir / "chart_03_cost_breakdown.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_03_cost_breakdown: {exc}")
+
+    # ------------------------------------------------------------------
+    # 4. Shortage Reduction: before / after LT
+    # ------------------------------------------------------------------
+    if no_lt and with_lt:
+        try:
+            categories = ["Shortage Units", "Shortage Cost (k)"]
+            before = [
+                float(no_lt.get("total_realized_shortage_units", 0.0)),
+                float(no_lt.get("shortage_cost_realized", 0.0)) / 1e3,
+            ]
+            after = [
+                float(with_lt.get("total_realized_shortage_units", 0.0)),
+                float(with_lt.get("shortage_cost_realized", 0.0)) / 1e3,
+            ]
+            x = range(len(categories))
+            width = 0.35
+            fig, ax = plt.subplots(figsize=(7, 4))
+            bars1 = ax.bar([i - width/2 for i in x], before, width, label="Without LT", color="#DD8452")
+            bars2 = ax.bar([i + width/2 for i in x], after,  width, label="With LT",    color="#55A868")
+            for bar in bars1:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
+                        f"{bar.get_height():,.1f}", ha="center", va="bottom", fontsize=8)
+            for bar in bars2:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
+                        f"{bar.get_height():,.1f}", ha="center", va="bottom", fontsize=8)
+            ax.set_xticks(list(x))
+            ax.set_xticklabels(categories)
+            ax.set_title("Shortage Reduction via Lateral Transshipment")
+            ax.legend()
+            ax.grid(True, axis="y", alpha=0.3)
+            path = str(out_dir / "chart_04_shortage_reduction.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_04_shortage_reduction: {exc}")
+
+    # ------------------------------------------------------------------
+    # 5. Demand Fulfillment Rate by Store (post-shock, before vs after LT)
+    # ------------------------------------------------------------------
+    post_shock_df = results.get("post_shock_demand_fulfillment")
+    lt_plan_df    = results.get("lt_plan")
+    if post_shock_df is not None and not post_shock_df.empty and no_lt and with_lt:
+        try:
+            # Aggregate by store (mean fulfillment rate)
+            rate_col = "post_shock_fulfillment_rate" if "post_shock_fulfillment_rate" in post_shock_df.columns else "demand_fulfillment_rate"
+            store_rates = post_shock_df.groupby("store")[rate_col].mean().sort_values()
+            stores = list(store_rates.index)
+
+            # Compute per-store post-LT fulfillment from realized breakdown
+            shortage_no_lt  = float(no_lt.get("total_realized_shortage_units", 0.0))
+            shortage_with_lt = float(with_lt.get("total_realized_shortage_units", 0.0))
+            total_demand_all = float(post_shock_df["total_realized_demand"].sum()) if "total_realized_demand" in post_shock_df.columns else 0.0
+
+            fig, ax = plt.subplots(figsize=(max(8, len(stores)), 5))
+            x = range(len(stores))
+            pre_lt_vals  = [float(store_rates[s]) * 100 for s in stores]
+
+            # Post-LT per store: approximation — distribute LT benefit proportionally to pre-LT shortage
+            if lt_plan_df is not None and not lt_plan_df.empty and "to_store" in lt_plan_df.columns:
+                lt_received = lt_plan_df.groupby("to_store")["lt_qty"].sum()
+                post_lt_vals = []
+                for s in stores:
+                    shortage_s = float(post_shock_df[post_shock_df["store"] == s]["post_shock_shortage" if "post_shock_shortage" in post_shock_df.columns else "shortage"].sum()) if ("post_shock_shortage" in post_shock_df.columns or "shortage" in post_shock_df.columns) else 0.0
+                    demand_s   = float(post_shock_df[post_shock_df["store"] == s]["total_realized_demand"].sum()) if "total_realized_demand" in post_shock_df.columns else 1.0
+                    lt_gain    = float(lt_received.get(s, 0.0))
+                    shortage_after = max(0.0, shortage_s - lt_gain)
+                    fulfilled_after = max(0.0, demand_s - shortage_after)
+                    rate_after = fulfilled_after / demand_s if demand_s > 1e-9 else 1.0
+                    post_lt_vals.append(min(rate_after * 100, 100.0))
+            else:
+                post_lt_vals = [min(v + (shortage_no_lt - shortage_with_lt) / max(total_demand_all, 1) * 100, 100.0) for v in pre_lt_vals]
+
+            width = 0.4
+            ax.barh([i - width/2 for i in x], pre_lt_vals,  width, label="Post-Shock (before LT)", color="#DD8452")
+            ax.barh([i + width/2 for i in x], post_lt_vals, width, label="After LT",               color="#55A868")
+            ax.set_yticks(list(x))
+            ax.set_yticklabels(stores, fontsize=8)
+            ax.set_xlabel("Fulfillment Rate (%)")
+            ax.set_title("Demand Fulfillment Rate by Store: Before vs After LT Recourse")
+            ax.axvline(100, linestyle="--", color="black", alpha=0.4, linewidth=1)
+            ax.legend()
+            ax.grid(True, axis="x", alpha=0.3)
+            path = str(out_dir / "chart_05_fulfillment_by_store.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_05_fulfillment_by_store: {exc}")
+
+    # ------------------------------------------------------------------
+    # 6. LT Flow Heatmap (from_store × to_store, aggregated by qty)
+    # ------------------------------------------------------------------
+    if lt_plan_df is not None and not lt_plan_df.empty:
+        try:
+            lt_agg = lt_plan_df.groupby(["from_store", "to_store"])["lt_qty"].sum().reset_index()
+            all_stores = sorted(set(lt_agg["from_store"]) | set(lt_agg["to_store"]))
+            n = len(all_stores)
+            idx_map = {s: i for i, s in enumerate(all_stores)}
+            matrix = [[0.0] * n for _ in range(n)]
+            for _, row in lt_agg.iterrows():
+                r, c = idx_map[row["from_store"]], idx_map[row["to_store"]]
+                matrix[r][c] = float(row["lt_qty"])
+
+            import numpy as np
+            mat = np.array(matrix)
+            fig, ax = plt.subplots(figsize=(max(6, n), max(5, n - 1)))
+            im = ax.imshow(mat, cmap="YlOrRd", aspect="auto")
+            ax.set_xticks(range(n)); ax.set_xticklabels(all_stores, rotation=45, ha="right", fontsize=7)
+            ax.set_yticks(range(n)); ax.set_yticklabels(all_stores, fontsize=7)
+            ax.set_xlabel("Receiver Store")
+            ax.set_ylabel("Donor Store")
+            ax.set_title("LT Flow Heatmap (total qty transferred)")
+            plt.colorbar(im, ax=ax, label="Units")
+            for i in range(n):
+                for j in range(n):
+                    if mat[i, j] > 1e-9:
+                        ax.text(j, i, f"{mat[i, j]:.1f}", ha="center", va="center",
+                                fontsize=6, color="black" if mat[i, j] < mat.max() * 0.6 else "white")
+            path = str(out_dir / "chart_06_lt_flow_heatmap.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_06_lt_flow_heatmap: {exc}")
+
+    # ------------------------------------------------------------------
+    # 7. Branch-and-Price Bound Progression
+    # ------------------------------------------------------------------
+    bp_history = results.get("branch_price_history") or []
+    if bp_history:
+        try:
+            bp_df = pd.DataFrame(bp_history)
+            bp_df = bp_df[bp_df["objective"] < 1e17]  # filter inf
+            status_colors = {
+                "integer_incumbent": "#55A868",
+                "pruned_by_bound":   "#C44E52",
+                "pruned_by_depth":   "#DD8452",
+                "pruned_by_integrality": "#8172B2",
+                "infeasible":        "#937860",
+                "branched":          "#4C72B0",
+                "open":              "#64B5CD",
+            }
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+            # Left: objective per node coloured by status
+            ax = axes[0]
+            for status, grp in bp_df.groupby("status"):
+                ax.scatter(grp["node_id"], grp["objective"] / 1e6,
+                           label=status, color=status_colors.get(status, "gray"),
+                           s=60, zorder=3)
+            if "incumbent_objective" in bp_df.columns:
+                inc = bp_df[bp_df["incumbent_objective"] < 1e17].copy()
+                if not inc.empty:
+                    ax.step(inc["node_id"], inc["incumbent_objective"] / 1e6,
+                            where="post", linestyle="--", color="black", linewidth=1.5, label="Incumbent bound")
+            ax.set_xlabel("B&P Node ID")
+            ax.set_ylabel("Objective (M)")
+            ax.set_title("B&P Node Objectives")
+            ax.legend(fontsize=7, ncol=2)
+            ax.grid(True, alpha=0.3)
+
+            # Right: node status distribution
+            ax2 = axes[1]
+            counts = bp_df["status"].value_counts()
+            colors = [status_colors.get(s, "gray") for s in counts.index]
+            ax2.bar(range(len(counts)), counts.values, color=colors)
+            ax2.set_xticks(range(len(counts)))
+            ax2.set_xticklabels(counts.index, rotation=30, ha="right", fontsize=8)
+            ax2.set_ylabel("Node Count")
+            ax2.set_title("B&P Node Status Distribution")
+            ax2.grid(True, axis="y", alpha=0.3)
+
+            path = str(out_dir / "chart_07_branch_price.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_07_branch_price: {exc}")
+
+    # ------------------------------------------------------------------
+    # 8. CG Pricing Funnel per Episode (at root node)
+    # ------------------------------------------------------------------
+    cg_diag = results.get("cg_episode_diagnostics") or []
+    if cg_diag:
+        try:
+            diag_df = pd.DataFrame(cg_diag)
+            if "branch_node_id" in diag_df.columns:
+                diag_df = diag_df[diag_df["branch_node_id"] == 0]
+            diag_df = diag_df[diag_df["episode"] > 0].reset_index(drop=True)
+            if not diag_df.empty:
+                eps = diag_df["episode"].tolist()
+                fig, ax = plt.subplots(figsize=(10, 4))
+                cols_labels = [
+                    ("candidate_pairs_before_pruning", "Candidate pairs"),
+                    ("pairs_after_pruning",             "After feature pruning"),
+                    ("pairs_accepted_stackelberg",      "After Stackelberg"),
+                    ("patterns_built_before_gnn",       "Patterns built"),
+                    ("patterns_added_to_pool",          "Added to pool"),
+                ]
+                for col, label in cols_labels:
+                    if col in diag_df.columns:
+                        ax.plot(eps, diag_df[col], marker="o", linewidth=2, label=label)
+                ax.set_xlabel("CG Episode (root node)")
+                ax.set_ylabel("Count")
+                ax.set_title("Pricing Funnel: Candidate Pairs → Pool per CG Episode")
+                ax.legend(fontsize=8)
+                ax.grid(True, alpha=0.3)
+                path = str(out_dir / "chart_08_pricing_funnel.png")
+                saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_08_pricing_funnel: {exc}")
+
+    # ------------------------------------------------------------------
+    # 9. Phase Comparison: Classical CG vs GNN-Deployed CG (optional)
+    # ------------------------------------------------------------------
+    if phase_comparison_df is not None and not phase_comparison_df.empty:
+        try:
+            metrics_keys = [
+                ("realized_operating_cost_without_lt", "Cost (no LT, M)"),
+                ("realized_operating_cost_with_cg_lt", "Cost (with LT, M)"),
+                ("realized_cost_delta_without_minus_with_lt", "LT Savings (M)"),
+            ]
+            phases = phase_comparison_df["phase"].tolist() if "phase" in phase_comparison_df.columns else list(range(len(phase_comparison_df)))
+            x = range(len(metrics_keys))
+            width = 0.8 / max(len(phases), 1)
+            cmap2 = mpl.colormaps.get_cmap("Set2")
+            fig, ax = plt.subplots(figsize=(10, 5))
+            for pi, phase in enumerate(phases):
+                row = phase_comparison_df[phase_comparison_df["phase"] == phase].iloc[0] if "phase" in phase_comparison_df.columns else phase_comparison_df.iloc[pi]
+                vals = [float(row.get(k, 0.0)) / 1e6 for k, _ in metrics_keys]
+                offsets = [i + (pi - len(phases) / 2 + 0.5) * width for i in x]
+                bars = ax.bar(offsets, vals, width * 0.9, label=str(phase), color=cmap2(pi))
+                for bar, v in zip(bars, vals):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.01,
+                            f"{v:.1f}M", ha="center", va="bottom", fontsize=7)
+            ax.set_xticks(list(x))
+            ax.set_xticklabels([lbl for _, lbl in metrics_keys])
+            ax.set_ylabel("Value (M)")
+            ax.set_title("Phase Comparison: Classical CG vs GNN-Deployed CG")
+            ax.legend()
+            ax.grid(True, axis="y", alpha=0.3)
+            path = str(out_dir / "chart_09_phase_comparison.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_09_phase_comparison: {exc}")
+
+    return saved
+
+
 def save_cg_cost_curve(cg_history: List[Dict[str, Any]], output_path: str) -> Optional[str]:
     if not cg_history:
         return None
@@ -5020,6 +5402,7 @@ if __name__ == "__main__":
     pd.DataFrame(results["column_pool_diagnostics"]).to_csv(column_pool_diagnostics_path, index=False)
     print(f"Saved column pool diagnostics to: {column_pool_diagnostics_path}")
 
+    refreshed_history: List[Dict[str, Any]] = []
     teacher_dataset_path = RESULTS_DIR / "cg_teacher_dataset.csv"
     teacher_dataset_df = pd.DataFrame(results["teacher_dataset_rows"])
     if teacher_dataset_df.empty:
@@ -5136,29 +5519,54 @@ if __name__ == "__main__":
                     "(teacher graph dataset was likely empty)."
                 )
 
-    cg_cost_chart_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_cg_total_cost_curve.png"
+    cg_cost_chart_path = str(RESULTS_DIR / "irp_gnn_cg_total_cost_curve.png")
     saved_chart = save_cg_cost_curve(results["cg_episode_history"], cg_cost_chart_path)
     if saved_chart:
         print(f"Saved CG total-cost chart to: {saved_chart}")
 
-    gnn_selection_history_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_selected_columns.json"
+    gnn_selection_history_path = str(RESULTS_DIR / "irp_gnn_selected_columns.json")
     with open(gnn_selection_history_path, "w", encoding="utf-8") as f:
         json.dump(results["gnn_selection_history"], f, indent=2)
     print(f"Saved GNN selected-column history to: {gnn_selection_history_path}")
 
     predicted_df = build_predicted_inventory_df(results["baseline_solution"])
-    predicted_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_predicted_inventory.csv"
+    predicted_path = str(RESULTS_DIR / "irp_predicted_inventory.csv")
     predicted_df.to_csv(predicted_path, index=False)
     print(f"Saved predicted inventory to: {predicted_path}")
 
     comparison_df = predicted_df.merge(validation_target, on=["store", "sku", "period"], how="inner")
     comparison_df["error"] = comparison_df["predicted_end_qty"] - comparison_df["actual_end_qty"]
-    comparison_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_validation_comparison.csv"
+    comparison_path = str(RESULTS_DIR / "irp_validation_comparison.csv")
     comparison_df.to_csv(comparison_path, index=False)
     print(f"Saved validation comparison to: {comparison_path}")
 
     metrics = compute_validation_metrics(comparison_df)
     print("\nValidation metrics:")
     pprint.pprint(metrics)
+
+    # ------------------------------------------------------------------
+    # Pipeline charts (Phase 1 — teacher collection pass)
+    # ------------------------------------------------------------------
+    charts_dir = RESULTS_DIR / "charts"
+    phase_cmp_df: Optional[pd.DataFrame] = None
+    phase_cmp_path = RESULTS_DIR / "irp_phase_comparison.csv"
+    if phase_cmp_path.exists():
+        try:
+            phase_cmp_df = pd.read_csv(phase_cmp_path)
+        except Exception:
+            pass
+
+    saved_charts = save_pipeline_charts(
+        results=results,
+        out_dir=charts_dir,
+        refreshed_gnn_history=refreshed_history if collect_teacher_mode else None,
+        phase_comparison_df=phase_cmp_df,
+    )
+    if saved_charts:
+        print(f"\nSaved {len(saved_charts)} pipeline charts to: {charts_dir}")
+        for cp in saved_charts:
+            print(f"  {Path(cp).name}")
+    else:
+        print("\n[Charts] No charts were generated (matplotlib missing or data empty).")
 
     print("\nDone.")
