@@ -141,6 +141,43 @@ def _safe_var_value(model: gp.Model, var: gp.Var) -> float:
 DEFAULT_GNN_CHECKPOINT = "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt"
 RESULTS_DIR = Path(__file__).resolve().parent / "Results"
 
+# All run-artifact filename prefixes the pipeline writes. Any file in RESULTS_DIR
+# (and RESULTS_DIR/charts) starting with one of these is considered "managed" and
+# will be cleaned up at the start of each __main__ run so stale files from prior
+# runs (on Kaggle especially) can't shadow fresh outputs.
+_MANAGED_OUTPUT_PREFIXES: Tuple[str, ...] = (
+    "irp_",
+    "cg_",
+    "column_pool_",
+    "chart_",
+)
+
+
+def clean_managed_outputs(results_dir: Path | str = RESULTS_DIR,
+                          extra_subdirs: Tuple[str, ...] = ("charts",)) -> List[str]:
+    """Remove managed output files so a fresh run can't be confused with stale ones.
+
+    Matches any file whose name starts with a prefix in `_MANAGED_OUTPUT_PREFIXES`.
+    Returns the list of removed paths. Safe to call even if the directory does
+    not yet exist.
+    """
+    removed: List[str] = []
+    root = Path(results_dir)
+    if not root.exists():
+        return removed
+    targets = [root] + [root / sub for sub in extra_subdirs if (root / sub).exists()]
+    for target in targets:
+        for entry in target.iterdir():
+            if not entry.is_file():
+                continue
+            if any(entry.name.startswith(pfx) for pfx in _MANAGED_OUTPUT_PREFIXES):
+                try:
+                    entry.unlink()
+                    removed.append(str(entry))
+                except OSError:
+                    pass
+    return removed
+
 
 def _project_path(path: str) -> Path:
     value = Path(str(path).strip()).expanduser()
@@ -388,6 +425,11 @@ class FullIRPTSolution:
     deliv: Dict[Tuple[Store, Product, Vehicle, Period], float] = field(default_factory=dict)
     load: Dict[Tuple[Node, Vehicle, Period], float] = field(default_factory=dict)
     efficiency_metrics: Dict[str, float] = field(default_factory=dict)
+    # Per-iteration trace populated by ALNS; empty for MIP solvers.
+    alns_history: List[Dict[str, float]] = field(default_factory=list)
+    # Attached by the pipeline after LT recourse is computed so validation compares
+    # against the inventory that actually lands on shelves (baseline + post-shock + LT).
+    realized_inventory_after_lt: Optional[Dict[Tuple[Store, Product, Period], float]] = None
 
     def summary(self) -> Dict:
         return {
@@ -978,6 +1020,18 @@ class BaselineALNSModel:
         n_accept = 0
         n_improve = 0
         n_new_best = 0
+        history: List[Dict[str, float]] = [{
+            "iteration": 0,
+            "current_cost": float(curr_cost),
+            "candidate_cost": float(curr_cost),
+            "best_cost": float(best_cost),
+            "temperature": float(temperature),
+            "accepted": 1.0,
+            "new_best": 1.0,
+            "destroy_op": "initial",
+            "repair_op": "initial",
+            "feasible": 1.0 if curr_feasible else 0.0,
+        }]
 
         for iteration in range(1, int(max_iterations) + 1):
             if deadline is not None and time.perf_counter() >= deadline:
@@ -1031,6 +1085,19 @@ class BaselineALNSModel:
             pi_destroy[d_idx] += score
             pi_repair[r_idx] += score
 
+            history.append({
+                "iteration": int(iteration),
+                "current_cost": float(curr_cost),
+                "candidate_cost": float(cand_cost),
+                "best_cost": float(best_cost),
+                "temperature": float(temperature),
+                "accepted": 1.0 if accepted else 0.0,
+                "new_best": 1.0 if score == self.SIGMA_NEW_BEST else 0.0,
+                "destroy_op": destroy_ops[d_idx][0],
+                "repair_op": repair_ops[r_idx][0],
+                "feasible": 1.0 if cand_feasible else 0.0,
+            })
+
             temperature = max(1e-6, temperature * cooling_rate)
 
             if iteration % segment_size == 0:
@@ -1050,7 +1117,7 @@ class BaselineALNSModel:
                     print(f"[ALNS] iter={iteration} best={best_cost:.4f} curr={curr_cost:.4f} T={temperature:.3f}")
 
         runtime = time.perf_counter() - t0
-        return self._build_full_irpt_solution(
+        solution = self._build_full_irpt_solution(
             best,
             runtime_seconds=runtime,
             iterations=iteration,
@@ -1060,6 +1127,8 @@ class BaselineALNSModel:
             final_cost=best_cost,
             feasible=best_feasible,
         )
+        solution.alns_history = history
+        return solution
 
     # ---------------------------------------------------------- initial build
 
@@ -4085,13 +4154,72 @@ class LateralTransshipmentCG:
 # ============================================================================
 
 def build_predicted_inventory_df(solution) -> pd.DataFrame:
+    """Emit per-(store, sku, period) predicted end-of-period inventory.
+
+    Prefers `realized_inventory_after_lt` (baseline + post-shock + LT recourse)
+    when the pipeline has attached it; otherwise falls back to the forecast-plan
+    `inv_store`. The realized path is what should be compared against dataset
+    `actual_end_qty`, since that is the quantity that actually lands on shelves.
+    """
     rows = []
-    if hasattr(solution, "inv_store"):
-        for (s, p, t), inv in solution.inv_store.items():
-            rows.append({"store": s, "sku": p, "period": t, "predicted_end_qty": inv})
+    inventory_source = None
+    inventory_tag = "inv_store_forecast"
+    realized = getattr(solution, "realized_inventory_after_lt", None)
+    if realized:
+        inventory_source = realized
+        inventory_tag = "realized_after_lt"
+    elif hasattr(solution, "inv_store"):
+        inventory_source = solution.inv_store
     else:
         raise ValueError("Solution object does not contain inv_store")
+    for (s, p, t), inv in inventory_source.items():
+        rows.append({
+            "store": s,
+            "sku": p,
+            "period": t,
+            "predicted_end_qty": float(inv),
+            "inventory_source": inventory_tag,
+        })
     return pd.DataFrame(rows)
+
+
+def compute_realized_inventory_after_lt(
+    data: IRPData,
+    dc_solution: FullIRPTSolution,
+    lt_plan_df: Optional[pd.DataFrame] = None,
+) -> Dict[Tuple[Store, Product, Period], float]:
+    """Replay baseline + post-shock state, then net LT flows per (store, sku, period).
+
+    Returns the same dict that `build_realized_operating_cost_breakdown` uses
+    internally, so the validation comparison sees the exact inventory trajectory
+    that produced the realized operating cost.
+    """
+    lt_net: Dict[Tuple[Store, Product, Period], float] = {
+        (s, p, t): 0.0
+        for s in data.stores
+        for p in data.products
+        for t in data.periods
+    }
+    if lt_plan_df is not None and not lt_plan_df.empty:
+        for _, row in lt_plan_df.iterrows():
+            p = str(row["sku"])
+            t = int(row["period"])
+            i = str(row["from_store"])
+            j = str(row["to_store"])
+            qty = float(row["lt_qty"])
+            if (i, p, t) in lt_net:
+                lt_net[(i, p, t)] -= qty
+            if (j, p, t) in lt_net:
+                lt_net[(j, p, t)] += qty
+    realized: Dict[Tuple[Store, Product, Period], float] = {}
+    for s in data.stores:
+        for p in data.products:
+            for t in data.periods:
+                post_shock_inv = float(
+                    data.post_shock_inventory.get((s, p, t), dc_solution.inv_store.get((s, p, t), 0.0))
+                )
+                realized[(s, p, t)] = max(0.0, post_shock_inv + lt_net.get((s, p, t), 0.0))
+    return realized
 
 
 def build_forecast_fulfillment_df(data: IRPData, solution: FullIRPTSolution) -> pd.DataFrame:
@@ -4777,6 +4905,91 @@ def save_pipeline_charts(
             print(f"[Charts] chart_08_pricing_funnel: {exc}")
 
     # ------------------------------------------------------------------
+    # 10. ALNS Convergence (effectiveness of baseline search)
+    # ------------------------------------------------------------------
+    alns_history = results.get("alns_history") or []
+    if alns_history:
+        try:
+            hist_df = pd.DataFrame(alns_history)
+            if not hist_df.empty and "iteration" in hist_df.columns:
+                fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+                ax = axes[0]
+                ax.plot(hist_df["iteration"], hist_df["best_cost"] / 1e6,
+                        color="#55A868", linewidth=2, label="Best (incumbent)")
+                ax.plot(hist_df["iteration"], hist_df["current_cost"] / 1e6,
+                        color="#4C72B0", linewidth=0.8, alpha=0.6, label="Current")
+                if "candidate_cost" in hist_df.columns:
+                    ax.scatter(hist_df["iteration"], hist_df["candidate_cost"] / 1e6,
+                               s=3, color="#DD8452", alpha=0.25, label="Candidate")
+                ax.set_xlabel("ALNS Iteration")
+                ax.set_ylabel("Cost (M)")
+                ax.set_title("ALNS Cost Trajectory")
+                ax.legend(fontsize=8)
+                ax.grid(True, alpha=0.3)
+
+                ax2 = axes[1]
+                # Acceptance rate + new-best events (rolling window)
+                window = max(20, len(hist_df) // 50)
+                if "accepted" in hist_df.columns:
+                    accept_rate = hist_df["accepted"].rolling(window, min_periods=1).mean()
+                    ax2.plot(hist_df["iteration"], accept_rate * 100,
+                             color="#4C72B0", linewidth=2, label=f"Accept rate ({window}-iter avg)")
+                if "new_best" in hist_df.columns:
+                    new_best_mask = hist_df["new_best"] > 0
+                    ax2.scatter(hist_df.loc[new_best_mask, "iteration"],
+                                [100] * int(new_best_mask.sum()),
+                                marker="v", color="#55A868", s=40, label="New best")
+                ax2.set_xlabel("ALNS Iteration")
+                ax2.set_ylabel("Accept Rate (%)")
+                ax2.set_ylim(-5, 110)
+                ax2.set_title("ALNS Acceptance Dynamics")
+                ax2.legend(fontsize=8, loc="lower left")
+                ax2.grid(True, alpha=0.3)
+
+                path = str(out_dir / "chart_10_alns_convergence.png")
+                saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_10_alns_convergence: {exc}")
+
+    # ------------------------------------------------------------------
+    # 11. Cost Breakdown Log-Scale (so small components stay visible)
+    # ------------------------------------------------------------------
+    if no_lt and with_lt:
+        try:
+            components = [
+                ("DC Ship",      "direct_cw_unit_cost_executed_plan"),
+                ("Store Hold",   "store_holding_cost_realized"),
+                ("WH Hold",      "warehouse_holding_cost_executed_plan"),
+                ("Route",        "route_distance_cost_executed_plan"),
+                ("Vehicle",      "vehicle_fixed_cost_executed_plan"),
+                ("LT Cost",      "lateral_transshipment_cost_realized"),
+                ("Shortage",     "shortage_cost_realized"),
+            ]
+            labels = [c[0] for c in components]
+            nolt_vals   = [max(1e-3, float(no_lt.get(c[1],  0.0))) for c in components]
+            withlt_vals = [max(1e-3, float(with_lt.get(c[1], 0.0))) for c in components]
+            x = range(len(labels))
+            width = 0.4
+            fig, ax = plt.subplots(figsize=(12, 5))
+            ax.bar([i - width/2 for i in x], nolt_vals,   width, label="Realized — No LT",   color="#DD8452")
+            ax.bar([i + width/2 for i in x], withlt_vals, width, label="Realized — With LT", color="#55A868")
+            ax.set_yscale("log")
+            ax.set_xticks(list(x))
+            ax.set_xticklabels(labels, rotation=20, ha="right")
+            ax.set_ylabel("Cost (raw, log scale)")
+            ax.set_title("Cost Breakdown After LT Recourse (log scale — all components visible)")
+            ax.legend()
+            ax.grid(True, axis="y", alpha=0.3, which="both")
+            # Value labels so LT Cost is readable even when dwarfed
+            for i, (n, w) in enumerate(zip(nolt_vals, withlt_vals)):
+                ax.text(i - width/2, n, f"{n:,.0f}", ha="center", va="bottom", fontsize=7, rotation=0)
+                ax.text(i + width/2, w, f"{w:,.0f}", ha="center", va="bottom", fontsize=7, rotation=0)
+            path = str(out_dir / "chart_11_cost_breakdown_log.png")
+            saved.append(_save_fig(plt, path))
+        except Exception as exc:
+            print(f"[Charts] chart_11_cost_breakdown_log: {exc}")
+
+    # ------------------------------------------------------------------
     # 9. Phase Comparison: Classical CG vs GNN-Deployed CG (optional)
     # ------------------------------------------------------------------
     if phase_comparison_df is not None and not phase_comparison_df.empty:
@@ -5185,6 +5398,16 @@ class IRPResearchPipeline:
         print_cost_breakdown("Realized Operating Cost Without LT", realized_no_lt_cost_breakdown)
         print_cost_breakdown("Realized Operating Cost With CG LT", realized_with_lt_cost_breakdown)
 
+        # Expose the inventory trajectory that produced the "with LT" realized cost
+        # so downstream validation compares against the actual shelf state (baseline
+        # forecast + post-shock reallocation + LT recourse), not just the forecast
+        # inv_store. build_predicted_inventory_df automatically picks this up.
+        baseline_sol.realized_inventory_after_lt = compute_realized_inventory_after_lt(
+            self.data,
+            baseline_sol,
+            lt_plan_df=lt_plan_df,
+        )
+
         pipeline_runtime_seconds = time.perf_counter() - pipeline_started_at
         comparison = {
             "forecast_dc_plan_objective": baseline_sol.objective,
@@ -5231,6 +5454,7 @@ class IRPResearchPipeline:
             "cg_episode_diagnostics": cg_engine.cg_episode_diagnostics,
             "column_pool_diagnostics": cg_engine.column_pool_diagnostics,
             "teacher_dataset_rows": cg_engine.teacher_dataset_rows,
+            "alns_history": list(getattr(baseline_sol, "alns_history", []) or []),
         }
 
 
@@ -5240,6 +5464,14 @@ class IRPResearchPipeline:
 
 if __name__ == "__main__":
     EXCEL_PATH = Path(__file__).with_name("1BISCR501V_90100140_20260323-150407111_filtered_sites.csv")
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("IRP_CLEAN_RESULTS", "1").lower() not in {"0", "false", "no"}:
+        removed = clean_managed_outputs(RESULTS_DIR)
+        if removed:
+            print(f"[Cleanup] Removed {len(removed)} stale output files in {RESULTS_DIR}")
+        else:
+            print(f"[Cleanup] No stale managed outputs found in {RESULTS_DIR}")
 
     mapper = DatasetToIRPValidationMapper(
         excel_path=EXCEL_PATH,
@@ -5271,7 +5503,7 @@ if __name__ == "__main__":
     print("Mapped dataset metadata:")
     pprint.pprint(meta)
 
-    validation_target_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_validation_target.csv"
+    validation_target_path = f"{RESULTS_DIR}/irp_validation_target.csv"
     validation_target.to_csv(validation_target_path, index=False)
     print(f"Saved validation target to: {validation_target_path}")
 
@@ -5336,7 +5568,7 @@ if __name__ == "__main__":
         }
         for r in results["baseline_routes"]
     ])
-    routes_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_baseline_routes.csv"
+    routes_path = f"{RESULTS_DIR}/irp_baseline_routes.csv"
     baseline_routes_df.to_csv(routes_path, index=False)
     print(f"Saved baseline routes to: {routes_path}")
 
@@ -5348,25 +5580,38 @@ if __name__ == "__main__":
     results["forecast_demand_fulfillment"].to_csv(forecast_fulfillment_path, index=False)
     print(f"Saved pre-shock (forecast) demand fulfillment to: {forecast_fulfillment_path}")
 
-    solver_metrics_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_solver_efficiency_metrics.csv"
+    solver_metrics_path = f"{RESULTS_DIR}/irp_solver_efficiency_metrics.csv"
     pd.DataFrame([
         {"model": "baseline_irpt", **results["baseline_solution"].efficiency_metrics},
         {"model": "cg_rmp_total", **results["cg_solution"].efficiency_metrics},
     ]).to_csv(solver_metrics_path, index=False)
     print(f"Saved solver efficiency metrics to: {solver_metrics_path}")
 
-    cost_breakdown_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_baseline_cost_breakdown.csv"
+    cost_breakdown_path = f"{RESULTS_DIR}/irp_baseline_cost_breakdown.csv"
     pd.DataFrame([results["baseline_cost_breakdown"]]).to_csv(cost_breakdown_path, index=False)
     print(f"Saved baseline cost breakdown to: {cost_breakdown_path}")
 
-    realized_cost_breakdown_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_realized_operating_cost_breakdown.csv"
+    realized_cost_breakdown_path = f"{RESULTS_DIR}/irp_realized_operating_cost_breakdown.csv"
+    no_lt_bd = results["realized_no_lt_cost_breakdown"]
+    with_lt_bd = results["realized_with_lt_cost_breakdown"]
+    delta_bd = {
+        k: round(float(no_lt_bd.get(k, 0.0)) - float(with_lt_bd.get(k, 0.0)), 6)
+        for k in no_lt_bd.keys()
+    }
     pd.DataFrame([
-        {"scenario": "without_lt", **results["realized_no_lt_cost_breakdown"]},
-        {"scenario": "with_cg_lt", **results["realized_with_lt_cost_breakdown"]},
+        {"scenario": "without_lt", **no_lt_bd},
+        {"scenario": "with_cg_lt", **with_lt_bd},
+        {"scenario": "delta_no_lt_minus_with_lt", **delta_bd},
     ]).to_csv(realized_cost_breakdown_path, index=False)
     print(f"Saved realized operating cost breakdown to: {realized_cost_breakdown_path}")
 
-    demand_shock_summary_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_hidden_demand_shock_summary.csv"
+    alns_history_rows = results.get("alns_history") or []
+    if alns_history_rows:
+        alns_history_path = f"{RESULTS_DIR}/irp_alns_history.csv"
+        pd.DataFrame(alns_history_rows).to_csv(alns_history_path, index=False)
+        print(f"Saved ALNS iteration history to: {alns_history_path}")
+
+    demand_shock_summary_path = f"{RESULTS_DIR}/irp_hidden_demand_shock_summary.csv"
     pd.DataFrame([{
         **results["demand_shock_summary"],
         **results["post_shock_summary"],
@@ -5374,7 +5619,7 @@ if __name__ == "__main__":
     }]).to_csv(demand_shock_summary_path, index=False)
     print(f"Saved hidden demand shock summary to: {demand_shock_summary_path}")
 
-    lt_plan_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_lt_plan.csv"
+    lt_plan_path = f"{RESULTS_DIR}/irp_lt_plan.csv"
     results["lt_plan"].to_csv(lt_plan_path, index=False)
     print(f"Saved lateral transshipment plan to: {lt_plan_path}")
 
@@ -5386,19 +5631,19 @@ if __name__ == "__main__":
         pd.DataFrame(results["gnn_training_history"]).to_csv(legacy_training_history_path, index=False)
         print(f"Saved runtime GNN training history (pre-refresh) to: {legacy_training_history_path}")
 
-    cg_episode_history_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_gnn_cg_episode_history.csv"
+    cg_episode_history_path = f"{RESULTS_DIR}/irp_gnn_cg_episode_history.csv"
     pd.DataFrame(results["cg_episode_history"]).to_csv(cg_episode_history_path, index=False)
     print(f"Saved CG total-cost episode history to: {cg_episode_history_path}")
 
-    branch_price_history_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/irp_branch_price_history.csv"
+    branch_price_history_path = f"{RESULTS_DIR}/irp_branch_price_history.csv"
     pd.DataFrame(results["branch_price_history"]).to_csv(branch_price_history_path, index=False)
     print(f"Saved branch-and-price history to: {branch_price_history_path}")
 
-    cg_episode_diagnostics_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/cg_episode_diagnostics.csv"
+    cg_episode_diagnostics_path = f"{RESULTS_DIR}/cg_episode_diagnostics.csv"
     pd.DataFrame(results["cg_episode_diagnostics"]).to_csv(cg_episode_diagnostics_path, index=False)
     print(f"Saved CG episode diagnostics to: {cg_episode_diagnostics_path}")
 
-    column_pool_diagnostics_path = "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/Results/column_pool_diagnostics.csv"
+    column_pool_diagnostics_path = f"{RESULTS_DIR}/column_pool_diagnostics.csv"
     pd.DataFrame(results["column_pool_diagnostics"]).to_csv(column_pool_diagnostics_path, index=False)
     print(f"Saved column pool diagnostics to: {column_pool_diagnostics_path}")
 
