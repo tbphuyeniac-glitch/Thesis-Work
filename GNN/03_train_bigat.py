@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -224,7 +225,10 @@ def main() -> None:
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    best_valid = float("inf")
+    # For pairwise_rank the primary metric is MRR (higher = better).
+    # For other objectives, lower valid_loss is better.
+    _maximize_primary = (args.objective == "pairwise_rank")
+    best_valid = float("-inf") if _maximize_primary else float("inf")
     bad_epochs = 0
     best_path = out_dir / "best_model.pt"
     chart_path = out_dir / "training_loss_curve.png"
@@ -258,7 +262,12 @@ def main() -> None:
             except ValueError as exc:
                 utilities.log(f"skipped incompatible optimizer state: {exc}", logfile)
         if checkpoint is not None:
-            best_valid = float(checkpoint.get("best_valid_loss", checkpoint.get("valid_metrics", {}).get("loss", float("inf"))))
+            if _maximize_primary:
+                best_valid = float(checkpoint.get("best_valid_mrr",
+                                   checkpoint.get("valid_metrics", {}).get("ranking_mrr", float("-inf"))))
+            else:
+                best_valid = float(checkpoint.get("best_valid_loss",
+                                   checkpoint.get("valid_metrics", {}).get("loss", float("inf"))))
             start_epoch = int(checkpoint.get("last_epoch", 0)) + 1
         if history_path.exists():
             with open(history_path, "r", encoding="utf-8") as f:
@@ -329,8 +338,14 @@ def main() -> None:
             logfile,
         )
 
-        if valid_metrics["loss"] < best_valid:
-            best_valid = valid_metrics["loss"]
+        if _maximize_primary:
+            current_primary = valid_metrics.get("ranking_mrr", float("nan"))
+            improved = not math.isnan(current_primary) and current_primary > best_valid
+        else:
+            current_primary = valid_metrics["loss"]
+            improved = current_primary < best_valid
+        if improved:
+            best_valid = current_primary
             bad_epochs = 0
             torch.save({
                 "state_dict": model.state_dict(),
@@ -349,7 +364,8 @@ def main() -> None:
                 },
                 "valid_metrics": valid_metrics,
                 "optimizer_state": optimizer.state_dict(),
-                "best_valid_loss": best_valid,
+                "best_valid_loss": best_valid if not _maximize_primary else valid_metrics["loss"],
+                "best_valid_mrr": best_valid if _maximize_primary else valid_metrics.get("ranking_mrr", float("nan")),
                 "last_epoch": epoch,
                 "objective": args.objective,
                 "dataset_type": args.dataset_type,

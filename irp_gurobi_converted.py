@@ -237,8 +237,10 @@ def print_gnn_training_history(history: List[Dict[str, Any]], checkpoint_path: s
             f"  epoch={int(row.get('epoch', row.get('episode', 0))):03d} "
             f"| train_loss={float(row.get('train_loss', math.nan)):.6f} "
             f"| valid_loss={float(row.get('valid_loss', math.nan)):.6f} "
-            f"| valid_f1={float(row.get('valid_f1', math.nan)):.6f} "
-            f"| valid_top1={float(row.get('valid_top1', math.nan)):.6f}"
+            f"| mrr={float(row.get('valid_mrr', row.get('ranking_valid_mrr', math.nan))):.4f} "
+            f"| top1={float(row.get('valid_top1', row.get('ranking_valid_top1', math.nan))):.4f} "
+            f"| top3={float(row.get('ranking_valid_top3', math.nan)):.4f} "
+            f"| f1={float(row.get('valid_f1', row.get('binary_valid_f1', math.nan))):.4f}"
         )
     chart_path = _project_path(checkpoint_path).parent / "training_loss_curve.png"
     if chart_path.exists():
@@ -685,6 +687,7 @@ class DatasetToIRPValidationMapper:
         cw_capacity_factor: float = 2.0,
         distance_matrix_path: Optional[str] = "Distance data/mm_megamarket_distance_matrix_clean.csv",
         store_initial_inventory_multiplier: float = 1.0,
+        lt_cost_multiplier: float = 1.0,
     ):
         df = self.preprocess()
 
@@ -814,7 +817,7 @@ class DatasetToIRPValidationMapper:
             for j in stores:
                 if i == j:
                     continue
-                data.transship_unit_cost[(i, j)] = 0.01 * alpha * data.distance[(i, j)]
+                data.transship_unit_cost[(i, j)] = 0.01 * alpha * data.distance[(i, j)] * max(0.0, lt_cost_multiplier)
 
         # Validation target = actual END_QTY for periods >= 2
         validation_target = base[base["period"] > first_period][["store", "sku", "period", "end_qty"]].copy()
@@ -5498,10 +5501,31 @@ if __name__ == "__main__":
         cw_replenishment_factor=0.2,
         cw_capacity_factor=2.0,
         store_initial_inventory_multiplier=float(os.environ.get("IRP_STORE_INIT_MULTIPLIER", "0.2")),
+        lt_cost_multiplier=float(os.environ.get("IRP_LT_COST_MULTIPLIER", "1.0")),
     )
 
     print("Mapped dataset metadata:")
     pprint.pprint(meta)
+
+    # Cost unit diagnostic — helps detect scale mismatch between cost components.
+    # Shortage cost and LT cost should be on the same economic scale for valid optimisation.
+    if data.stores and data.products and data.periods:
+        _s0, _p0, _t0 = next(iter(data.stores)), next(iter(data.products)), next(iter(data.periods))
+        _shortage_unit = data.shortage_cost.get((_s0, _p0), float("nan"))
+        _holding_unit  = data.holding_cost_store.get((_s0, _p0), float("nan"))
+        _lt_pairs = [(i, j) for i in data.stores for j in data.stores if i != j]
+        _lt_unit = float(sum(data.transship_unit_cost.get((i, j), 0.0) for i, j in _lt_pairs) / max(1, len(_lt_pairs)))
+        _lt_cost_mult = float(os.environ.get("IRP_LT_COST_MULTIPLIER", "1.0"))
+        print(
+            f"\n[Cost Unit Diagnostic] (representative values — sample store={_s0}, sku={_p0})\n"
+            f"  shortage_unit_cost      = {_shortage_unit:.4f}  (shortage_cost_rate * price)\n"
+            f"  holding_unit_cost       = {_holding_unit:.4f}  (holding_cost_rate * price)\n"
+            f"  lt_unit_cost (avg)      = {_lt_unit:.4f}  (0.01*alpha*distance*lt_cost_multiplier)\n"
+            f"  lt_cost_multiplier      = {_lt_cost_mult:.2f}x  (env IRP_LT_COST_MULTIPLIER)\n"
+            f"  lt/shortage ratio       = {_lt_unit / max(1e-12, _shortage_unit):.6f}\n"
+            f"  *** If lt/shortage << 1, LT is effectively free — examiners will challenge results. ***\n"
+            f"  *** For thesis sensitivity analysis, re-run with IRP_LT_COST_MULTIPLIER=5,10,25,50. ***"
+        )
 
     validation_target_path = f"{RESULTS_DIR}/irp_validation_target.csv"
     validation_target.to_csv(validation_target_path, index=False)
@@ -5694,6 +5718,7 @@ if __name__ == "__main__":
                     store_initial_inventory_multiplier=float(
                         os.environ.get("IRP_STORE_INIT_MULTIPLIER", "0.2")
                     ),
+                    lt_cost_multiplier=float(os.environ.get("IRP_LT_COST_MULTIPLIER", "1.0")),
                 )
                 gnn_results = IRPResearchPipeline(gnn_data).run(
                     use_random_initial_patterns=True,
