@@ -1,6 +1,33 @@
 from __future__ import annotations
 
-"""Build teacher-supervised BiGAT graph samples from CG teacher CSV rows."""
+"""
+GNN/build_teacher_graph_dataset.py
+==================================
+Convert CG teacher CSV rows into train/valid/test graph samples.
+
+Inputs
+------
+- Results/cg_teacher_dataset.csv (or .pkl.gz for Kaggle) produced during
+  CG episodes where collect_teacher_mode=True.
+
+Outputs
+-------
+- GNN/data/irplt_teacher/{train,valid,test}/sample_*.pkl
+- GNN/data/irplt_teacher/dataset_summary.json
+
+Split semantics
+---------------
+When more than one distinct `source_instance` is present, the split is
+performed at the instance level (default --split-by-instance) so that no
+single instance contributes groups to more than one split. With only one
+instance, the code falls back to group-level random split and prints a
+warning that the test split is NOT a strict generalization check.
+
+CLI
+---
+--teacher-csv, --out-dir, --train-ratio, --valid-ratio, --seed,
+--overwrite/--no-overwrite, --split-by-instance/--no-split-by-instance
+"""
 
 import argparse
 import csv
@@ -115,7 +142,44 @@ def split_groups(
     train_ratio: float,
     valid_ratio: float,
     rng: random.Random,
+    split_by_instance: bool = True,
 ) -> Dict[str, List[GroupKey]]:
+    """Split group keys into train/valid/test.
+
+    When `split_by_instance=True` (default) and more than one distinct
+    `source_instance` is present across keys, the split is performed at the
+    instance level so that no single source_instance contributes groups to
+    more than one split — eliminating cross-split data leakage. When only
+    one instance exists, we fall back to group-level random split and warn
+    the caller that the test split is NOT a strict generalization check.
+    """
+    if not keys:
+        return {"train": [], "valid": [], "test": []}
+
+    instances = sorted({key[0] for key in keys})
+    if split_by_instance and len(instances) > 1:
+        shuffled_instances = list(instances)
+        rng.shuffle(shuffled_instances)
+        n_inst = len(shuffled_instances)
+        n_train_i = max(1, int(round(n_inst * train_ratio)))
+        n_valid_i = max(1, int(round(n_inst * valid_ratio))) if n_inst >= 3 else 0
+        if n_train_i + n_valid_i >= n_inst:
+            n_valid_i = max(0, n_inst - n_train_i - 1)
+        train_i = set(shuffled_instances[:n_train_i])
+        valid_i = set(shuffled_instances[n_train_i:n_train_i + n_valid_i])
+        test_i = set(shuffled_instances[n_train_i + n_valid_i:])
+        buckets: Dict[str, List[GroupKey]] = {"train": [], "valid": [], "test": []}
+        for key in keys:
+            inst = key[0]
+            if inst in train_i:
+                buckets["train"].append(key)
+            elif inst in valid_i:
+                buckets["valid"].append(key)
+            else:
+                buckets["test"].append(key)
+        return buckets
+
+    # Fallback: only one instance → group-level random split (leakage warning).
     shuffled = list(keys)
     rng.shuffle(shuffled)
     n = len(shuffled)
@@ -205,6 +269,13 @@ def main() -> None:
     parser.add_argument("--valid-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=utilities.valid_seed, default=0)
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--split-by-instance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When multiple source_instance values exist, split at the instance "
+             "level so the test set is strictly unseen. Disable only for debugging.",
+    )
     args = parser.parse_args()
 
     teacher_csv = Path(args.teacher_csv)
@@ -231,11 +302,22 @@ def main() -> None:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    all_keys = list(grouped_rows.keys())
+    distinct_instances = sorted({key[0] for key in all_keys})
+    split_mode = "instance-level" if (args.split_by_instance and len(distinct_instances) > 1) else "group-level"
+    if split_mode == "group-level" and args.split_by_instance:
+        print(
+            f"[Teacher Split] Only {len(distinct_instances)} distinct source_instance found. "
+            "Falling back to group-level random split. The test split is NOT a strict "
+            "generalization check — consider collecting teacher rows from more CG runs."
+        )
+
     split_map = split_groups(
-        list(grouped_rows.keys()),
+        all_keys,
         train_ratio=args.train_ratio,
         valid_ratio=args.valid_ratio,
         rng=random.Random(args.seed),
+        split_by_instance=args.split_by_instance,
     )
 
     summary: Dict[str, Any] = {
@@ -243,9 +325,15 @@ def main() -> None:
         "out_dir": str(out_dir),
         "n_raw_rows": len(rows),
         "n_groups": len(grouped_rows),
+        "n_distinct_instances": len(distinct_instances),
+        "split_mode": split_mode,
         "group_key_fields": ["source_instance", "branch_node_id", "episode", "product", "period", "constraint_state_hash"],
         "splits": {},
         "skipped_groups": [],
+    }
+    summary["instances_per_split"] = {
+        split_name: sorted({k[0] for k in keys_list})
+        for split_name, keys_list in split_map.items()
     }
     for split, keys in split_map.items():
         written, skipped, diagnostics = write_samples(grouped_rows, keys, out_dir / split)

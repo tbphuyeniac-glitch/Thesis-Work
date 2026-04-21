@@ -2,27 +2,62 @@
 IRP / IRPT thesis prototype with validation split
 =================================================
 
-What this file does
--------------------
-- Keeps the user's original dataset mapper structure and validation flow.
-- Upgrades the baseline model into an Achamrah-style IRPT model.
-- Preserves old fields and adds extra fields needed for route / vehicle / LT modeling.
-- Includes:
-  - base formulation (2)–(15)
-  - valid inequalities (16)–(20)
-  - LT column generation with explicit RMP, pricing, dual values, and re-optimization loop
-- Does NOT fully implement disjoint path inequalities (21) as true branch-and-cut,
-  because this prototype does not implement true callback-based disjoint path cuts.
+Contents (top-to-bottom)
+------------------------
+- DatasetToIRPValidationMapper        : Excel/CSV → IRPData + validation target
+- IRPData / CGSolution / FullIRPTSolution : dataclasses
+- BaselineALNSModel                   : ALNS baseline (DC→stores→DC, no LT)
+- AchamrahFullIRPTModel               : Legacy Gurobi baseline (kept for reference)
+- LateralTransshipmentCG              : CG + RMP + pricing + B&P, optional GNN/heuristic scorer
+- IRPResearchPipeline.run             : full pipeline orchestrator (baseline → post-shock shock → CG LT)
+- Post-processing helpers             : LT plan, cost breakdowns, realized inventory
+- Teacher/GNN bridge                  : run_teacher_graph_and_gnn_training (offline train + offline test)
+- run_three_way_benchmark             : Classical vs Heuristic vs GNN benchmark runner
+- __main__                            : reads env vars, runs pipeline or benchmark
 
-Notes
------
-- To keep the code practical, product-flow variables are continuous by default.
-  Set enforce_integer_flows=True for a smaller test if needed.
-- If the model becomes heavy, reduce store_limit / sku_limit / vehicle_count.
+Inputs
+------
+- Excel/CSV dataset at EXCEL_PATH (set in __main__)
+- Optional distance matrix CSV (DatasetToIRPValidationMapper)
+
+Outputs (written under Results/)
+--------------------------------
+- irp_validation_target.csv, irp_baseline_routes.csv, irp_solver_efficiency_metrics.csv
+- irp_baseline_cost_breakdown.csv, irp_realized_operating_cost_breakdown.csv
+- irp_lt_plan.csv, irp_hidden_demand_shock_summary.csv, irp_alns_history.csv
+- irp_gnn_training_history.csv, irp_gnn_offline_test.csv, chart_*.png
+- irp_benchmark_comparison.csv (only if IRP_RUN_BENCHMARK=1)
+
+Environment variables read by __main__ (all optional, all have defaults)
+-----------------------------------------------------------------------
+- IRP_CG_ITERATIONS, IRP_GNN_TRAIN_EPOCHS, IRP_TIME_LIMIT
+- IRP_USE_BRANCH_AND_PRICE, IRP_BP_MAX_NODES, IRP_BP_MAX_DEPTH
+- IRP_COLLECT_TEACHER_MODE, IRP_RUNTIME_GNN_MODE
+- IRP_BUILD_TEACHER_GRAPHS, IRP_TRAIN_GNN_AFTER_TEACHER, IRP_RESUME_GNN_CHECKPOINT
+- IRP_GNN_CHECKPOINT
+- IRP_LT_ACTIVATION_THRESHOLD
+- IRP_DEMAND_SHOCK_PROBABILITY, IRP_DEMAND_SHOCK_REALLOCATION_FRACTION,
+  IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD,
+  IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER, IRP_DEMAND_SHOCK_SEED
+- IRP_STORE_INIT_MULTIPLIER, IRP_CLEAN_RESULTS
+- IRP_LT_COST_MULTIPLIER                 : sensitivity multiplier on transship_unit_cost
+- IRP_ENFORCE_INTEGER                    : force integer delivery + inventory + LT flows
+- IRP_RUN_BENCHMARK                      : run 3-way Classical/Heuristic/GNN benchmark and exit
+- IRP_HEURISTIC_TOP_K                    : top-k cut-off for heuristic variant B
+- IRP_ONLINE_INFERENCE                   : set to 1 to run Stage 2 — loads "test data.csv" + pre-trained GNN, no retraining
+- IRP_ONLINE_LEARNING                    : set to 1 (alongside IRP_ONLINE_INFERENCE=1) to enable solver-supervised online
+                                           fine-tuning after each inference run; collects new teacher rows from the inference
+                                           CG episodes and fine-tunes the checkpoint in-place (resume_checkpoint=True).
+                                           Defaults to 0 — offline training + pure inference is preferred for thesis
+                                           reproducibility; online learning should only be activated after the model has
+                                           been validated in inference-only mode first.
+- IRP_ONLINE_LEARNING_EPOCHS             : fine-tuning epochs for online learning (default 2; keep small to avoid overfitting
+                                           to a single inference run)
+- IRP_DATASET_PATH                       : explicit override for the input CSV/Excel path (overrides both stage defaults)
 
 Dependencies
 ------------
-pip install pandas openpyxl gurobipy
+pip install pandas openpyxl gurobipy torch
 """
 
 from __future__ import annotations
@@ -255,6 +290,7 @@ def run_teacher_graph_and_gnn_training(
     resume_checkpoint: bool = False,
     checkpoint_path: str = DEFAULT_GNN_CHECKPOINT,
     training_history_csv_path: Optional[str] = None,
+    run_offline_test: bool = True,
 ) -> List[Dict[str, Any]]:
     """Build teacher graph samples and train the BiGAT scorer.
 
@@ -330,6 +366,50 @@ def run_teacher_graph_and_gnn_training(
         resolved_csv_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(history).to_csv(resolved_csv_path, index=False)
         print(f"[Teacher/GNN] Wrote training history CSV ({len(history)} rows) to: {resolved_csv_path}")
+
+        # ---- Validation summary (best epoch by MRR) ----
+        if history:
+            best_row = max(
+                history,
+                key=lambda r: float(r.get("valid_mrr", r.get("ranking_valid_mrr", float("-inf"))) or float("-inf")),
+            )
+            print("\n[GNN Validation Summary — best epoch by MRR]")
+            print(
+                f"  epoch={int(best_row.get('epoch', 0)):03d} | "
+                f"train_loss={float(best_row.get('train_loss', math.nan)):.4f} | "
+                f"valid_loss={float(best_row.get('valid_loss', math.nan)):.4f} | "
+                f"mrr={float(best_row.get('valid_mrr', best_row.get('ranking_valid_mrr', math.nan))):.4f} | "
+                f"top1={float(best_row.get('valid_top1', best_row.get('ranking_valid_top1', math.nan))):.4f} | "
+                f"top3={float(best_row.get('ranking_valid_top3', math.nan)):.4f} | "
+                f"f1={float(best_row.get('valid_f1', best_row.get('binary_valid_f1', math.nan))):.4f}"
+            )
+
+        # ---- Offline test evaluation on strictly held-out split ----
+        if run_offline_test:
+            checkpoint_path_obj = _project_path(checkpoint_path)
+            test_split_dir = _project_path("GNN/data/irplt_teacher/test")
+            if not checkpoint_path_obj.exists():
+                print(f"[Teacher/GNN] Skipping offline test — checkpoint not found: {checkpoint_path_obj}")
+            elif not test_split_dir.exists() or not any(test_split_dir.iterdir()):
+                print(f"[Teacher/GNN] Skipping offline test — empty test split at {test_split_dir}. "
+                      f"Collect teacher rows from more source_instance values to enable instance-level split.")
+            else:
+                test_out_csv = Path(RESULTS_DIR) / "irp_gnn_offline_test.csv"
+                test_cmd = [
+                    sys.executable,
+                    "GNN/04_test.py",
+                    "--data-dir", "GNN/data/irplt_teacher",
+                    "--checkpoint", str(checkpoint_path_obj),
+                    "--split", "test",
+                    "--out-file", str(test_out_csv),
+                ]
+                print("\n[Teacher/GNN] Running offline test evaluation on strictly held-out split")
+                try:
+                    subprocess.run(test_cmd, cwd=str(Path(__file__).resolve().parent), check=True)
+                    print(f"[Teacher/GNN] Offline test metrics saved to: {test_out_csv}")
+                except subprocess.CalledProcessError as exc:
+                    # Surface the failure so silent regressions are caught (see code review Task).
+                    print(f"[Teacher/GNN] Offline test FAILED (non-zero exit): {exc}")
 
     return history
 
@@ -980,7 +1060,8 @@ class BaselineALNSModel:
         if allow_lateral_transshipment:
             if msg:
                 print("[ALNS] allow_lateral_transshipment=True ignored: baseline ALNS keeps y=0 by design.")
-        _ = add_valid_16_20, enforce_integer_flows  # kept for signature parity
+        _ = add_valid_16_20  # kept for signature parity with Gurobi baseline
+        self._enforce_integer = bool(enforce_integer_flows)
         self._min_visit_activity_qty = max(0.0, float(min_visit_activity_qty))
         self._min_visit_delivery_qty = max(0.0, float(min_visit_delivery_qty))
         self._msg = bool(msg)
@@ -1457,6 +1538,12 @@ class BaselineALNSModel:
 
     # ---------------------------------------------------------- repair ops
 
+    def _snap_qty(self, qty: float) -> float:
+        """Floor to integer when integer flows are enforced; identity otherwise."""
+        if getattr(self, "_enforce_integer", False):
+            return float(math.floor(qty + 1e-9))
+        return float(qty)
+
     def _collect_unserved_requests(self, state: _ALNSState) -> List[Tuple[Store, Product, Period, float]]:
         d = self.data
         requests: List[Tuple[Store, Product, Period, float]] = []
@@ -1478,6 +1565,7 @@ class BaselineALNSModel:
                         shortfall = -ending
                         max_room = max(0.0, float(d.max_inventory_store.get((s, p), float("inf"))) - (inv_store[(s, p)] + qdir))
                         addable = min(shortfall, max_room, inv_wh.get(p, 0.0))
+                        addable = self._snap_qty(addable)
                         if addable > 1e-9:
                             requests.append((s, p, t, addable))
                     inv_store[(s, p)] = max(0.0, ending)
@@ -1523,7 +1611,7 @@ class BaselineALNSModel:
                     best_pos = i
             route.insert(best_pos, s)
             state.routes[(t, v)] = route
-        state.deliv[(s, p, v, t)] = state.deliv.get((s, p, v, t), 0.0) + qty
+        state.deliv[(s, p, v, t)] = state.deliv.get((s, p, v, t), 0.0) + self._snap_qty(qty)
 
     def _repair_greedy(self, state: _ALNSState) -> None:
         d = self.data
@@ -1698,6 +1786,8 @@ class BaselineALNSModel:
                     qdir = direct_ship_q.get((s, p, t), 0.0)
                     demand = float(d.demand.get((s, p, t), 0.0))
                     new_inv = cur_inv_store[(s, p)] + qdir - demand
+                    if getattr(self, "_enforce_integer", False):
+                        new_inv = float(math.floor(new_inv + 1e-9))
                     shortage[(s, p, t)] = float(max(0.0, -new_inv))
                     cur_inv_store[(s, p)] = max(0.0, new_inv)
                     inv_store[(s, p, t)] = float(cur_inv_store[(s, p)])
@@ -2336,6 +2426,8 @@ class LateralTransshipmentCG:
         gnn_root: str = "GNN",
         branch_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
         diagnostic_verbosity: str = "summary",
+        heuristic_top_k_mode: bool = False,
+        heuristic_top_k: int = 20,
     ):
         self.data = data
         self.baseline = baseline_solution
@@ -2372,6 +2464,10 @@ class LateralTransshipmentCG:
         self.gnn_acceptance_weight = 0.10
         self.use_classical_fallback = bool(use_classical_fallback)
         self.gnn_root = gnn_root
+        # Run-B (benchmark) — rank candidate patterns by |reduced_cost| and keep top-k
+        # before they enter RMP. Active only when use_gnn=False and collect_teacher_mode=False.
+        self.heuristic_top_k_mode = bool(heuristic_top_k_mode)
+        self.heuristic_top_k = max(1, int(heuristic_top_k))
         self._gnn_loaded = False
         self._gnn_unavailable_reason: Optional[str] = None
         self._gnn_model = None
@@ -2870,7 +2966,14 @@ class LateralTransshipmentCG:
                 )
             return selected
         except Exception as exc:
-            print(f"[GNN] Scoring skipped for this pricing episode: {exc}")
+            # Track scoring failures so the 3-way benchmark can detect when Run C
+            # silently degraded to the all-patterns fallback (was previously a
+            # blind passthrough with no accounting).
+            self._gnn_scoring_failures = int(getattr(self, "_gnn_scoring_failures", 0)) + 1
+            print(
+                f"[GNN] Scoring skipped for this pricing episode (failure "
+                f"#{self._gnn_scoring_failures}): {exc}"
+            )
             return patterns
 
     def _collect_teacher_batch_without_gnn_prefilter(
@@ -3798,6 +3901,13 @@ class LateralTransshipmentCG:
                 dual_need=master_solution.dual_need,
                 dual_surplus=master_solution.dual_surplus,
             )
+        elif self.heuristic_top_k_mode:
+            ranked = sorted(
+                new_patterns,
+                key=lambda p: abs(float(p.metadata.get("reduced_cost", 0.0) or 0.0)),
+                reverse=True,
+            )
+            selected_patterns = ranked[: self.heuristic_top_k]
         else:
             selected_patterns = new_patterns
         self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
@@ -4516,6 +4626,7 @@ def build_lt_plan_df_from_solution(
 def build_lt_plan_df_from_cg(cg_solution: CGSolution, patterns: List[LTPattern], data: IRPData) -> pd.DataFrame:
     pattern_by_id = {pat.pattern_id: pat for pat in patterns}
     rows = []
+    enforce_integer = os.environ.get("IRP_ENFORCE_INTEGER", "0").lower() not in {"0", "false", "no"}
     for pat_id in sorted(cg_solution.selected_patterns):
         pat = pattern_by_id.get(pat_id)
         if pat is None:
@@ -4525,6 +4636,8 @@ def build_lt_plan_df_from_cg(cg_solution: CGSolution, patterns: List[LTPattern],
             continue
         for i, j in sorted(pat.pattern_flows):
             qty = float(pat.pattern_flows[(i, j)]) * lam
+            if enforce_integer:
+                qty = float(math.floor(qty + 1e-9))
             if qty <= 1e-9:
                 continue
             unit_cost = float(data.ship_cost_lt.get((i, j, pat.product), data.transship_unit_cost.get((i, j), 0.0)))
@@ -5253,6 +5366,8 @@ class IRPResearchPipeline:
         demand_shock_non_dispatch_multiplier: float = 1.8,
         demand_shock_seed: int = 20260418,
         diagnostic_verbosity: str = "summary",
+        heuristic_top_k_mode: bool = False,
+        heuristic_top_k: int = 20,
     ) -> Dict:
         pipeline_started_at = time.perf_counter()
         print("=" * 80)
@@ -5374,6 +5489,8 @@ class IRPResearchPipeline:
             gnn_max_keep=gnn_max_keep,
             gnn_max_keep_fraction=gnn_max_keep_fraction,
             diagnostic_verbosity=diagnostic_verbosity,
+            heuristic_top_k_mode=heuristic_top_k_mode,
+            heuristic_top_k=heuristic_top_k,
         )
         if use_branch_and_price:
             cg_sol = cg_engine.run_branch_and_price(
@@ -5458,7 +5575,135 @@ class IRPResearchPipeline:
             "column_pool_diagnostics": cg_engine.column_pool_diagnostics,
             "teacher_dataset_rows": cg_engine.teacher_dataset_rows,
             "alns_history": list(getattr(baseline_sol, "alns_history", []) or []),
+            "gnn_scoring_failures": int(getattr(cg_engine, "_gnn_scoring_failures", 0)),
         }
+
+
+# ============================================================================
+# 3-WAY BENCHMARK RUNNER (IRP_RUN_BENCHMARK=1)
+# ============================================================================
+
+def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
+                               runtime_seconds: float) -> Dict[str, Any]:
+    """Extract the comparison-table row from a completed pipeline run."""
+    baseline_sol = results.get("baseline_solution")
+    cg_sol = results.get("cg_solution")
+    realized_no_lt = results.get("realized_no_lt_cost_breakdown") or {}
+    realized_with_lt = results.get("realized_with_lt_cost_breakdown") or {}
+    cg_history = results.get("cg_episode_history") or []
+    column_pool = results.get("column_pool_diagnostics") or []
+    total_cols_generated = sum(int(r.get("patterns_built_before_gnn", 0) or 0) for r in cg_history)
+    total_cols_added = sum(int(r.get("patterns_added_to_pool", 0) or 0) for r in cg_history)
+    final_pool = column_pool[-1] if column_pool else {}
+    pool_size = int(final_pool.get("pool_size", 0) or 0)
+    selected_in_rmp = int(final_pool.get("selected_in_rmp", 0) or 0)
+    pool_util = (selected_in_rmp / pool_size) if pool_size > 0 else 0.0
+    gnn_scoring_failures = int(results.get("gnn_scoring_failures", 0) or 0)
+    return {
+        "variant": variant,
+        "rmp_objective": float(cg_sol.objective) if cg_sol is not None else float("nan"),
+        "realized_cost_no_lt": float(realized_no_lt.get("total_cost", float("nan"))),
+        "realized_cost_with_lt": float(realized_with_lt.get("total_cost", float("nan"))),
+        "lt_cost_with_lt": float(realized_with_lt.get("lateral_transshipment_cost", 0.0)),
+        "shortage_cost_with_lt": float(realized_with_lt.get("shortage_cost", 0.0)),
+        "cg_iterations": int(len(cg_history)),
+        "runtime_seconds": float(runtime_seconds),
+        "columns_generated": total_cols_generated,
+        "columns_added_to_rmp": total_cols_added,
+        "column_pool_utilization": float(pool_util),
+        "gnn_scoring_failures": gnn_scoring_failures,
+    }
+
+
+def run_three_way_benchmark(
+    data: "IRPData",
+    *,
+    cg_iterations: int,
+    time_limit: Optional[int],
+    bp_max_nodes: int,
+    bp_max_depth: int,
+    gnn_checkpoint_path: str,
+    demand_shock_seed: int,
+    demand_shock_probability: float,
+    demand_shock_reallocation_fraction: float,
+    demand_shock_reallocations_per_product_period: int,
+    demand_shock_non_dispatch_multiplier: float,
+    lt_activation_threshold: float,
+    heuristic_top_k: int = 20,
+    enforce_integer_flows: bool = False,
+) -> pd.DataFrame:
+    """Run Classical CG, Heuristic Ranking CG, and GNN-Guided CG on the same data.
+
+    Writes Results/irp_benchmark_comparison.csv and returns the DataFrame.
+    Each variant reuses the same `data` object so the comparison is apples-to-apples.
+    """
+    variants: List[Tuple[str, Dict[str, Any]]] = [
+        ("A_classical_cg",  {"use_gnn": False, "collect_teacher_mode": False,
+                              "runtime_gnn_mode": False, "heuristic_top_k_mode": False}),
+        ("B_heuristic_cg",  {"use_gnn": False, "collect_teacher_mode": False,
+                              "runtime_gnn_mode": False, "heuristic_top_k_mode": True,
+                              "heuristic_top_k": heuristic_top_k}),
+        ("C_gnn_guided_cg", {"use_gnn": True,  "collect_teacher_mode": False,
+                              "runtime_gnn_mode": True,  "heuristic_top_k_mode": False}),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for variant_name, variant_kwargs in variants:
+        print("\n" + "#" * 80)
+        print(f"# BENCHMARK VARIANT: {variant_name}")
+        print("#" * 80)
+        t0 = time.perf_counter()
+        try:
+            variant_results = IRPResearchPipeline(data).run(
+                use_random_initial_patterns=True,
+                n_initial_patterns_per_product_period=5,
+                cg_iterations=cg_iterations,
+                msg=False,
+                time_limit=time_limit,
+                enforce_integer_flows=enforce_integer_flows,
+                gnn_checkpoint=gnn_checkpoint_path,
+                use_classical_fallback=False,
+                gnn_mass_threshold=0.55,
+                gnn_max_keep=150,
+                gnn_max_keep_fraction=0.30,
+                use_branch_and_price=True,
+                bp_max_nodes=bp_max_nodes,
+                bp_max_depth=bp_max_depth,
+                lt_activation_threshold=lt_activation_threshold,
+                demand_shock_probability=demand_shock_probability,
+                demand_shock_reallocation_fraction=demand_shock_reallocation_fraction,
+                demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+                demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
+                demand_shock_seed=demand_shock_seed,
+                **variant_kwargs,
+            )
+        except Exception as exc:
+            # Surface the failure instead of silently dropping the run.
+            print(f"[Benchmark] Variant {variant_name} FAILED: {exc}")
+            rows.append({
+                "variant": variant_name, "rmp_objective": float("nan"),
+                "realized_cost_no_lt": float("nan"), "realized_cost_with_lt": float("nan"),
+                "lt_cost_with_lt": float("nan"), "shortage_cost_with_lt": float("nan"),
+                "cg_iterations": 0, "runtime_seconds": time.perf_counter() - t0,
+                "columns_generated": 0, "columns_added_to_rmp": 0,
+                "column_pool_utilization": 0.0, "error": str(exc),
+            })
+            continue
+        runtime = time.perf_counter() - t0
+        row = _collect_benchmark_metrics(variant_name, variant_results, runtime)
+        rows.append(row)
+        print(f"[Benchmark] {variant_name}: obj={row['rmp_objective']:.2f} "
+              f"cost_with_lt={row['realized_cost_with_lt']:.2f} runtime={runtime:.1f}s")
+
+    df = pd.DataFrame(rows)
+    out_path = Path(RESULTS_DIR) / "irp_benchmark_comparison.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print("\n" + "=" * 80)
+    print("BENCHMARK COMPARISON SUMMARY")
+    print("=" * 80)
+    print(df.to_string(index=False))
+    print(f"\nSaved benchmark comparison to: {out_path}")
+    return df
 
 
 # ============================================================================
@@ -5466,7 +5711,59 @@ class IRPResearchPipeline:
 # ============================================================================
 
 if __name__ == "__main__":
-    EXCEL_PATH = Path(__file__).with_name("1BISCR501V_90100140_20260323-150407111_filtered_sites.csv")
+    # ---- Three-stage pipeline -----------------------------------------------
+    #
+    # Stage 1  OFFLINE TRAINING  (default)
+    #   IRP_ONLINE_INFERENCE=0
+    #   Dataset : training CSV (1BISCR501V_...)
+    #   Flow    : CG episodes → collect teacher rows → build graph samples
+    #             → train BiGAT from scratch → offline test on held-out split
+    #   GNN role: not used during CG; model produced as output
+    #
+    # Stage 2  ONLINE INFERENCE  (IRP_ONLINE_INFERENCE=1)
+    #   Dataset : test data.csv
+    #   Flow    : load pre-trained checkpoint → GNN scores columns during CG
+    #             → no new teacher collection, no retraining
+    #   Why this is the thesis default for Stage 2: the offline-trained model
+    #   is evaluated on a fixed checkpoint for reproducible examiner comparison.
+    #   Online learning introduces non-determinism and should only be activated
+    #   after the model has been validated in inference-only mode first.
+    #
+    # Stage 3  ONLINE LEARNING   (IRP_ONLINE_INFERENCE=1 + IRP_ONLINE_LEARNING=1)
+    #   Dataset : test data.csv
+    #   Supervision : solver-supervised — teacher labels come from RMP dual
+    #                 variables (lambda > 1e-6 → label=1) and reduced costs
+    #                 during inference CG episodes; no human annotation needed.
+    #   Sample collection: same teacher-row export as Stage 1, but on inference
+    #                 instances. Samples are appended to the existing teacher CSV
+    #                 so the fine-tune sees both old and new distributions.
+    #   Update frequency: once per full pipeline run (end-of-run fine-tune).
+    #                 Use IRP_ONLINE_LEARNING_EPOCHS (default 2) to control
+    #                 how many gradient steps are taken; keep small (1-3) to
+    #                 avoid overfitting to a single inference run.
+    #   Checkpoint: resume_checkpoint=True — weights are updated in-place;
+    #                 the original offline checkpoint is overwritten, so back
+    #                 it up manually before enabling this mode.
+    # -------------------------------------------------------------------------
+    _TRAINING_DATASET = Path(__file__).with_name("1BISCR501V_90100140_20260323-150407111_filtered_sites.csv")
+    _INFERENCE_DATASET = Path(__file__).with_name("test data.csv")
+
+    _online_inference = os.environ.get("IRP_ONLINE_INFERENCE", "0").lower() not in {"0", "false", "no"}
+    _online_learning  = (
+        _online_inference
+        and os.environ.get("IRP_ONLINE_LEARNING", "0").lower() not in {"0", "false", "no"}
+    )
+    EXCEL_PATH = Path(os.environ.get("IRP_DATASET_PATH", str(_INFERENCE_DATASET if _online_inference else _TRAINING_DATASET)))
+
+    if _online_learning:
+        print(
+            "[Mode] ONLINE LEARNING — test data.csv; GNN scores during CG AND new teacher rows are "
+            "collected; model is fine-tuned (solver-supervised, resume_checkpoint=True) at end of run."
+        )
+    elif _online_inference:
+        print("[Mode] ONLINE INFERENCE — test data.csv; pre-trained GNN checkpoint loaded, no retraining.")
+    else:
+        print("[Mode] OFFLINE TRAINING — training dataset; CG → teacher rows → GNN train/validate.")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     if os.environ.get("IRP_CLEAN_RESULTS", "1").lower() not in {"0", "false", "no"}:
@@ -5531,22 +5828,70 @@ if __name__ == "__main__":
     validation_target.to_csv(validation_target_path, index=False)
     print(f"Saved validation target to: {validation_target_path}")
 
-    collect_teacher_mode = os.environ.get("IRP_COLLECT_TEACHER_MODE", "1").lower() not in {"0", "false", "no"}
-    runtime_gnn_mode = os.environ.get("IRP_RUNTIME_GNN_MODE", "0").lower() not in {"0", "false", "no"}
-    use_branch_and_price = os.environ.get("IRP_USE_BRANCH_AND_PRICE", "1").lower() not in {"0", "false", "no"}
-    build_teacher_graphs = os.environ.get("IRP_BUILD_TEACHER_GRAPHS", "1").lower() not in {"0", "false", "no"}
-    train_gnn_after_teacher = os.environ.get("IRP_TRAIN_GNN_AFTER_TEACHER", "1").lower() not in {"0", "false", "no"}
-    gnn_train_epochs = int(os.environ.get("IRP_GNN_TRAIN_EPOCHS", "5"))
+    # Flag defaults per mode:
+    #   offline training : collect=T  runtime_gnn=F  train=T  resume=F  graphs=T
+    #   online inference : collect=F  runtime_gnn=T  train=F  resume=F  graphs=F
+    #   online learning  : collect=T  runtime_gnn=T  train=T  resume=T  graphs=T
+    if _online_learning:
+        _default_collect    = "1"
+        _default_runtime_gnn = "1"
+        _default_train_after = "1"
+        _default_build_graphs = "1"
+        _default_resume     = "1"   # fine-tune in-place, never retrain from scratch
+    elif _online_inference:
+        _default_collect    = "0"
+        _default_runtime_gnn = "1"
+        _default_train_after = "0"
+        _default_build_graphs = "0"
+        _default_resume     = "0"
+    else:  # offline training
+        _default_collect    = "1"
+        _default_runtime_gnn = "0"
+        _default_train_after = "1"
+        _default_build_graphs = "1"
+        _default_resume     = "0"
+
+    collect_teacher_mode  = os.environ.get("IRP_COLLECT_TEACHER_MODE",    _default_collect).lower()     not in {"0", "false", "no"}
+    runtime_gnn_mode      = os.environ.get("IRP_RUNTIME_GNN_MODE",        _default_runtime_gnn).lower() not in {"0", "false", "no"}
+    use_branch_and_price  = os.environ.get("IRP_USE_BRANCH_AND_PRICE",    "1").lower()                  not in {"0", "false", "no"}
+    build_teacher_graphs  = os.environ.get("IRP_BUILD_TEACHER_GRAPHS",    _default_build_graphs).lower() not in {"0", "false", "no"}
+    train_gnn_after_teacher = os.environ.get("IRP_TRAIN_GNN_AFTER_TEACHER", _default_train_after).lower() not in {"0", "false", "no"}
+    # Online learning uses fewer epochs (1-3) to avoid overfitting to a single run.
+    _default_epochs = str(int(os.environ.get("IRP_ONLINE_LEARNING_EPOCHS", "2"))) if _online_learning else "5"
+    gnn_train_epochs = int(os.environ.get("IRP_GNN_TRAIN_EPOCHS", _default_epochs))
     lt_activation_threshold = float(os.environ.get("IRP_LT_ACTIVATION_THRESHOLD", "0.0"))
     demand_shock_probability = float(os.environ.get("IRP_DEMAND_SHOCK_PROBABILITY", "0.85"))
     demand_shock_reallocation_fraction = float(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATION_FRACTION", "0.60"))
     demand_shock_reallocations_per_product_period = int(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD", "3"))
     demand_shock_non_dispatch_multiplier = float(os.environ.get("IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER", "1.8"))
     demand_shock_seed = int(os.environ.get("IRP_DEMAND_SHOCK_SEED", "20260418"))
-    resume_gnn_checkpoint = os.environ.get("IRP_RESUME_GNN_CHECKPOINT", "0").lower() not in {"0", "false", "no"}
+    resume_gnn_checkpoint = os.environ.get("IRP_RESUME_GNN_CHECKPOINT", _default_resume).lower() not in {"0", "false", "no"}
     gnn_checkpoint_path = os.environ.get("IRP_GNN_CHECKPOINT", DEFAULT_GNN_CHECKPOINT)
 
     env_time_limit = os.environ.get("IRP_TIME_LIMIT")
+    enforce_integer_flows = os.environ.get("IRP_ENFORCE_INTEGER", "0").lower() not in {"0", "false", "no"}
+
+    # ----- 3-way benchmark short-circuit -----
+    if os.environ.get("IRP_RUN_BENCHMARK", "0").lower() not in {"0", "false", "no"}:
+        heuristic_top_k_env = int(os.environ.get("IRP_HEURISTIC_TOP_K", "20"))
+        run_three_way_benchmark(
+            data=data,
+            cg_iterations=int(os.environ.get("IRP_CG_ITERATIONS", "15")),
+            time_limit=int(env_time_limit) if env_time_limit else None,
+            bp_max_nodes=int(os.environ.get("IRP_BP_MAX_NODES", "15")),
+            bp_max_depth=int(os.environ.get("IRP_BP_MAX_DEPTH", "6")),
+            gnn_checkpoint_path=gnn_checkpoint_path,
+            demand_shock_seed=demand_shock_seed,
+            demand_shock_probability=demand_shock_probability,
+            demand_shock_reallocation_fraction=demand_shock_reallocation_fraction,
+            demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+            demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
+            lt_activation_threshold=lt_activation_threshold,
+            heuristic_top_k=heuristic_top_k_env,
+            enforce_integer_flows=enforce_integer_flows,
+        )
+        print("\n[Benchmark] IRP_RUN_BENCHMARK=1 — exiting after 3-way comparison.")
+        sys.exit(0)
 
     results = IRPResearchPipeline(data).run(
         use_random_initial_patterns=True,
@@ -5554,7 +5899,7 @@ if __name__ == "__main__":
         cg_iterations=int(os.environ.get("IRP_CG_ITERATIONS", "15")),
         msg=False,
         time_limit=int(env_time_limit) if env_time_limit else None,
-        enforce_integer_flows=False,
+        enforce_integer_flows=enforce_integer_flows,
         use_gnn=runtime_gnn_mode,
         collect_teacher_mode=collect_teacher_mode,
         runtime_gnn_mode=runtime_gnn_mode,
@@ -5726,7 +6071,7 @@ if __name__ == "__main__":
                     cg_iterations=int(os.environ.get("IRP_CG_ITERATIONS", "15")),
                     msg=False,
                     time_limit=int(env_time_limit) if env_time_limit else None,
-                    enforce_integer_flows=False,
+                    enforce_integer_flows=enforce_integer_flows,
                     use_gnn=True,
                     collect_teacher_mode=False,
                     runtime_gnn_mode=True,
@@ -5823,8 +6168,9 @@ if __name__ == "__main__":
     if phase_cmp_path.exists():
         try:
             phase_cmp_df = pd.read_csv(phase_cmp_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[Charts] Could not read {phase_cmp_path}: {exc}. Charts will skip phase comparison.")
+            phase_cmp_df = None
 
     saved_charts = save_pipeline_charts(
         results=results,

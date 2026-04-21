@@ -497,6 +497,7 @@ def build_training_sample_from_exported_teacher_rows(
     edge_rows: List[Tuple[int, int]] = []
     edge_attrs: List[List[float]] = []
     metadata_columns: List[Dict[str, Any]] = []
+    missing_teacher_score_count = 0
 
     for col_idx, row in enumerate(rows):
         if not row.get("column_features_json"):
@@ -515,7 +516,22 @@ def build_training_sample_from_exported_teacher_rows(
         else:
             label = 1.0 if _truthy(row.get("selected_in_rmp")) else 0.0
         labels.append(label)
-        target_scores.append(_float_value(row.get("teacher_score"), label))
+        # teacher_score is λ·max(0,−reduced_cost) — a graded ranking signal.
+        # If missing, we fall back to the binary label; count how often so the
+        # caller can detect degraded supervision (score_regression objective
+        # would silently become equivalent to binary without this warning).
+        raw_score = row.get("teacher_score")
+        if raw_score is None or str(raw_score).strip() == "":
+            missing_teacher_score_count += 1
+            target_scores.append(label)
+        else:
+            target_scores.append(_float_value(raw_score, label))
+    if missing_teacher_score_count > 0:
+        print(
+            f"[teacher_dataset] WARNING: teacher_score missing on {missing_teacher_score_count}/"
+            f"{len(rows)} rows; target_score fell back to binary label. "
+            f"This degrades score_regression supervision (pairwise_rank is unaffected)."
+        )
         metadata_columns.append({
             "pattern_id": row.get("pattern_id"),
             "product": row.get("product"),

@@ -1,4 +1,29 @@
 from __future__ import annotations
+"""
+GNN/03_train_bigat.py — Offline BiGAT training for IRP-LT column scoring.
+
+Inputs
+------
+- GNN/data/irplt_teacher/{train,valid,test}/sample_*.pkl (written by
+  GNN/build_teacher_graph_dataset.py)
+
+Outputs
+-------
+- GNN/trained_models/irplt_teacher/bigat/<objective>/best_model.pt
+- GNN/trained_models/irplt_teacher/bigat/<objective>/training_history.json
+- GNN/trained_models/irplt_teacher/bigat/<objective>/training_loss_curve.png
+
+Early stopping
+--------------
+Primary metric is MRR when --objective=pairwise_rank (HIGHER is better);
+otherwise validation loss (lower is better). The checkpoint saved to
+best_model.pt corresponds to the best primary metric observed.
+
+CLI
+---
+--data-dir, --out-dir, --dataset-type (teacher|synthetic), --seed, --epochs,
+--lr, --hidden-dim, --dropout, --patience, --objective, --resume-checkpoint, --device
+"""
 
 import argparse
 import json
