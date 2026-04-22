@@ -697,9 +697,21 @@ def normalize_dataset(
     normalized = []
     for sample in samples:
         item = dict(sample)
-        item["column_features"] = (item["column_features"] - stats["column_mean"]) / stats["column_std"]
-        item["constraint_features"] = (item["constraint_features"] - stats["constraint_mean"]) / stats["constraint_std"]
-        item["edge_attr_col_to_con"] = (item["edge_attr_col_to_con"] - stats["edge_mean"]) / stats["edge_std"]
+        # Align normalization stats to the sample tensor device/dtype so
+        # evaluation works even when checkpoints are loaded onto CUDA.
+        column_mean = stats["column_mean"].to(device=item["column_features"].device, dtype=item["column_features"].dtype)
+        column_std = stats["column_std"].to(device=item["column_features"].device, dtype=item["column_features"].dtype)
+        constraint_mean = stats["constraint_mean"].to(
+            device=item["constraint_features"].device, dtype=item["constraint_features"].dtype
+        )
+        constraint_std = stats["constraint_std"].to(
+            device=item["constraint_features"].device, dtype=item["constraint_features"].dtype
+        )
+        edge_mean = stats["edge_mean"].to(device=item["edge_attr_col_to_con"].device, dtype=item["edge_attr_col_to_con"].dtype)
+        edge_std = stats["edge_std"].to(device=item["edge_attr_col_to_con"].device, dtype=item["edge_attr_col_to_con"].dtype)
+        item["column_features"] = (item["column_features"] - column_mean) / column_std
+        item["constraint_features"] = (item["constraint_features"] - constraint_mean) / constraint_std
+        item["edge_attr_col_to_con"] = (item["edge_attr_col_to_con"] - edge_mean) / edge_std
         normalized.append(item)
     return normalized, stats
 
