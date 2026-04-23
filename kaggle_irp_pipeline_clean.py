@@ -63,12 +63,6 @@ BP_MAX_DEPTH     = 6
 GNN_TRAIN_EPOCHS = 80
 LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 
-# ── Time limits ──────────────────────────────────────────
-# Per-phase CG solver time limit (seconds). None = unlimited (use for final runs).
-# Kaggle T4 / P100: 600–900 s is a reasonable guard for Phase 1 & 2 first runs.
-PHASE_TIME_LIMIT: Optional[int] = 600   # seconds; set None for unlimited
-# Benchmark gets its own limit — 3 variants × PHASE_TIME_LIMIT can be long.
-BENCHMARK_TIME_LIMIT: Optional[int] = 300  # seconds per benchmark variant
 
 # ── Teacher / scenario generation ────────────────────────
 # Set MULTI_SCENARIO_MODE=True to run generate_teacher_scenarios.py for
@@ -89,13 +83,12 @@ BASE_SPECS = [
 TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 
 # ── Optional stages ───────────────────────────────────────
-# First run: keep RUN_BENCHMARK=False until Phase 1 + Phase 2 look correct.
-# Benchmark runs 3 CG variants on the same data — adds significant wall-clock
-# time and can hit Kaggle's 9-hour session limit if CG_ITERATIONS is high.
+# Only enable RUN_BENCHMARK after Phase 1 + Phase 2 results look correct.
+# Benchmark runs 3 CG variants — adds significant wall-clock time.
 RUN_PHASE_2          = True
 RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
-RUN_BENCHMARK        = False    # set True only after Phase 1 + Phase 2 validated
+RUN_BENCHMARK        = True     # flip to False on first run; enable after Phase 1 + Phase 2 validated
 HEURISTIC_TOP_K      = 20
 DEMAND_SHOCK_SEED    = 42
 
@@ -335,7 +328,7 @@ def run_phase(irp: Any, data: Any, *, use_gnn: bool, collect_teacher: bool,
         n_initial_patterns_per_product_period=10,
         cg_iterations=CG_ITERATIONS,
         msg=False,
-        time_limit=PHASE_TIME_LIMIT,
+        time_limit=None,
         enforce_integer_flows=False,
         cw_dispatch_cycle=5,
         use_gnn=use_gnn,
@@ -717,7 +710,7 @@ if RUN_BENCHMARK:
     benchmark_df = irp.run_three_way_benchmark(
         data=bm_data,
         cg_iterations=CG_ITERATIONS,
-        time_limit=BENCHMARK_TIME_LIMIT,
+        time_limit=None,
         bp_max_nodes=BP_MAX_NODES,
         bp_max_depth=BP_MAX_DEPTH,
         gnn_checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
