@@ -198,7 +198,114 @@ def _safe_var_value(model: gp.Model, var: gp.Var) -> float:
 
 
 DEFAULT_GNN_CHECKPOINT = "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt"
-RESULTS_DIR = Path(__file__).resolve().parent / "Results"
+RESULTS_DIR = Path(os.environ.get("IRP_RESULTS_DIR") or Path(__file__).resolve().parent / "Results")
+
+
+# ============================================================================
+# RESULTS LAYOUT
+# ============================================================================
+# Every pipeline invocation is tagged by a "phase label" that controls which
+# sub-folder its artifacts land in. This keeps train / valid / test / benchmark
+# outputs cleanly separated so the Results/ tree is self-describing.
+#
+#     Results/
+#       run_manifest.json          — per-run index (dataset, scenario, phase, files)
+#       seed_manifest.json         — resolved seeds
+#       scenarios/                 — teacher-data scenario generator outputs
+#       teacher/                   — single-run teacher rows (fallback mode)
+#       graphs/                    — teacher-graph dataset summary (mirror of GNN/data/<…>/dataset_summary.json)
+#       gnn/                       — BiGAT training + offline test
+#       phase1_offline_baseline/   — Phase 1 = teacher-collection / classical CG
+#       phase2_online_inference/   — Phase 2 = pre-trained GNN scoring during CG
+#       phase3_online_learning/    — Phase 3 = fine-tune + inference
+#       benchmark/                 — 3-way classical / heuristic / GNN comparison
+#       thesis_summary/            — headline tables for reporting
+#       charts/                    — all PNGs in one place, phase-suffixed
+#
+# Phase label is derived from env:
+#   IRP_PHASE_LABEL               — explicit override (set by Kaggle notebook)
+#   IRP_ONLINE_LEARNING=1         → phase3_online_learning
+#   IRP_ONLINE_INFERENCE=1        → phase2_online_inference
+#   otherwise                     → phase1_offline_baseline
+
+SCENARIOS_SUBDIR       = "scenarios"
+TEACHER_SUBDIR         = "teacher"
+GRAPHS_SUBDIR          = "graphs"
+GNN_SUBDIR             = "gnn"
+BENCHMARK_SUBDIR       = "benchmark"
+CHARTS_SUBDIR          = "charts"
+THESIS_SUMMARY_SUBDIR  = "thesis_summary"
+
+_KNOWN_PHASE_LABELS = (
+    "phase1_offline_baseline",
+    "phase2_online_inference",
+    "phase3_online_learning",
+    "phase2_deploy_after_teacher",
+    "scenario",
+    "smoke_test",
+)
+
+
+def resolve_phase_label() -> str:
+    explicit = os.environ.get("IRP_PHASE_LABEL", "").strip()
+    if explicit:
+        return explicit
+    if os.environ.get("IRP_ONLINE_LEARNING", "0").lower() not in {"0", "false", "no", ""}:
+        return "phase3_online_learning"
+    if os.environ.get("IRP_ONLINE_INFERENCE", "0").lower() not in {"0", "false", "no", ""}:
+        return "phase2_online_inference"
+    return "phase1_offline_baseline"
+
+
+class ResultsLayout:
+    """Owns every output path the pipeline writes to.
+
+    Call `build_results_layout()` once at the start of a run; pass the
+    resulting object to any helper that needs to write an artifact. Every
+    sub-folder is created lazily on first access via `ensure()`.
+    """
+
+    def __init__(self, root: Path, phase_label: str):
+        self.root = Path(root)
+        self.phase_label = phase_label
+        self.run_manifest_path = self.root / "run_manifest.json"
+        self.seed_manifest_path = self.root / "seed_manifest.json"
+        self.scenarios  = self.root / SCENARIOS_SUBDIR
+        self.teacher    = self.root / TEACHER_SUBDIR
+        self.graphs     = self.root / GRAPHS_SUBDIR
+        self.gnn        = self.root / GNN_SUBDIR
+        self.gnn_test   = self.gnn / "offline_test"
+        self.benchmark  = self.root / BENCHMARK_SUBDIR
+        self.charts     = self.root / CHARTS_SUBDIR
+        self.thesis     = self.root / THESIS_SUMMARY_SUBDIR
+        self.phase      = self.root / phase_label
+
+    def ensure(self, *paths: Path) -> None:
+        for p in paths:
+            Path(p).mkdir(parents=True, exist_ok=True)
+
+    def phase_file(self, name: str) -> Path:
+        self.ensure(self.phase)
+        return self.phase / name
+
+    def chart_file(self, name: str, phase_label: Optional[str] = None) -> Path:
+        self.ensure(self.charts)
+        suffix = phase_label or self.phase_label
+        stem, _, ext = name.rpartition(".")
+        if ext:
+            return self.charts / f"{stem}_{suffix}.{ext}"
+        return self.charts / f"{name}_{suffix}"
+
+
+def build_results_layout(
+    root: Optional[Path] = None,
+    phase_label: Optional[str] = None,
+) -> ResultsLayout:
+    root = Path(root) if root is not None else RESULTS_DIR
+    phase = phase_label or resolve_phase_label()
+    layout = ResultsLayout(root=root, phase_label=phase)
+    layout.ensure(layout.root)
+    return layout
 
 
 def resolve_seed_manifest(results_dir: Path | str = RESULTS_DIR) -> Dict[str, int]:
@@ -276,41 +383,72 @@ def resolve_seed_manifest(results_dir: Path | str = RESULTS_DIR) -> Dict[str, in
     return manifest
 
 
-# All run-artifact filename prefixes the pipeline writes. Any file in RESULTS_DIR
-# (and RESULTS_DIR/charts) starting with one of these is considered "managed" and
-# will be cleaned up at the start of each __main__ run so stale files from prior
-# runs (on Kaggle especially) can't shadow fresh outputs.
-_MANAGED_OUTPUT_PREFIXES: Tuple[str, ...] = (
-    "irp_",
-    "cg_",
-    "column_pool_",
-    "chart_",
+# Sub-folders under Results/ that the pipeline owns end-to-end. clean_managed_outputs()
+# wipes them before a fresh run so stale artifacts from an earlier run can't
+# shadow new ones. `scenarios/` is intentionally EXCLUDED (scenario generator
+# appends across invocations), as are `seed_manifest.json` and `run_manifest.json`
+# (rewritten fresh on every run but not destroyed before seed_manifest is
+# regenerated).
+_MANAGED_SUBDIRS: Tuple[str, ...] = (
+    TEACHER_SUBDIR,
+    GRAPHS_SUBDIR,
+    GNN_SUBDIR,
+    BENCHMARK_SUBDIR,
+    CHARTS_SUBDIR,
+    THESIS_SUMMARY_SUBDIR,
+    "phase1_offline_baseline",
+    "phase2_online_inference",
+    "phase2_deploy_after_teacher",
+    "phase3_online_learning",
+    "smoke_test",
 )
 
 
-def clean_managed_outputs(results_dir: Path | str = RESULTS_DIR,
-                          extra_subdirs: Tuple[str, ...] = ("charts",)) -> List[str]:
-    """Remove managed output files so a fresh run can't be confused with stale ones.
+def clean_managed_outputs(
+    results_dir: Path | str = RESULTS_DIR,
+    keep_scenarios: bool = True,
+) -> List[str]:
+    """Remove managed output sub-folders so a fresh run starts clean.
 
-    Matches any file whose name starts with a prefix in `_MANAGED_OUTPUT_PREFIXES`.
-    Returns the list of removed paths. Safe to call even if the directory does
-    not yet exist.
+    Returns the list of removed paths. Safe to call even if the directory
+    does not yet exist. `scenarios/` is preserved by default because the
+    teacher-scenario generator appends across runs.
     """
+    import shutil
     removed: List[str] = []
     root = Path(results_dir)
     if not root.exists():
         return removed
-    targets = [root] + [root / sub for sub in extra_subdirs if (root / sub).exists()]
-    for target in targets:
-        for entry in target.iterdir():
-            if not entry.is_file():
-                continue
-            if any(entry.name.startswith(pfx) for pfx in _MANAGED_OUTPUT_PREFIXES):
-                try:
-                    entry.unlink()
-                    removed.append(str(entry))
-                except OSError:
-                    pass
+    for sub in _MANAGED_SUBDIRS:
+        target = root / sub
+        if target.exists():
+            try:
+                shutil.rmtree(target)
+                removed.append(str(target))
+            except OSError:
+                pass
+    if not keep_scenarios:
+        target = root / SCENARIOS_SUBDIR
+        if target.exists():
+            try:
+                shutil.rmtree(target)
+                removed.append(str(target))
+            except OSError:
+                pass
+    # Legacy stray CSVs from the old flat layout, if a stale tree still
+    # contains them — wipe quietly.
+    for entry in list(root.iterdir()) if root.exists() else []:
+        if entry.is_file() and (
+            entry.name.startswith("irp_")
+            or entry.name.startswith("cg_")
+            or entry.name.startswith("column_pool_")
+            or entry.name.startswith("chart_")
+        ):
+            try:
+                entry.unlink()
+                removed.append(str(entry))
+            except OSError:
+                pass
     return removed
 
 
@@ -462,14 +600,32 @@ def run_teacher_graph_and_gnn_training(
                 "check constraint_features_json diversity or group_key collapse."
             )
 
+        gnn_dir = Path(RESULTS_DIR) / GNN_SUBDIR
+        gnn_dir.mkdir(parents=True, exist_ok=True)
         resolved_csv_path = (
             Path(training_history_csv_path)
             if training_history_csv_path
-            else Path(RESULTS_DIR) / "irp_gnn_training_history.csv"
+            else gnn_dir / "training_history.csv"
         )
         resolved_csv_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(history).to_csv(resolved_csv_path, index=False)
         print(f"[Teacher/GNN] Wrote training history CSV ({len(history)} rows) to: {resolved_csv_path}")
+
+        # Mirror the canonical training loss chart + JSON history into Results/gnn/
+        # so everything for the thesis is colocated under Results/.
+        _ckpt_dir = _project_path(checkpoint_path).parent
+        for src_name, dst_name in [
+            ("training_loss_curve.png", "training_loss_curve.png"),
+            ("training_history.json",   "training_history.json"),
+            ("training_summary.json",   "training_summary.json"),
+        ]:
+            src = _ckpt_dir / src_name
+            if src.exists():
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(src, gnn_dir / dst_name)
+                except OSError:
+                    pass
 
         # ---- Validation summary (best epoch by MRR) ----
         if history:
@@ -511,7 +667,9 @@ def run_teacher_graph_and_gnn_training(
                     raise RuntimeError(msg + " (IRP_STRICT_OFFLINE_TEST=1)")
                 print(f"Skipping {msg}")
             else:
-                test_out_csv = Path(RESULTS_DIR) / "irp_gnn_offline_test.csv"
+                gnn_test_dir = Path(RESULTS_DIR) / GNN_SUBDIR / "offline_test"
+                gnn_test_dir.mkdir(parents=True, exist_ok=True)
+                test_out_csv = gnn_test_dir / "test_per_sample.csv"
                 test_cmd = [
                     sys.executable,
                     "GNN/04_test.py",
@@ -524,6 +682,19 @@ def run_teacher_graph_and_gnn_training(
                 try:
                     subprocess.run(test_cmd, cwd=str(Path(__file__).resolve().parent), check=True)
                     print(f"[Teacher/GNN] Offline test metrics saved to: {test_out_csv}")
+                    # Aggregate by mass_threshold → test_summary.json
+                    try:
+                        _df = pd.read_csv(test_out_csv)
+                        if not _df.empty and "mass_threshold" in _df.columns:
+                            _agg = _df.groupby("mass_threshold").mean(numeric_only=True).reset_index()
+                            _summary = {
+                                "n_samples": int(_df["sample_id"].nunique()) if "sample_id" in _df.columns else int(len(_df)),
+                                "thresholds": _agg.to_dict(orient="records"),
+                            }
+                            with open(gnn_test_dir / "test_summary.json", "w", encoding="utf-8") as f:
+                                json.dump(_summary, f, indent=2)
+                    except Exception as agg_exc:
+                        print(f"[Teacher/GNN] Could not aggregate test summary: {agg_exc}")
                 except subprocess.CalledProcessError as exc:
                     # Surface the failure so silent regressions are caught (see code review Task).
                     print(f"[Teacher/GNN] Offline test FAILED (non-zero exit): {exc}")
@@ -4991,10 +5162,13 @@ def save_pipeline_charts(
     out_dir: Path,
     refreshed_gnn_history: Optional[List[Dict[str, Any]]] = None,
     phase_comparison_df: Optional[pd.DataFrame] = None,
+    phase_label: Optional[str] = None,
 ) -> List[str]:
     """Generate all pipeline visualisation charts and write them to *out_dir*.
 
-    Returns a list of paths that were actually written.
+    Chart filenames are suffixed with *phase_label* (default: "phase1") so
+    multiple pipeline phases can share the same charts/ directory without
+    clobbering each other. Returns a list of paths that were actually written.
     """
     mpl, plt = _mpl_agg()
     if plt is None:
@@ -5003,6 +5177,12 @@ def save_pipeline_charts(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    suffix = phase_label or "phase1"
+
+    def _chart(name: str) -> str:
+        stem, _, ext = name.rpartition(".")
+        return str(out_dir / (f"{stem}_{suffix}.{ext}" if ext else f"{name}_{suffix}"))
+
     saved: List[str] = []
 
     # ------------------------------------------------------------------
@@ -5037,10 +5217,10 @@ def save_pipeline_charts(
             ax2.legend()
             ax2.grid(True, alpha=0.3)
 
-            path = str(out_dir / "chart_01_gnn_training.png")
+            path = _chart("gnn_training.png")
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_01_gnn_training: {exc}")
+            print(f"[Charts] gnn_training: {exc}")
 
     # ------------------------------------------------------------------
     # 2. CG Cost Convergence (all B&P nodes)
@@ -5063,10 +5243,10 @@ def save_pipeline_charts(
             if len(node_ids) <= 10:
                 ax.legend(fontsize=7, ncol=2)
             ax.grid(True, alpha=0.3)
-            path = str(out_dir / "chart_02_cg_convergence.png")
+            path = _chart("cg_convergence.png")
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_02_cg_convergence: {exc}")
+            print(f"[Charts] cg_convergence: {exc}")
 
     # ------------------------------------------------------------------
     # 3. Cost Breakdown Comparison: baseline | without LT | with CG LT
@@ -5102,10 +5282,10 @@ def save_pipeline_charts(
             ax.set_title("Cost Breakdown: Baseline vs Realized Without/With LT")
             ax.legend()
             ax.grid(True, axis="y", alpha=0.3)
-            path = str(out_dir / "chart_03_cost_breakdown.png")
+            path = _chart("cost_breakdown.png")
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_03_cost_breakdown: {exc}")
+            print(f"[Charts] cost_breakdown: {exc}")
 
     # ------------------------------------------------------------------
     # 4. Shortage Reduction: before / after LT
@@ -5137,10 +5317,10 @@ def save_pipeline_charts(
             ax.set_title("Shortage Reduction via Lateral Transshipment")
             ax.legend()
             ax.grid(True, axis="y", alpha=0.3)
-            path = str(out_dir / "chart_04_shortage_reduction.png")
+            path = _chart("shortage_reduction.png")
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_04_shortage_reduction: {exc}")
+            print(f"[Charts] shortage_reduction: {exc}")
 
     # ------------------------------------------------------------------
     # 5. Demand Fulfillment Rate by Store (post-shock, before vs after LT)
@@ -5188,10 +5368,10 @@ def save_pipeline_charts(
             ax.axvline(100, linestyle="--", color="black", alpha=0.4, linewidth=1)
             ax.legend()
             ax.grid(True, axis="x", alpha=0.3)
-            path = str(out_dir / "chart_05_fulfillment_by_store.png")
+            path = _chart("fulfillment_by_store.png")
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_05_fulfillment_by_store: {exc}")
+            print(f"[Charts] fulfillment_by_store: {exc}")
 
     # ------------------------------------------------------------------
     # 6. LT Flow Heatmap (from_store × to_store, aggregated by qty)
@@ -5222,10 +5402,10 @@ def save_pipeline_charts(
                     if mat[i, j] > 1e-9:
                         ax.text(j, i, f"{mat[i, j]:.1f}", ha="center", va="center",
                                 fontsize=6, color="black" if mat[i, j] < mat.max() * 0.6 else "white")
-            path = str(out_dir / "chart_06_lt_flow_heatmap.png")
+            path = _chart("lt_flow_heatmap.png")
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_06_lt_flow_heatmap: {exc}")
+            print(f"[Charts] lt_flow_heatmap: {exc}")
 
     # ------------------------------------------------------------------
     # 7. Branch-and-Price Bound Progression
@@ -5274,10 +5454,10 @@ def save_pipeline_charts(
             ax2.set_title("B&P Node Status Distribution")
             ax2.grid(True, axis="y", alpha=0.3)
 
-            path = str(out_dir / "chart_07_branch_price.png")
+            path = _chart("branch_price.png")
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_07_branch_price: {exc}")
+            print(f"[Charts] branch_price: {exc}")
 
     # ------------------------------------------------------------------
     # 8. CG Pricing Funnel per Episode (at root node)
@@ -5307,10 +5487,10 @@ def save_pipeline_charts(
                 ax.set_title("Pricing Funnel: Candidate Pairs → Pool per CG Episode")
                 ax.legend(fontsize=8)
                 ax.grid(True, alpha=0.3)
-                path = str(out_dir / "chart_08_pricing_funnel.png")
+                path = _chart("pricing_funnel.png")
                 saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_08_pricing_funnel: {exc}")
+            print(f"[Charts] pricing_funnel: {exc}")
 
     # ------------------------------------------------------------------
     # 10. ALNS Convergence (effectiveness of baseline search)
@@ -5354,10 +5534,10 @@ def save_pipeline_charts(
                 ax2.legend(fontsize=8, loc="lower left")
                 ax2.grid(True, alpha=0.3)
 
-                path = str(out_dir / "chart_10_alns_convergence.png")
+                path = _chart("alns_convergence.png")
                 saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_10_alns_convergence: {exc}")
+            print(f"[Charts] alns_convergence: {exc}")
 
     # ------------------------------------------------------------------
     # 11. Cost Breakdown Log-Scale (so small components stay visible)
@@ -5426,10 +5606,10 @@ def save_pipeline_charts(
             ax.set_title("Phase Comparison: Classical CG vs GNN-Deployed CG")
             ax.legend()
             ax.grid(True, axis="y", alpha=0.3)
-            path = str(out_dir / "chart_09_phase_comparison.png")
+            path = str(out_dir / "phase_comparison.png")  # cross-phase chart — no suffix
             saved.append(_save_fig(plt, path))
         except Exception as exc:
-            print(f"[Charts] chart_09_phase_comparison: {exc}")
+            print(f"[Charts] phase_comparison: {exc}")
 
     return saved
 
@@ -5942,6 +6122,177 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
     }
 
 
+def save_phase_artifacts(
+    results: Dict[str, Any],
+    layout: ResultsLayout,
+    phase_label: Optional[str] = None,
+    *,
+    validation_target: Optional[pd.DataFrame] = None,
+    save_routes: Optional[bool] = None,
+) -> Dict[str, str]:
+    """Write every per-phase CSV/JSON artifact into Results/<phase>/ with short names.
+
+    Returns a mapping {artifact_name: path} describing what was actually written,
+    so the run manifest can list it and the runtime summary can print it.
+    Filenames do NOT repeat the phase label — the containing folder signals it.
+    """
+    phase_label = phase_label or layout.phase_label
+    phase_dir = layout.root / phase_label
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    if save_routes is None:
+        save_routes = os.environ.get("IRP_SAVE_ROUTES", "0").lower() not in {"0", "false", "no", ""}
+    written: Dict[str, str] = {}
+
+    def _put(name: str, path: Path) -> None:
+        written[name] = str(path.relative_to(layout.root))
+
+    def _csv(name: str, df: pd.DataFrame) -> None:
+        path = phase_dir / name
+        df.to_csv(path, index=False)
+        _put(name, path)
+
+    # Cost breakdowns
+    try:
+        _csv("baseline_cost_breakdown.csv", pd.DataFrame([results["baseline_cost_breakdown"]]))
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] baseline_cost_breakdown: {exc}")
+
+    try:
+        no_lt = results.get("realized_no_lt_cost_breakdown") or {}
+        with_lt = results.get("realized_with_lt_cost_breakdown") or {}
+        delta = {k: round(float(no_lt.get(k, 0.0)) - float(with_lt.get(k, 0.0)), 6) for k in no_lt}
+        _csv("realized_cost_breakdown.csv", pd.DataFrame([
+            {"scenario": "without_lt", **no_lt},
+            {"scenario": "with_cg_lt", **with_lt},
+            {"scenario": "delta_no_lt_minus_with_lt", **delta},
+        ]))
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] realized_cost_breakdown: {exc}")
+
+    # Solver efficiency
+    try:
+        _csv("solver_efficiency.csv", pd.DataFrame([
+            {"model": "baseline_irpt", **results["baseline_solution"].efficiency_metrics},
+            {"model": "cg_rmp_total",  **results["cg_solution"].efficiency_metrics},
+        ]))
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] solver_efficiency: {exc}")
+
+    # Demand fulfillment (forecast + post-shock in one file, tagged by mode)
+    try:
+        parts: List[pd.DataFrame] = []
+        fc = results.get("forecast_demand_fulfillment")
+        ps = results.get("post_shock_demand_fulfillment")
+        if isinstance(fc, pd.DataFrame) and not fc.empty:
+            tagged = fc.copy(); tagged["mode"] = "pre_shock_forecast"; parts.append(tagged)
+        if isinstance(ps, pd.DataFrame) and not ps.empty:
+            tagged = ps.copy(); tagged["mode"] = "post_shock_realized"; parts.append(tagged)
+        if parts:
+            _csv("demand_fulfillment.csv", pd.concat(parts, ignore_index=True, sort=False))
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] demand_fulfillment: {exc}")
+
+    # LT plan
+    try:
+        lt_plan = results.get("lt_plan")
+        if isinstance(lt_plan, pd.DataFrame):
+            _csv("lt_plan.csv", lt_plan)
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] lt_plan: {exc}")
+
+    # Demand shock summary
+    try:
+        shock_row = {
+            **(results.get("demand_shock_summary") or {}),
+            **(results.get("post_shock_summary") or {}),
+            **(results.get("post_shock_lt_diagnostics") or {}),
+        }
+        if shock_row:
+            _csv("demand_shock_summary.csv", pd.DataFrame([shock_row]))
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] demand_shock_summary: {exc}")
+
+    # CG / B&P histories (per-phase so phase1 and phase2 don't overwrite each other)
+    for key, fname in [
+        ("cg_episode_history",     "cg_episode_history.csv"),
+        ("branch_price_history",   "branch_price_history.csv"),
+        ("cg_episode_diagnostics", "cg_episode_diagnostics.csv"),
+        ("column_pool_diagnostics","column_pool_diagnostics.csv"),
+    ]:
+        v = results.get(key)
+        if isinstance(v, list) and v:
+            try:
+                _csv(fname, pd.DataFrame(v))
+            except Exception as exc:
+                print(f"[artifacts/{phase_label}] {fname}: {exc}")
+        elif isinstance(v, pd.DataFrame) and not v.empty:
+            try:
+                _csv(fname, v)
+            except Exception as exc:
+                print(f"[artifacts/{phase_label}] {fname}: {exc}")
+
+    # ALNS history — only if populated
+    alns = results.get("alns_history") or []
+    if alns:
+        try:
+            _csv("alns_history.csv", pd.DataFrame(alns))
+        except Exception as exc:
+            print(f"[artifacts/{phase_label}] alns_history: {exc}")
+
+    # Selected-column history (JSON)
+    try:
+        sel = results.get("gnn_selection_history")
+        if sel is not None:
+            path = phase_dir / "selected_columns.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(sel, f, indent=2)
+            _put("selected_columns.json", path)
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] selected_columns: {exc}")
+
+    # Optional verbose routes dump — off by default (very wide rows)
+    if save_routes:
+        try:
+            rows = [
+                {
+                    "period": r["period"],
+                    "vehicle": r["vehicle"],
+                    "route": " -> ".join(r["route"]),
+                    "total_direct_qty": r["total_direct_qty"],
+                    "total_lt_qty": r["total_lt_qty"],
+                    "load_departure": r.get("load_departure", 0.0),
+                }
+                for r in results.get("baseline_routes", [])
+            ]
+            if rows:
+                _csv("baseline_routes.csv", pd.DataFrame(rows))
+        except Exception as exc:
+            print(f"[artifacts/{phase_label}] baseline_routes: {exc}")
+
+    # Predicted inventory + validation comparison (only if validation_target given).
+    if validation_target is not None:
+        try:
+            predicted = build_predicted_inventory_df(results["baseline_solution"])
+            cmp = predicted.merge(validation_target, on=["store", "sku", "period"], how="inner")
+            cmp["error"] = cmp["predicted_end_qty"] - cmp["actual_end_qty"]
+            _csv("validation_comparison.csv", cmp)
+        except Exception as exc:
+            print(f"[artifacts/{phase_label}] validation_comparison: {exc}")
+
+    # CG cost curve → charts/ with phase suffix
+    try:
+        chart_path = save_cg_cost_curve(
+            results.get("cg_episode_history") or [],
+            str(layout.chart_file("cg_cost_curve.png", phase_label=phase_label)),
+        )
+        if chart_path:
+            written["cg_cost_curve.png"] = str(Path(chart_path).relative_to(layout.root))
+    except Exception as exc:
+        print(f"[artifacts/{phase_label}] cg_cost_curve: {exc}")
+
+    return written
+
+
 def run_three_way_benchmark(
     data: "IRPData",
     *,
@@ -5961,7 +6312,7 @@ def run_three_way_benchmark(
 ) -> pd.DataFrame:
     """Run Classical CG, Heuristic Ranking CG, and GNN-Guided CG on the same data.
 
-    Writes Results/irp_benchmark_comparison.csv and returns the DataFrame.
+    Writes Results/benchmark/comparison.csv and returns the DataFrame.
     Each variant reuses the same `data` object so the comparison is apples-to-apples.
     """
     variants: List[Tuple[str, Dict[str, Any]]] = [
@@ -6036,9 +6387,19 @@ def run_three_way_benchmark(
               f"cost_with_lt={row['realized_cost_with_lt']:.2f} runtime={runtime:.1f}s")
 
     df = pd.DataFrame(rows)
-    out_path = Path(RESULTS_DIR) / "irp_benchmark_comparison.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    benchmark_dir = Path(RESULTS_DIR) / BENCHMARK_SUBDIR
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    out_path = benchmark_dir / "comparison.csv"
     df.to_csv(out_path, index=False)
+    # Mirror into thesis_summary/ for reporting convenience
+    thesis_dir = Path(RESULTS_DIR) / THESIS_SUMMARY_SUBDIR
+    thesis_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(thesis_dir / "benchmark_comparison.csv", index=False)
+    # Per-variant JSON summaries for quick inspection
+    for row in rows:
+        variant = str(row.get("variant") or row.get("run_label") or "unknown")
+        with open(benchmark_dir / f"variant_{variant}_summary.json", "w", encoding="utf-8") as f:
+            json.dump(row, f, indent=2, default=str)
     print("\n" + "=" * 80)
     print("BENCHMARK COMPARISON SUMMARY")
     print("=" * 80)
@@ -6120,9 +6481,15 @@ if __name__ == "__main__":
     if os.environ.get("IRP_CLEAN_RESULTS", "1").lower() not in {"0", "false", "no"}:
         removed = clean_managed_outputs(RESULTS_DIR)
         if removed:
-            print(f"[Cleanup] Removed {len(removed)} stale output files in {RESULTS_DIR}")
+            print(f"[Cleanup] Removed {len(removed)} stale output sub-folders/files in {RESULTS_DIR}")
         else:
             print(f"[Cleanup] No stale managed outputs found in {RESULTS_DIR}")
+
+    # Resolve layout (root + phase) once so every output helper shares the
+    # same target folders. Phase label is derived from the mode env vars
+    # (see resolve_phase_label()) unless IRP_PHASE_LABEL overrides it.
+    layout = build_results_layout(RESULTS_DIR)
+    print(f"[Layout] Results root = {layout.root}  |  phase = {layout.phase_label}")
 
     # Resolve all per-component seeds from IRP_MASTER_SEED (or individual env
     # overrides) and write Results/seed_manifest.json so every run's seed
@@ -6189,9 +6556,10 @@ if __name__ == "__main__":
             f"  *** For thesis sensitivity analysis, re-run with IRP_LT_COST_MULTIPLIER=5,10,25,50. ***"
         )
 
-    validation_target_path = f"{RESULTS_DIR}/irp_validation_target.csv"
-    validation_target.to_csv(validation_target_path, index=False)
-    print(f"Saved validation target to: {validation_target_path}")
+    # validation_target is held in memory; it is merged into each phase's
+    # validation_comparison.csv by save_phase_artifacts(). No standalone copy is
+    # written (used to be Results/irp_validation_target.csv) — the target is a
+    # direct slice of the input CSV and adds no information on its own.
 
     # Flag defaults per mode:
     #   offline training : collect=T  runtime_gnn=F  train=T  resume=F  graphs=T
@@ -6284,105 +6652,29 @@ if __name__ == "__main__":
         demand_shock_seed=demand_shock_seed,
     )
 
-    baseline_routes_df = pd.DataFrame([
-        {
-            "period": r["period"],
-            "vehicle": r["vehicle"],
-            "route": " -> ".join(r["route"]),
-            "arcs": str(r["arcs"]),
-            "total_direct_qty": r["total_direct_qty"],
-            "total_lt_qty": r["total_lt_qty"],
-            "load_departure": r.get("load_departure", 0.0),
-            "load_by_node": str(r.get("load_by_node", {})),
-            "direct_qty_by_node": str(r.get("direct_qty_by_node", {})),
-            "zero_service_nodes": str(r.get("zero_service_nodes", [])),
-            "degree_warnings": str(r.get("degree_warnings", [])),
-            "unvisited_arcs": str(r.get("unvisited_arcs", [])),
-            "product_flow_summary": str(r["product_flow_summary"]),
-        }
-        for r in results["baseline_routes"]
-    ])
-    routes_path = f"{RESULTS_DIR}/irp_baseline_routes.csv"
-    baseline_routes_df.to_csv(routes_path, index=False)
-    print(f"Saved baseline routes to: {routes_path}")
-
-    post_shock_fulfillment_path = f"{RESULTS_DIR}/irp_post_shock_demand_fulfillment.csv"
-    results["post_shock_demand_fulfillment"].to_csv(post_shock_fulfillment_path, index=False)
-    print(f"Saved post-shock demand fulfillment rates to: {post_shock_fulfillment_path}")
-
-    forecast_fulfillment_path = f"{RESULTS_DIR}/irp_forecast_demand_fulfillment.csv"
-    results["forecast_demand_fulfillment"].to_csv(forecast_fulfillment_path, index=False)
-    print(f"Saved pre-shock (forecast) demand fulfillment to: {forecast_fulfillment_path}")
-
-    solver_metrics_path = f"{RESULTS_DIR}/irp_solver_efficiency_metrics.csv"
-    pd.DataFrame([
-        {"model": "baseline_irpt", **results["baseline_solution"].efficiency_metrics},
-        {"model": "cg_rmp_total", **results["cg_solution"].efficiency_metrics},
-    ]).to_csv(solver_metrics_path, index=False)
-    print(f"Saved solver efficiency metrics to: {solver_metrics_path}")
-
-    cost_breakdown_path = f"{RESULTS_DIR}/irp_baseline_cost_breakdown.csv"
-    pd.DataFrame([results["baseline_cost_breakdown"]]).to_csv(cost_breakdown_path, index=False)
-    print(f"Saved baseline cost breakdown to: {cost_breakdown_path}")
-
-    realized_cost_breakdown_path = f"{RESULTS_DIR}/irp_realized_operating_cost_breakdown.csv"
-    no_lt_bd = results["realized_no_lt_cost_breakdown"]
-    with_lt_bd = results["realized_with_lt_cost_breakdown"]
-    delta_bd = {
-        k: round(float(no_lt_bd.get(k, 0.0)) - float(with_lt_bd.get(k, 0.0)), 6)
-        for k in no_lt_bd.keys()
-    }
-    pd.DataFrame([
-        {"scenario": "without_lt", **no_lt_bd},
-        {"scenario": "with_cg_lt", **with_lt_bd},
-        {"scenario": "delta_no_lt_minus_with_lt", **delta_bd},
-    ]).to_csv(realized_cost_breakdown_path, index=False)
-    print(f"Saved realized operating cost breakdown to: {realized_cost_breakdown_path}")
-
-    alns_history_rows = results.get("alns_history") or []
-    if alns_history_rows:
-        alns_history_path = f"{RESULTS_DIR}/irp_alns_history.csv"
-        pd.DataFrame(alns_history_rows).to_csv(alns_history_path, index=False)
-        print(f"Saved ALNS iteration history to: {alns_history_path}")
-
-    demand_shock_summary_path = f"{RESULTS_DIR}/irp_hidden_demand_shock_summary.csv"
-    pd.DataFrame([{
-        **results["demand_shock_summary"],
-        **results["post_shock_summary"],
-        **results["post_shock_lt_diagnostics"],
-    }]).to_csv(demand_shock_summary_path, index=False)
-    print(f"Saved hidden demand shock summary to: {demand_shock_summary_path}")
-
-    lt_plan_path = f"{RESULTS_DIR}/irp_lt_plan.csv"
-    results["lt_plan"].to_csv(lt_plan_path, index=False)
-    print(f"Saved lateral transshipment plan to: {lt_plan_path}")
-
-    # irp_gnn_training_history.csv is now written directly inside
-    # run_teacher_graph_and_gnn_training() after every training run so that
-    # Kaggle-style scripts which don't go through __main__ also produce it.
-    if results.get("gnn_training_history"):
-        legacy_training_history_path = f"{RESULTS_DIR}/irp_gnn_training_history_runtime.csv"
-        pd.DataFrame(results["gnn_training_history"]).to_csv(legacy_training_history_path, index=False)
-        print(f"Saved runtime GNN training history (pre-refresh) to: {legacy_training_history_path}")
-
-    cg_episode_history_path = f"{RESULTS_DIR}/irp_gnn_cg_episode_history.csv"
-    pd.DataFrame(results["cg_episode_history"]).to_csv(cg_episode_history_path, index=False)
-    print(f"Saved CG total-cost episode history to: {cg_episode_history_path}")
-
-    branch_price_history_path = f"{RESULTS_DIR}/irp_branch_price_history.csv"
-    pd.DataFrame(results["branch_price_history"]).to_csv(branch_price_history_path, index=False)
-    print(f"Saved branch-and-price history to: {branch_price_history_path}")
-
-    cg_episode_diagnostics_path = f"{RESULTS_DIR}/cg_episode_diagnostics.csv"
-    pd.DataFrame(results["cg_episode_diagnostics"]).to_csv(cg_episode_diagnostics_path, index=False)
-    print(f"Saved CG episode diagnostics to: {cg_episode_diagnostics_path}")
-
-    column_pool_diagnostics_path = f"{RESULTS_DIR}/column_pool_diagnostics.csv"
-    pd.DataFrame(results["column_pool_diagnostics"]).to_csv(column_pool_diagnostics_path, index=False)
-    print(f"Saved column pool diagnostics to: {column_pool_diagnostics_path}")
+    # ------------------------------------------------------------------
+    # Phase 1 per-phase artifacts
+    # ------------------------------------------------------------------
+    # save_phase_artifacts() writes every CSV/JSON for this phase into
+    # Results/<phase_label>/ using short, folder-scoped filenames. The phase
+    # folder itself identifies the split, so filenames stay neutral
+    # (baseline_cost_breakdown.csv, lt_plan.csv, ...). It also emits the CG
+    # cost-curve PNG into Results/charts/cg_cost_curve_<phase>.png.
+    phase1_artifacts = save_phase_artifacts(
+        results,
+        layout,
+        layout.phase_label,
+        validation_target=validation_target,
+    )
+    print(
+        f"[Phase 1] Wrote {len(phase1_artifacts)} artifacts to "
+        f"{(layout.root / layout.phase_label)}"
+    )
 
     refreshed_history: List[Dict[str, Any]] = []
-    teacher_dataset_path = RESULTS_DIR / "cg_teacher_dataset.csv"
+    phase2_artifacts: Optional[Dict[str, str]] = None
+    teacher_dataset_path = layout.teacher / "teacher_rows.csv"
+    layout.ensure(layout.teacher)
     teacher_dataset_df = pd.DataFrame(results["teacher_dataset_rows"])
     if teacher_dataset_df.empty:
         print(
@@ -6456,38 +6748,28 @@ if __name__ == "__main__":
                     demand_shock_seed=demand_shock_seed,
                 )
 
-                gnn_lt_plan_path = f"{RESULTS_DIR}/irp_lt_plan_gnn_deployed.csv"
-                gnn_results["lt_plan"].to_csv(gnn_lt_plan_path, index=False)
-                print(f"Saved GNN-deployed LT plan to: {gnn_lt_plan_path}")
+                phase2_label = "phase2_deploy_after_teacher"
+                phase2_artifacts = save_phase_artifacts(
+                    gnn_results,
+                    layout,
+                    phase2_label,
+                    validation_target=validation_target,
+                )
+                print(
+                    f"[Phase 2] Wrote {len(phase2_artifacts)} artifacts to "
+                    f"{(layout.root / phase2_label)}"
+                )
 
-                gnn_cost_path = f"{RESULTS_DIR}/irp_realized_operating_cost_breakdown_gnn_deployed.csv"
+                # Classical-vs-GNN phase comparison → thesis_summary/ only
+                # (used to live as Results/irp_phase_comparison.csv in the flat
+                # layout). The charts reader below picks it up from here.
+                layout.ensure(layout.thesis)
+                phase_cmp_out = layout.thesis / "phase_comparison.csv"
                 pd.DataFrame([
-                    {"scenario": "without_lt", **gnn_results["realized_no_lt_cost_breakdown"]},
-                    {"scenario": "with_gnn_cg_lt", **gnn_results["realized_with_lt_cost_breakdown"]},
-                ]).to_csv(gnn_cost_path, index=False)
-                print(f"Saved GNN-deployed realized cost breakdown to: {gnn_cost_path}")
-
-                gnn_cg_history_path = f"{RESULTS_DIR}/irp_gnn_cg_episode_history_gnn_deployed.csv"
-                pd.DataFrame(gnn_results["cg_episode_history"]).to_csv(gnn_cg_history_path, index=False)
-                print(f"Saved GNN-deployed CG episode history to: {gnn_cg_history_path}")
-
-                gnn_bp_history_path = f"{RESULTS_DIR}/irp_branch_price_history_gnn_deployed.csv"
-                pd.DataFrame(gnn_results["branch_price_history"]).to_csv(gnn_bp_history_path, index=False)
-                print(f"Saved GNN-deployed branch-and-price history to: {gnn_bp_history_path}")
-
-                gnn_selection_path = f"{RESULTS_DIR}/irp_gnn_selected_columns_gnn_deployed.json"
-                with open(gnn_selection_path, "w", encoding="utf-8") as f:
-                    json.dump(gnn_results["gnn_selection_history"], f, indent=2)
-                print(f"Saved GNN-deployed selected-column history to: {gnn_selection_path}")
-
-                gnn_comparison_path = f"{RESULTS_DIR}/irp_phase_comparison.csv"
-                teacher_cmp = results["comparison"]
-                gnn_cmp = gnn_results["comparison"]
-                pd.DataFrame([
-                    {"phase": "teacher_collection_classical_cg", **teacher_cmp},
-                    {"phase": "gnn_deployed_cg", **gnn_cmp},
-                ]).to_csv(gnn_comparison_path, index=False)
-                print(f"Saved phase comparison (classical vs GNN) to: {gnn_comparison_path}")
+                    {"phase": "teacher_collection_classical_cg", **results["comparison"]},
+                    {"phase": "gnn_deployed_cg",                 **gnn_results["comparison"]},
+                ]).to_csv(phase_cmp_out, index=False)
+                print(f"Saved phase comparison (classical vs GNN) to: {phase_cmp_out}")
             elif deploy_gnn_after_training and not checkpoint_ready:
                 print(
                     f"[Phase 2] Skipped GNN deployment: checkpoint not found at "
@@ -6499,55 +6781,102 @@ if __name__ == "__main__":
                     "(teacher graph dataset was likely empty)."
                 )
 
-    cg_cost_chart_path = str(RESULTS_DIR / "irp_gnn_cg_total_cost_curve.png")
-    saved_chart = save_cg_cost_curve(results["cg_episode_history"], cg_cost_chart_path)
-    if saved_chart:
-        print(f"Saved CG total-cost chart to: {saved_chart}")
-
-    gnn_selection_history_path = str(RESULTS_DIR / "irp_gnn_selected_columns.json")
-    with open(gnn_selection_history_path, "w", encoding="utf-8") as f:
-        json.dump(results["gnn_selection_history"], f, indent=2)
-    print(f"Saved GNN selected-column history to: {gnn_selection_history_path}")
-
-    predicted_df = build_predicted_inventory_df(results["baseline_solution"])
-    predicted_path = str(RESULTS_DIR / "irp_predicted_inventory.csv")
-    predicted_df.to_csv(predicted_path, index=False)
-    print(f"Saved predicted inventory to: {predicted_path}")
-
-    comparison_df = predicted_df.merge(validation_target, on=["store", "sku", "period"], how="inner")
-    comparison_df["error"] = comparison_df["predicted_end_qty"] - comparison_df["actual_end_qty"]
-    comparison_path = str(RESULTS_DIR / "irp_validation_comparison.csv")
-    comparison_df.to_csv(comparison_path, index=False)
-    print(f"Saved validation comparison to: {comparison_path}")
-
-    metrics = compute_validation_metrics(comparison_df)
-    print("\nValidation metrics:")
-    pprint.pprint(metrics)
+    # Validation metrics from the Phase 1 validation_comparison.csv (already
+    # written inside save_phase_artifacts). We recompute the comparison frame
+    # here only to print summary stats to stdout — no duplicate file.
+    try:
+        predicted_df = build_predicted_inventory_df(results["baseline_solution"])
+        comparison_df = predicted_df.merge(
+            validation_target, on=["store", "sku", "period"], how="inner"
+        )
+        comparison_df["error"] = (
+            comparison_df["predicted_end_qty"] - comparison_df["actual_end_qty"]
+        )
+        metrics = compute_validation_metrics(comparison_df)
+        print("\nValidation metrics:")
+        pprint.pprint(metrics)
+    except Exception as exc:
+        print(f"[Validation] metrics unavailable: {exc}")
+        metrics = {}
 
     # ------------------------------------------------------------------
-    # Pipeline charts (Phase 1 — teacher collection pass)
+    # Pipeline charts
     # ------------------------------------------------------------------
-    charts_dir = RESULTS_DIR / "charts"
+    # Charts land in Results/charts/ with filenames suffixed by phase_label,
+    # so Phase 1 and Phase 2 runs in the same Results root never clobber each
+    # other. The phase_comparison chart is only produced when we actually ran
+    # Phase 2 (thesis_summary/phase_comparison.csv exists).
     phase_cmp_df: Optional[pd.DataFrame] = None
-    phase_cmp_path = RESULTS_DIR / "irp_phase_comparison.csv"
+    phase_cmp_path = layout.thesis / "phase_comparison.csv"
     if phase_cmp_path.exists():
         try:
             phase_cmp_df = pd.read_csv(phase_cmp_path)
         except Exception as exc:
-            print(f"[Charts] Could not read {phase_cmp_path}: {exc}. Charts will skip phase comparison.")
+            print(f"[Charts] Could not read {phase_cmp_path}: {exc}.")
             phase_cmp_df = None
 
     saved_charts = save_pipeline_charts(
         results=results,
-        out_dir=charts_dir,
+        out_dir=layout.charts,
         refreshed_gnn_history=refreshed_history if collect_teacher_mode else None,
         phase_comparison_df=phase_cmp_df,
+        phase_label=layout.phase_label,
     )
     if saved_charts:
-        print(f"\nSaved {len(saved_charts)} pipeline charts to: {charts_dir}")
+        print(f"\nSaved {len(saved_charts)} pipeline charts to: {layout.charts}")
         for cp in saved_charts:
             print(f"  {Path(cp).name}")
     else:
         print("\n[Charts] No charts were generated (matplotlib missing or data empty).")
+
+    # ------------------------------------------------------------------
+    # Run manifest + runtime summary
+    # ------------------------------------------------------------------
+    # One manifest per run indexes every artifact by phase so examiners /
+    # Kaggle orchestrators can locate a file without guessing the folder.
+    artifacts_by_phase: Dict[str, Dict[str, str]] = {
+        layout.phase_label: phase1_artifacts,
+    }
+    if phase2_artifacts:
+        artifacts_by_phase["phase2_deploy_after_teacher"] = phase2_artifacts
+
+    run_manifest = {
+        "run_id": datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        "started_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "phase_label": layout.phase_label,
+        "dataset_id": data.dataset_id,
+        "scenario_id": data.scenario_id,
+        "dataset_path": str(EXCEL_PATH),
+        "mode": (
+            "phase3_online_learning" if _online_learning
+            else "phase2_online_inference" if _online_inference
+            else "phase1_offline_baseline"
+        ),
+        "results_root": str(layout.root),
+        "artifacts_by_phase": artifacts_by_phase,
+        "validation_metrics": metrics,
+        "charts": [str(Path(p).relative_to(layout.root)) for p in saved_charts],
+    }
+    try:
+        with open(layout.run_manifest_path, "w", encoding="utf-8") as f:
+            json.dump(run_manifest, f, indent=2)
+        print(f"[Manifest] Wrote {layout.run_manifest_path}")
+    except OSError as exc:
+        print(f"[Manifest] Could not write run_manifest.json: {exc}")
+
+    # Concise per-phase file listing for the examiner — filename alone already
+    # says what it is; the folder says which split/phase it belongs to.
+    print("\n" + "=" * 72)
+    print(f"Runtime summary — Results root: {layout.root}")
+    print("=" * 72)
+    for phase, files in artifacts_by_phase.items():
+        print(f"  [{phase}]  ({len(files)} files)")
+        for name in sorted(files):
+            print(f"    - {files[name]}")
+    if saved_charts:
+        print(f"  [charts]  ({len(saved_charts)} files)")
+        for cp in saved_charts:
+            print(f"    - charts/{Path(cp).name}")
+    print("=" * 72)
 
     print("\nDone.")

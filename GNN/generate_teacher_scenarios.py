@@ -14,18 +14,17 @@ they form the unit of identity used for splitting:
 
 Output layout
 -------------
-    Results/teacher_scenarios/
-        manifest.json                 — full list of (base, scenario) runs
-        aggregate_cg_teacher_dataset.csv
-                                      — concatenated teacher CSV across runs
-        run_<NNN>/                    — per-run working dir (logs, raw CSV)
-            cg_teacher_dataset.csv
+    Results/scenarios/
+        scenarios_manifest.json       — full list of (base, scenario) runs
+        aggregate_teacher_rows.csv    — concatenated teacher rows across runs
+        run_<NNN>__<base>__<scenario>/
+            cg_teacher_dataset.csv    — raw per-run teacher rows
             run_metadata.json
 
 After this script finishes, call
 
     python GNN/build_teacher_graph_dataset.py \
-        --teacher-csv Results/teacher_scenarios/aggregate_cg_teacher_dataset.csv \
+        --teacher-csv Results/scenarios/aggregate_teacher_rows.csv \
         --out-dir GNN/data/irplt_teacher
 
 to produce the final graph splits. build_teacher_graph_dataset.py's
@@ -50,7 +49,7 @@ CLI
 --cg-iterations             CG iterations per run (default 5).
 --time-limit                Per-run time limit seconds (default 300).
 --shock-distributions       "normal,gamma,sku_spike" (default all three, rotated).
---out-dir                   Output directory (default Results/teacher_scenarios).
+--out-dir                   Output directory (default Results/scenarios).
 --split-by                  "base" (default) or "scenario".
 --train-ratio / --valid-ratio
                             Base-dataset split ratios (default 0.60/0.20).
@@ -240,6 +239,9 @@ def run_pipeline(
     """Invoke the main pipeline once for one scenario. Returns (ok, csv_path, runtime)."""
     run_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
+    # Each scenario gets its own isolated Results tree inside run_dir/. This
+    # prevents the top-level Results/ from being clobbered by the last run
+    # and lets us cleanly pull the single teacher CSV we care about afterwards.
     base_env = {
         "IRP_SOURCE_INSTANCE": scenario["source_instance"],
         "IRP_DATASET_ID": scenario["base_dataset_id"],
@@ -253,6 +255,13 @@ def run_pipeline(
         "IRP_COLLECT_TEACHER_MODE": "1",
         "IRP_RUNTIME_GNN_MODE": "0",
         "IRP_CLEAN_RESULTS": "0",  # never delete prior runs' aggregates
+        "IRP_RESULTS_DIR": str(run_dir),
+        "IRP_PHASE_LABEL": "scenario",
+        # Skip the Phase-2 GNN redeploy during scenario enumeration; we only
+        # want teacher rows here, not a second CG pass per scenario.
+        "IRP_DEPLOY_GNN_AFTER_TRAINING": "0",
+        "IRP_TRAIN_GNN_AFTER_TEACHER": "0",
+        "IRP_BUILD_TEACHER_GRAPHS": "0",
     }
     if scenario.get("start_date") not in (None, "None"):
         base_env["IRP_START_DATE"] = scenario["start_date"]
@@ -275,9 +284,16 @@ def run_pipeline(
         print(f"[generate] scenario {scenario['source_instance']} FAILED after {runtime:.1f}s: {exc}")
         return False, run_dir / "cg_teacher_dataset.csv", runtime
     runtime = time.perf_counter() - t0
-    src_csv = project_root / "Results" / "cg_teacher_dataset.csv"
+    # New layout: each run writes to run_dir/teacher/teacher_rows.csv (set via
+    # IRP_RESULTS_DIR above). Copy the teacher rows to run_dir root under the
+    # canonical per-run name so aggregation doesn't have to know the layout.
+    candidates = [
+        run_dir / "teacher" / "teacher_rows.csv",
+        run_dir / "cg_teacher_dataset.csv",  # legacy — pre-refactor runs
+    ]
     dst_csv = run_dir / "cg_teacher_dataset.csv"
-    if src_csv.exists():
+    src_csv = next((p for p in candidates if p.exists()), None)
+    if src_csv and src_csv != dst_csv:
         shutil.copy2(src_csv, dst_csv)
     return True, dst_csv, runtime
 
@@ -300,7 +316,7 @@ def main() -> None:
     parser.add_argument("--cg-iterations", type=int, default=5)
     parser.add_argument("--time-limit", type=int, default=300)
     parser.add_argument("--shock-distributions", default="normal_global,gamma_store,sku_spike")
-    parser.add_argument("--out-dir", default="Results/teacher_scenarios")
+    parser.add_argument("--out-dir", default="Results/scenarios")
     parser.add_argument("--split-by", choices=["base", "scenario"], default="base")
     parser.add_argument("--train-ratio", type=float, default=0.60)
     parser.add_argument("--valid-ratio", type=float, default=0.20)
@@ -341,10 +357,10 @@ def main() -> None:
         "scenarios": [],
         "split_assignment": split_assignment,
         "run_directory": str(out_dir),
-        "aggregate_csv": str(out_dir / "aggregate_cg_teacher_dataset.csv"),
+        "aggregate_csv": str(out_dir / "aggregate_teacher_rows.csv"),
         "build_teacher_graph_command": (
             f"python GNN/build_teacher_graph_dataset.py "
-            f"--teacher-csv {out_dir / 'aggregate_cg_teacher_dataset.csv'} "
+            f"--teacher-csv {out_dir / 'aggregate_teacher_rows.csv'} "
             f"--out-dir GNN/data/irplt_teacher"
         ),
     }
@@ -353,20 +369,26 @@ def main() -> None:
         print(f"  {scen['source_instance']:<60s} → {split_assignment[scen['source_instance']]}")
 
     if args.dry_run:
-        manifest_path = out_dir / "manifest.json"
+        manifest_path = out_dir / "scenarios_manifest.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         print(f"\n[generate] dry-run wrote plan to {manifest_path}")
         return
 
     aggregate_rows: List[Dict[str, str]] = []
-    aggregate_csv = out_dir / "aggregate_cg_teacher_dataset.csv"
+    aggregate_csv = out_dir / "aggregate_teacher_rows.csv"
     if aggregate_csv.exists():
         aggregate_rows = read_csv_rows(aggregate_csv)
         print(f"[generate] resuming — aggregate already has {len(aggregate_rows)} rows")
 
     for idx, scenario in enumerate(scenarios, start=1):
-        run_dir = out_dir / f"run_{idx:03d}"
+        # Include base + scenario id in the run-dir name so a quick `ls`
+        # of Results/scenarios/ tells you which scenario is which without
+        # having to crack open the manifest.
+        safe_id = (
+            f"{scenario['base_dataset_id']}__{scenario['scenario_id']}"
+        ).replace("/", "-").replace(" ", "_")
+        run_dir = out_dir / f"run_{idx:03d}__{safe_id}"
         ok, csv_path, runtime = run_pipeline(
             scenario=scenario,
             project_root=project_root,
@@ -388,7 +410,7 @@ def main() -> None:
             "ok": ok,
             "split": split_assignment[scenario["source_instance"]],
         })
-        manifest_path = out_dir / "manifest.json"
+        manifest_path = out_dir / "scenarios_manifest.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         if not ok and not args.continue_on_failure:
@@ -402,7 +424,7 @@ def main() -> None:
             sha.update(chunk)
     manifest["aggregate_sha1"] = sha.hexdigest()
     manifest["aggregate_rows"] = len(aggregate_rows)
-    manifest_path = out_dir / "manifest.json"
+    manifest_path = out_dir / "scenarios_manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"\n[generate] done. {len(aggregate_rows)} teacher rows aggregated.")

@@ -349,6 +349,22 @@ def main() -> None:
     with open(out_dir / "dataset_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    # Mirror the summary into Results/graphs/ so the thesis reporting tree
+    # has a single place to inspect graph-dataset stats without digging into
+    # GNN/data/. Only runs when IRP_RESULTS_DIR is set (i.e. inside a
+    # pipeline run), so standalone invocations stay self-contained.
+    import os as _os
+    _results_dir = _os.environ.get("IRP_RESULTS_DIR")
+    if _results_dir:
+        try:
+            mirror = Path(_results_dir) / "graphs"
+            mirror.mkdir(parents=True, exist_ok=True)
+            with open(mirror / "graph_dataset_summary.json", "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            print(f"Mirrored graph dataset summary to: {mirror / 'graph_dataset_summary.json'}")
+        except OSError as exc:
+            print(f"[graphs] mirror skipped ({exc})")
+
     print(json.dumps(summary, indent=2))
     print(f"Wrote teacher-supervised graph dataset to {out_dir}")
 
