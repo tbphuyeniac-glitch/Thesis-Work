@@ -32,7 +32,7 @@ from IPython.display import display
 
 REPO_URL  = "https://github.com/tbphuyeniac-glitch/Thesis-Work.git"
 REPO_ROOT = Path("/kaggle/working/Thesis-Work")
-REFRESH_WORKING_REPO = False
+REFRESH_WORKING_REPO = False  # set True once after updating the repo to force a fresh clone
 
 # ── Data files (relative to REPO_ROOT) ───────────────────
 TRAIN_DATA_FILE = "1BISCR501V_90100140_20260323-150407111_filtered_sites.csv"
@@ -381,7 +381,8 @@ if str(REPO_ROOT / "GNN") not in sys.path:
 os.chdir(REPO_ROOT)
 
 load_gurobi_wls_secrets()
-verify_gurobi()
+if not verify_gurobi():
+    raise RuntimeError("Gurobi license verification failed — fix credentials before proceeding.")
 
 import irp_gurobi_converted as irp
 irp = importlib.reload(irp)
@@ -530,6 +531,9 @@ if (graph_dir / "dataset_summary.json").exists():
     with open(graph_dir / "dataset_summary.json") as f:
         ds_summary = json.load(f)
     show_json("Graph Dataset Summary", ds_summary)
+    graphs_dir = RESULTS_DIR / "graphs"
+    graphs_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(graph_dir / "dataset_summary.json", graphs_dir / "graph_dataset_summary.json")
 
 train_samples = list((graph_dir / "train").glob("*.pkl")) if (graph_dir / "train").exists() else []
 valid_samples = list((graph_dir / "valid").glob("*.pkl")) if (graph_dir / "valid").exists() else []
@@ -562,6 +566,9 @@ if r.returncode != 0:
 
 gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
 pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
+training_summary_src = checkpoint.parent / "training_summary.json"
+if training_summary_src.exists():
+    shutil.copy2(training_summary_src, gnn_dir / "training_summary.json")
 irp.print_gnn_training_history(gnn_history)
 print(f"\n  checkpoint exists : {checkpoint.exists()}")
 print(f"  history rows      : {len(gnn_history)}")
