@@ -526,12 +526,7 @@ def build_training_sample_from_exported_teacher_rows(
             target_scores.append(label)
         else:
             target_scores.append(_float_value(raw_score, label))
-    if missing_teacher_score_count > 0:
-        print(
-            f"[teacher_dataset] WARNING: teacher_score missing on {missing_teacher_score_count}/"
-            f"{len(rows)} rows; target_score fell back to binary label. "
-            f"This degrades score_regression supervision (pairwise_rank is unaffected)."
-        )
+
         metadata_columns.append({
             "pattern_id": row.get("pattern_id"),
             "product": row.get("product"),
@@ -543,6 +538,13 @@ def build_training_sample_from_exported_teacher_rows(
             "selected_by_classical_fallback": _truthy(row.get("selected_by_classical_fallback")),
             "passed_to_rmp": _truthy(row.get("passed_to_rmp")),
         })
+
+    if missing_teacher_score_count > 0:
+        print(
+            f"[teacher_dataset] WARNING: teacher_score missing on {missing_teacher_score_count}/"
+            f"{len(rows)} rows; target_score fell back to binary label. "
+            f"This degrades score_regression supervision (pairwise_rank is unaffected)."
+        )
 
     return {
         "column_features": np.asarray(column_features, dtype=np.float32),

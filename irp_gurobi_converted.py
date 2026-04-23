@@ -63,6 +63,7 @@ pip install pandas openpyxl gurobipy torch
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Iterable, Set, Any
+import datetime
 import hashlib
 import importlib
 import itertools
@@ -86,11 +87,34 @@ except ImportError as e:
 GLOBAL_GUROBI_ENV: Optional[gp.Env] = None
 
 
+def _read_gurobi_lic() -> dict:
+    """Read WLSACCESSID/WLSSECRET/LICENSEID from ~/gurobi.lic if not in env."""
+    import pathlib
+    lic_path = pathlib.Path.home() / "gurobi.lic"
+    result = {}
+    if lic_path.exists():
+        for line in lic_path.read_text().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                result[k.strip().upper()] = v.strip()
+    return result
+
+
 def create_gurobi_env() -> gp.Env:
     env = gp.Env(empty=True)
-    env.setParam("WLSAccessID", os.environ["WLSACCESSID"])
-    env.setParam("WLSSecret", os.environ["WLSSECRET"])
-    env.setParam("LicenseID", int(os.environ["LICENSEID"]))
+    wls_id = os.environ.get("WLSACCESSID")
+    wls_secret = os.environ.get("WLSSECRET")
+    license_id = os.environ.get("LICENSEID")
+    if not (wls_id and wls_secret and license_id):
+        lic = _read_gurobi_lic()
+        wls_id = wls_id or lic.get("WLSACCESSID")
+        wls_secret = wls_secret or lic.get("WLSSECRET")
+        license_id = license_id or lic.get("LICENSEID")
+    if wls_id and wls_secret and license_id:
+        env.setParam("WLSAccessID", wls_id)
+        env.setParam("WLSSecret", wls_secret)
+        env.setParam("LicenseID", int(license_id))
     env.start()
     return env
 
@@ -175,6 +199,82 @@ def _safe_var_value(model: gp.Model, var: gp.Var) -> float:
 
 DEFAULT_GNN_CHECKPOINT = "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt"
 RESULTS_DIR = Path(__file__).resolve().parent / "Results"
+
+
+def resolve_seed_manifest(results_dir: Path | str = RESULTS_DIR) -> Dict[str, int]:
+    """Resolve all per-component seeds from a single IRP_MASTER_SEED.
+
+    If IRP_MASTER_SEED is set, deterministically derive per-component seeds for
+    demand shocks, ALNS, pattern initialisation, CG pricing, and GNN training.
+    Any per-component env var that is already set overrides the derived value
+    (so existing scripts that pin individual seeds still work).
+
+    Writes the resolved manifest to Results/seed_manifest.json so every run's
+    seed state is auditable alongside the outputs. Returns the manifest dict.
+    """
+    master_raw = os.environ.get("IRP_MASTER_SEED")
+    if master_raw is not None and str(master_raw).strip() != "":
+        master_seed = int(master_raw)
+        rng = random.Random(master_seed)
+        derived = {
+            "demand_shock_seed": rng.randrange(1, 2**31 - 1),
+            "alns_seed": rng.randrange(1, 2**31 - 1),
+            "pattern_init_seed": rng.randrange(1, 2**31 - 1),
+            "cg_pricing_seed": rng.randrange(1, 2**31 - 1),
+            "gnn_train_seed": rng.randrange(1, 2**31 - 1),
+            "gnn_build_seed": rng.randrange(1, 2**31 - 1),
+        }
+    else:
+        master_seed = None
+        derived = {
+            "demand_shock_seed": int(os.environ.get("IRP_DEMAND_SHOCK_SEED", "20260418")),
+            "alns_seed": int(os.environ.get("IRP_ALNS_SEED", "42")),
+            "pattern_init_seed": int(os.environ.get("IRP_PATTERN_INIT_SEED", "123")),
+            "cg_pricing_seed": int(os.environ.get("IRP_CG_PRICING_SEED", "0")),
+            "gnn_train_seed": int(os.environ.get("IRP_GNN_TRAIN_SEED", "0")),
+            "gnn_build_seed": int(os.environ.get("IRP_GNN_BUILD_SEED", "0")),
+        }
+    # Per-component env values take precedence (so users who pin a specific
+    # seed for one subsystem can still do so).
+    for key, env_name in [
+        ("demand_shock_seed", "IRP_DEMAND_SHOCK_SEED"),
+        ("alns_seed", "IRP_ALNS_SEED"),
+        ("pattern_init_seed", "IRP_PATTERN_INIT_SEED"),
+        ("cg_pricing_seed", "IRP_CG_PRICING_SEED"),
+        ("gnn_train_seed", "IRP_GNN_TRAIN_SEED"),
+        ("gnn_build_seed", "IRP_GNN_BUILD_SEED"),
+    ]:
+        override = os.environ.get(env_name)
+        if override is not None and str(override).strip() != "":
+            derived[key] = int(override)
+    # Make derived values available to subprocesses (GNN scripts etc.) that
+    # read per-component env vars directly.
+    for key, env_name in [
+        ("demand_shock_seed", "IRP_DEMAND_SHOCK_SEED"),
+        ("alns_seed", "IRP_ALNS_SEED"),
+        ("pattern_init_seed", "IRP_PATTERN_INIT_SEED"),
+        ("cg_pricing_seed", "IRP_CG_PRICING_SEED"),
+        ("gnn_train_seed", "IRP_GNN_TRAIN_SEED"),
+        ("gnn_build_seed", "IRP_GNN_BUILD_SEED"),
+    ]:
+        os.environ.setdefault(env_name, str(derived[key]))
+
+    manifest = {
+        "master_seed": master_seed,
+        "derived_seeds": derived,
+        "resolved_at_utc": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+    out_dir = Path(results_dir)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_dir / "seed_manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+    except OSError as exc:
+        # Never fatal — the seeds are still usable; only the manifest file failed.
+        print(f"[Seed] Warning: could not write seed_manifest.json ({exc})")
+    print(f"[Seed] master_seed={master_seed} derived={derived}")
+    return manifest
+
 
 # All run-artifact filename prefixes the pipeline writes. Any file in RESULTS_DIR
 # (and RESULTS_DIR/charts) starting with one of these is considered "managed" and
@@ -348,7 +448,11 @@ def run_teacher_graph_and_gnn_training(
                       f"training fresh because resume_checkpoint=False. Pass resume_checkpoint=True to fine-tune.")
             else:
                 print("\n[Teacher BiGAT Training Update] (fresh training)")
-        subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent), check=True)
+        try:
+            subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent), check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"[Teacher/GNN] Training failed (non-fatal): {exc}")
+            print("[Teacher/GNN] Continuing without updated checkpoint — teacher rows were collected successfully.")
 
         history = load_gnn_training_history(checkpoint_path)
         if not history:
@@ -388,11 +492,24 @@ def run_teacher_graph_and_gnn_training(
         if run_offline_test:
             checkpoint_path_obj = _project_path(checkpoint_path)
             test_split_dir = _project_path("GNN/data/irplt_teacher/test")
+            # Strict mode — fail loudly instead of silently skipping. A "silent
+            # skip" here is the worst failure mode for thesis evaluation: the
+            # pipeline prints "OK" but never actually runs held-out testing.
+            # Activate with env IRP_STRICT_OFFLINE_TEST=1.
+            _strict_offline_test = os.environ.get("IRP_STRICT_OFFLINE_TEST", "0").strip().lower() not in {"0", "false", "no", ""}
             if not checkpoint_path_obj.exists():
-                print(f"[Teacher/GNN] Skipping offline test — checkpoint not found: {checkpoint_path_obj}")
+                msg = f"[Teacher/GNN] offline test — checkpoint not found: {checkpoint_path_obj}"
+                if _strict_offline_test:
+                    raise RuntimeError(msg + " (IRP_STRICT_OFFLINE_TEST=1)")
+                print(f"Skipping {msg}")
             elif not test_split_dir.exists() or not any(test_split_dir.iterdir()):
-                print(f"[Teacher/GNN] Skipping offline test — empty test split at {test_split_dir}. "
-                      f"Collect teacher rows from more source_instance values to enable instance-level split.")
+                msg = (
+                    f"[Teacher/GNN] offline test — empty test split at {test_split_dir}. "
+                    f"Collect teacher rows from more source_instance values to enable instance-level split."
+                )
+                if _strict_offline_test:
+                    raise RuntimeError(msg + " (IRP_STRICT_OFFLINE_TEST=1)")
+                print(f"Skipping {msg}")
             else:
                 test_out_csv = Path(RESULTS_DIR) / "irp_gnn_offline_test.csv"
                 test_cmd = [
@@ -424,6 +541,12 @@ class IRPData:
     stores: List[Store]
     products: List[Product]
     warehouse: str = "CW"
+
+    # Identity tags for downstream logging / teacher-row tagging. Populated by
+    # DatasetToIRPValidationMapper when it builds the instance so that scenario
+    # generators can pass through a stable dataset_id for the manifest.
+    dataset_id: str = ""
+    scenario_id: str = ""
 
     demand: Dict[Tuple[Store, Product, Period], float] = field(default_factory=dict)
     realized_demand: Dict[Tuple[Store, Product, Period], float] = field(default_factory=dict)
@@ -2428,6 +2551,7 @@ class LateralTransshipmentCG:
         diagnostic_verbosity: str = "summary",
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
+        source_instance: Optional[str] = None,
     ):
         self.data = data
         self.baseline = baseline_solution
@@ -2441,6 +2565,23 @@ class LateralTransshipmentCG:
         self.max_columns_per_product_period = int(max_columns_per_product_period)
         self.top_pairs_per_feature = int(top_pairs_per_feature)
         self.top_patterns_per_feature = int(top_patterns_per_feature)
+        # Strict benchmark mode — disable every search-space-restricting heuristic
+        # so the classical CG baseline sees the full candidate pool. All of these
+        # are speed heuristics only; relaxing them changes the effective search
+        # space, not solver correctness, so benchmark runs that need apples-to-
+        # apples comparisons (Run A: classical vs Run C: GNN) must opt in.
+        # Activate with env IRP_STRICT_BENCHMARK=1 or by passing strict_benchmark=True.
+        _strict_env = os.environ.get("IRP_STRICT_BENCHMARK", "0").strip().lower() not in {"0", "false", "no", ""}
+        self.strict_benchmark_mode = bool(_strict_env)
+        if self.strict_benchmark_mode:
+            _UNCAPPED = 10**9
+            print("[StrictBenchmark] IRP_STRICT_BENCHMARK=1 — relaxing all pruning caps:")
+            print(f"  max_columns_per_product_period  : {self.max_columns_per_product_period} -> {_UNCAPPED}")
+            print(f"  top_pairs_per_feature           : {self.top_pairs_per_feature} -> {_UNCAPPED}")
+            print(f"  top_patterns_per_feature        : {self.top_patterns_per_feature} -> {_UNCAPPED}")
+            self.max_columns_per_product_period = _UNCAPPED
+            self.top_pairs_per_feature = _UNCAPPED
+            self.top_patterns_per_feature = _UNCAPPED
         self.feature_ranges = feature_ranges or {
             "shortage_ratio": {"min": 0.00, "max": 1.00},
             "surplus_ratio": {"min": 0.00, "max": 1.00},
@@ -2459,6 +2600,11 @@ class LateralTransshipmentCG:
         self.gnn_min_keep = int(gnn_min_keep)
         self.gnn_max_keep = int(gnn_max_keep) if gnn_max_keep is not None else None
         self.gnn_max_keep_fraction = float(gnn_max_keep_fraction)
+        if getattr(self, "strict_benchmark_mode", False):
+            print(f"  gnn_max_keep                    : {self.gnn_max_keep} -> None")
+            print(f"  gnn_max_keep_fraction           : {self.gnn_max_keep_fraction} -> 1.0")
+            self.gnn_max_keep = None
+            self.gnn_max_keep_fraction = 1.0
         self.gnn_prob_weight = 0.60
         self.gnn_rc_gain_weight = 0.30
         self.gnn_acceptance_weight = 0.10
@@ -2497,6 +2643,17 @@ class LateralTransshipmentCG:
             verbosity = "summary"
         self.diagnostic_verbosity = verbosity
         self._log_candidate_pairs = verbosity == "full"
+        # source_instance tags every exported teacher row so
+        # build_teacher_graph_dataset.py can split at the instance level.
+        # Default: env override → auto-timestamped unique tag. Never reuse
+        # "irplt_cg" across runs; doing so collapses every run into one
+        # source_instance and forces group-level split (leakage warning).
+        if source_instance is None:
+            source_instance = os.environ.get("IRP_SOURCE_INSTANCE") or (
+                f"irplt_cg__{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                f"_{os.getpid()}"
+            )
+        self.source_instance = str(source_instance)
 
     def _compute_combined_column_scores(self, patterns: List[LTPattern], probs: List[float]) -> List[Dict[str, float]]:
         rc_gains = []
@@ -2586,7 +2743,11 @@ class LateralTransshipmentCG:
         self._last_pricing_summary["patterns_deduplicated_before_gnn"] = len(patterns) - len(deduped)
         return deduped
 
-    def _adaptive_select_columns(self, score_rows: List[Dict[str, float]]) -> Tuple[List[int], Dict[str, Any]]:
+    def _adaptive_select_columns(
+        self,
+        score_rows: List[Dict[str, float]],
+        patterns: Optional[List[LTPattern]] = None,
+    ) -> Tuple[List[int], Dict[str, Any]]:
         if not score_rows:
             return [], {"selection_mode": self.gnn_selection_mode, "adaptive_k": 0}
 
@@ -2611,6 +2772,87 @@ class LateralTransshipmentCG:
         )
         info["max_keep"] = max_keep
         info["max_keep_fraction"] = self.gnn_max_keep_fraction
+
+        # ---- Fairness protection: per (product, period) minimum quota --------
+        # Global top-k selection can starve product-period groups whose best
+        # column scores are uniformly below the globally top-k-th column. That
+        # hides valid pricing subproblems from the RMP. We enforce a minimum
+        # of `gnn_min_per_group` columns per *active* group (a group with at
+        # least one negative-reduced-cost candidate). When a group is starved,
+        # force-add its highest-scoring column(s) on top of the global picks.
+        # Configurable via env IRP_GNN_MIN_PER_GROUP (default 1). Set to 0 to
+        # disable and recover the old behavior.
+        if patterns is not None and len(patterns) == len(score_rows):
+            min_per_group = int(os.environ.get("IRP_GNN_MIN_PER_GROUP", "1") or 0)
+            group_keys: List[Tuple[Any, Any]] = [
+                (getattr(pat, "product", None), getattr(pat, "period", None))
+                for pat in patterns
+            ]
+            groups: Dict[Tuple[Any, Any], List[int]] = {}
+            for idx, key in enumerate(group_keys):
+                groups.setdefault(key, []).append(idx)
+            # Only groups that actually contain a candidate with negative RC
+            # need protection — empty groups have nothing to contribute.
+            active_groups = {
+                key: idxs
+                for key, idxs in groups.items()
+                if any(
+                    float(patterns[i].metadata.get("reduced_cost", 0.0) or 0.0) < -1e-6
+                    for i in idxs
+                )
+            }
+            selected_set = set(selected_idx)
+            group_forced: Dict[str, int] = {}
+            if min_per_group > 0 and active_groups:
+                for key, idxs in active_groups.items():
+                    already = sum(1 for i in idxs if i in selected_set)
+                    if already >= min_per_group:
+                        continue
+                    # Pick the best-scoring indices for this group that are not
+                    # already selected. Ties broken by gnn_prob, then reduced_cost.
+                    group_ranked = sorted(
+                        idxs,
+                        key=lambda i: (
+                            -float(score_rows[i].get("combined_score", 0.0) or 0.0),
+                            -float(score_rows[i].get("gnn_prob", 0.0) or 0.0),
+                            float(patterns[i].metadata.get("reduced_cost", 0.0) or 0.0),
+                        ),
+                    )
+                    need = min_per_group - already
+                    added_for_group = 0
+                    for i in group_ranked:
+                        if i in selected_set:
+                            continue
+                        selected_idx.append(i)
+                        selected_set.add(i)
+                        added_for_group += 1
+                        if added_for_group >= need:
+                            break
+                    if added_for_group > 0:
+                        group_forced[f"{key[0]}__t{key[1]}"] = added_for_group
+
+            # Per-group diagnostics — written into `info` so the caller can log
+            # them in gnn_selection_history and the benchmark CSV.
+            group_diag = []
+            for key, idxs in groups.items():
+                n_candidates = len(idxs)
+                n_selected = sum(1 for i in idxs if i in selected_set)
+                n_negative_rc = sum(
+                    1 for i in idxs
+                    if float(patterns[i].metadata.get("reduced_cost", 0.0) or 0.0) < -1e-6
+                )
+                group_diag.append({
+                    "product": key[0],
+                    "period": key[1],
+                    "n_candidates": n_candidates,
+                    "n_negative_rc_candidates": n_negative_rc,
+                    "n_selected_after_gnn": n_selected,
+                    "selection_rate": (n_selected / n_candidates) if n_candidates else 0.0,
+                    "forced_by_quota": int(group_forced.get(f"{key[0]}__t{key[1]}", 0)),
+                })
+            info["per_group_diagnostics"] = group_diag
+            info["min_per_group"] = min_per_group
+            info["groups_forced_count"] = sum(group_forced.values())
         return selected_idx, info
 
     def _apply_classical_fallback(self, patterns: List[LTPattern], selected_idx: List[int]) -> Tuple[List[int], Optional[int]]:
@@ -2687,7 +2929,7 @@ class LateralTransshipmentCG:
             row = score_by_idx.get(idx, {})
             per_row_constraint_json = constraint_features_json if idx == 0 else ""
             self.teacher_dataset_rows.append({
-                "source_instance": "irplt_cg",
+                "source_instance": self.source_instance,
                 "branch_node_id": self.current_branch_node_id,
                 "episode": episode,
                 "column_index": idx,
@@ -2880,7 +3122,9 @@ class LateralTransshipmentCG:
 
                 probs = [float(value) for value in probs_tensor.tolist()]
                 score_rows = self._compute_combined_column_scores(patterns, probs)
-                gnn_selected_idx, adaptive_info = self._adaptive_select_columns(score_rows)
+                gnn_selected_idx, adaptive_info = self._adaptive_select_columns(
+                    score_rows, patterns=patterns
+                )
                 selected_idx, fallback_idx = self._apply_classical_fallback(patterns, gnn_selected_idx)
             gnn_selected_set = set(gnn_selected_idx)
             selected = [patterns[idx] for idx in selected_idx]
@@ -2951,6 +3195,12 @@ class LateralTransshipmentCG:
                 "classical_fallback_used": fallback_idx is not None,
                 "fallback_idx": fallback_idx,
                 "selected": selected_rows,
+                # Fairness diagnostics — per (product, period) candidates vs
+                # picks. Written by _adaptive_select_columns so the benchmark
+                # CSV and irp_gnn_selected_columns.json can audit starvation.
+                "per_group_diagnostics": adaptive_info.get("per_group_diagnostics", []),
+                "gnn_min_per_group": adaptive_info.get("min_per_group"),
+                "groups_forced_by_quota": adaptive_info.get("groups_forced_count", 0),
             })
             print(
                 f"[GNN] Episode {episode}: scored {len(patterns)} priced columns, "
@@ -3044,13 +3294,25 @@ class LateralTransshipmentCG:
                 "classical_fallback_used": False,
                 "fallback_idx": None,
                 "selected": [],
+                # Teacher-only path (no GNN prefilter) — no quota decision to
+                # record, but keep schema consistent so downstream log joins
+                # don't explode on missing keys.
+                "per_group_diagnostics": [],
+                "gnn_min_per_group": None,
+                "groups_forced_by_quota": 0,
             })
             print(
                 f"[Teacher] Episode {self.current_episode}: recorded full priced batch "
                 f"without GNN prefilter ({len(patterns)} columns)."
             )
         except Exception as exc:
-            print(f"[Teacher] Could not record full priced batch graph: {exc}")
+            # Count and surface these failures — silently losing teacher batches
+            # silently shrinks the training set and skews the learned ranker.
+            self._teacher_record_failures = getattr(self, "_teacher_record_failures", 0) + 1
+            print(
+                f"[Teacher] Could not record full priced batch graph: {exc} "
+                f"(cumulative failures={self._teacher_record_failures})"
+            )
         return patterns
 
     def add_patterns(self, new_patterns: Iterable[LTPattern]) -> int:
@@ -3922,7 +4184,25 @@ class LateralTransshipmentCG:
         improvement_tol: float = 1e-5,
         rc_tol: float = -1e-6,
         msg: bool = False,
+        stopping_mode: Optional[str] = None,
     ) -> CGSolution:
+        # stopping_mode controls when the CG loop terminates:
+        #   "fixed_budget" → stop at max_iter regardless of RC / improvement
+        #   "convergence"  → stop ONLY when added == 0 (no new negative-RC column
+        #                    was added to the RMP pool). improvement_tol is
+        #                    ignored. max_iter becomes a safety cap only.
+        #   "hybrid" (default) → original behavior: stop on added==0 OR
+        #                    improvement <= improvement_tol OR iter > max_iter.
+        # Benchmark runs should use "convergence" to avoid prematurely halting
+        # the LP just because the RMP improvement stalled for one iteration.
+        if stopping_mode is None:
+            stopping_mode = os.environ.get("IRP_CG_STOPPING_MODE", "hybrid").strip().lower()
+        if stopping_mode not in {"fixed_budget", "convergence", "hybrid"}:
+            raise ValueError(
+                f"Unknown stopping_mode={stopping_mode!r}; expected one of "
+                "'fixed_budget', 'convergence', 'hybrid'."
+            )
+        self._cg_stopping_mode = stopping_mode
         best_sol = self.solve_rmp(msg=msg)
         best_sol.iterations_run = 0
         rmp_metrics_total = dict(best_sol.efficiency_metrics)
@@ -4003,7 +4283,7 @@ class LateralTransshipmentCG:
                     + f" | gnn_score={pat.metadata.get('gnn_score')}"
                 )
 
-            if added == 0:
+            if added == 0 and stopping_mode != "fixed_budget":
                 best_sol.iterations_run = it - 1
                 best_sol.efficiency_metrics = dict(rmp_metrics_total)
                 self.cg_history.append({
@@ -4018,12 +4298,17 @@ class LateralTransshipmentCG:
                 if new_patterns:
                     print(
                         f"[CG] {len(new_patterns)} negative-RC column(s) priced but all already in pool "
-                        f"(degenerate cycling). Stop."
+                        f"(degenerate cycling). Stop. [stopping_mode={stopping_mode}]"
                     )
                 else:
-                    print("[CG] No negative reduced-cost columns found. LP optimal. Stop.")
+                    print(f"[CG] No negative reduced-cost columns found. LP optimal. Stop. [stopping_mode={stopping_mode}]")
                 self._print_cg_episode_history()
                 return best_sol
+            if added == 0 and stopping_mode == "fixed_budget":
+                # Log the would-be-convergence event but continue until max_iter
+                # so benchmark runs share a fixed iteration budget regardless of
+                # when LP optimality is reached.
+                print(f"[CG] added==0 at iter {it} but stopping_mode=fixed_budget — continuing until max_iter={max_iter}.")
 
             sol = self.solve_rmp(msg=msg)
             sol.iterations_run = it
@@ -4054,11 +4339,16 @@ class LateralTransshipmentCG:
                     pat = next(p for p in self.patterns if p.pattern_id == pat_id)
                     print("  " + format_pattern_detail(pat) + f" | lambda={sol.lambda_values[pat_id]:.4f}")
 
-            if improvement <= improvement_tol:
-                print(f"[CG] Improvement {improvement:.2e} <= tol {improvement_tol:.2e}. Converged.")
+            if stopping_mode == "hybrid" and improvement <= improvement_tol:
+                print(f"[CG] Improvement {improvement:.2e} <= tol {improvement_tol:.2e}. Converged. [stopping_mode=hybrid]")
                 self._print_cg_episode_history()
                 sol.efficiency_metrics = dict(rmp_metrics_total)
                 return sol
+            # In "convergence" and "fixed_budget" modes we do NOT stop on
+            # improvement_tol — the only convergence signal is added==0 (handled
+            # above). This keeps strict benchmark runs from halting early when
+            # the RMP objective happens to flatten but negative-RC columns still
+            # exist, which would bias the runtime comparison.
             prev_obj = sol.objective
             best_sol = sol
 
@@ -4085,6 +4375,7 @@ class LateralTransshipmentCG:
         max_nodes: int = 15,
         max_depth: int = 6,
         int_tol: float = 1e-5,
+        stopping_mode: Optional[str] = None,
     ) -> CGSolution:
         original_branch_bounds = dict(self.branch_bounds)
         self.branch_history = []
@@ -4127,6 +4418,7 @@ class LateralTransshipmentCG:
                     improvement_tol=improvement_tol,
                     rc_tol=rc_tol,
                     msg=msg,
+                    stopping_mode=stopping_mode,
                 )
                 for row in self.cg_history:
                     row_with_node = dict(row)
@@ -5436,7 +5728,7 @@ class IRPResearchPipeline:
                 n_patterns_per_product_period=n_initial_patterns_per_product_period,
                 max_pairs_in_pattern=4,
                 lt_activation_threshold=lt_activation_threshold,
-                seed=123,
+                seed=int(os.environ.get("IRP_PATTERN_INIT_SEED", "123")),
             )
             print(f"Generated {len(initial_patterns)} initial LT patterns")
 
@@ -5584,8 +5876,15 @@ class IRPResearchPipeline:
 # ============================================================================
 
 def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
-                               runtime_seconds: float) -> Dict[str, Any]:
-    """Extract the comparison-table row from a completed pipeline run."""
+                               runtime_seconds: float,
+                               run_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Extract the comparison-table row from a completed pipeline run.
+
+    The row includes the fields thesis benchmarking needs: identity (run label,
+    source_instance, seed), runtime breakdown (phase-1 baseline, phase-2 CG,
+    GNN inference, optional post-run fine-tune), solver stopping reason,
+    objective/cost, iteration count, candidate counts, and selected counts.
+    """
     baseline_sol = results.get("baseline_solution")
     cg_sol = results.get("cg_solution")
     realized_no_lt = results.get("realized_no_lt_cost_breakdown") or {}
@@ -5594,21 +5893,49 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
     column_pool = results.get("column_pool_diagnostics") or []
     total_cols_generated = sum(int(r.get("patterns_built_before_gnn", 0) or 0) for r in cg_history)
     total_cols_added = sum(int(r.get("patterns_added_to_pool", 0) or 0) for r in cg_history)
+    total_cols_selected_by_gnn = sum(int(r.get("patterns_kept_after_gnn", 0) or 0) for r in cg_history)
     final_pool = column_pool[-1] if column_pool else {}
     pool_size = int(final_pool.get("pool_size", 0) or 0)
     selected_in_rmp = int(final_pool.get("selected_in_rmp", 0) or 0)
     pool_util = (selected_in_rmp / pool_size) if pool_size > 0 else 0.0
     gnn_scoring_failures = int(results.get("gnn_scoring_failures", 0) or 0)
+    baseline_runtime = float(getattr(baseline_sol, "runtime_seconds", float("nan")) or float("nan"))
+    cg_runtime = float(
+        (cg_sol.efficiency_metrics or {}).get("rmp_total_runtime", float("nan"))
+        if cg_sol is not None else float("nan")
+    )
+    gnn_inference_runtime = float((cg_sol.efficiency_metrics or {}).get("gnn_total_runtime", 0.0)) if cg_sol else 0.0
+    # Stopping reason: infer from last CG episode — added==0 means convergence,
+    # else budget exhausted.
+    last_ep = cg_history[-1] if cg_history else {}
+    stopping_reason = (
+        "convergence_no_negative_rc" if int(last_ep.get("added_columns", 0) or 0) == 0
+        else "budget_exhausted"
+    )
+    run_context = run_context or {}
     return {
         "variant": variant,
+        "run_label": run_context.get("run_label", variant),
+        "source_instance": run_context.get("source_instance", ""),
+        "dataset_id": run_context.get("dataset_id", ""),
+        "scenario_id": run_context.get("scenario_id", ""),
+        "seed": run_context.get("seed", ""),
+        "benchmark_mode": run_context.get("benchmark_mode", ""),
         "rmp_objective": float(cg_sol.objective) if cg_sol is not None else float("nan"),
         "realized_cost_no_lt": float(realized_no_lt.get("total_cost", float("nan"))),
         "realized_cost_with_lt": float(realized_with_lt.get("total_cost", float("nan"))),
+        "final_objective_or_total_cost": float(realized_with_lt.get("total_cost", float("nan"))),
         "lt_cost_with_lt": float(realized_with_lt.get("lateral_transshipment_cost", 0.0)),
         "shortage_cost_with_lt": float(realized_with_lt.get("shortage_cost", 0.0)),
         "cg_iterations": int(len(cg_history)),
-        "runtime_seconds": float(runtime_seconds),
+        "stopping_reason": stopping_reason,
+        "total_runtime_seconds": float(runtime_seconds),
+        "phase1_baseline_runtime_seconds": baseline_runtime,
+        "phase2_cg_runtime_seconds": cg_runtime,
+        "gnn_inference_runtime_seconds": gnn_inference_runtime,
+        "post_run_fine_tune_runtime_seconds": float(run_context.get("fine_tune_runtime_seconds", 0.0)),
         "columns_generated": total_cols_generated,
+        "columns_selected_by_gnn": total_cols_selected_by_gnn,
         "columns_added_to_rmp": total_cols_added,
         "column_pool_utilization": float(pool_util),
         "gnn_scoring_failures": gnn_scoring_failures,
@@ -5680,16 +6007,30 @@ def run_three_way_benchmark(
             # Surface the failure instead of silently dropping the run.
             print(f"[Benchmark] Variant {variant_name} FAILED: {exc}")
             rows.append({
-                "variant": variant_name, "rmp_objective": float("nan"),
+                "variant": variant_name, "run_label": variant_name,
+                "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
+                "seed": demand_shock_seed,
+                "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
+                "rmp_objective": float("nan"),
                 "realized_cost_no_lt": float("nan"), "realized_cost_with_lt": float("nan"),
                 "lt_cost_with_lt": float("nan"), "shortage_cost_with_lt": float("nan"),
-                "cg_iterations": 0, "runtime_seconds": time.perf_counter() - t0,
+                "cg_iterations": 0, "total_runtime_seconds": time.perf_counter() - t0,
                 "columns_generated": 0, "columns_added_to_rmp": 0,
                 "column_pool_utilization": 0.0, "error": str(exc),
+                "stopping_reason": "failed",
             })
             continue
         runtime = time.perf_counter() - t0
-        row = _collect_benchmark_metrics(variant_name, variant_results, runtime)
+        run_context = {
+            "run_label": variant_name,
+            "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
+            "dataset_id": getattr(data, "dataset_id", "") or "",
+            "scenario_id": str(demand_shock_seed),
+            "seed": demand_shock_seed,
+            "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
+            "fine_tune_runtime_seconds": 0.0,
+        }
+        row = _collect_benchmark_metrics(variant_name, variant_results, runtime, run_context=run_context)
         rows.append(row)
         print(f"[Benchmark] {variant_name}: obj={row['rmp_objective']:.2f} "
               f"cost_with_lt={row['realized_cost_with_lt']:.2f} runtime={runtime:.1f}s")
@@ -5729,7 +6070,14 @@ if __name__ == "__main__":
     #   Online learning introduces non-determinism and should only be activated
     #   after the model has been validated in inference-only mode first.
     #
-    # Stage 3  ONLINE LEARNING   (IRP_ONLINE_INFERENCE=1 + IRP_ONLINE_LEARNING=1)
+    # Stage 3  POST-RUN FINE-TUNE   (IRP_ONLINE_INFERENCE=1 + IRP_ONLINE_LEARNING=1)
+    #   Historical note: the env flag is named IRP_ONLINE_LEARNING for backward
+    #   compatibility, but this stage is NOT true in-loop online learning — GNN
+    #   weights are frozen throughout CG and updated exactly once, in a batch
+    #   fine-tune pass at the end of the run. True in-loop online learning was
+    #   deliberately not implemented because (a) reproducibility for thesis
+    #   evaluation requires a frozen model across CG iterations, and (b) the
+    #   per-episode gradient signal is extremely noisy.
     #   Dataset : test data.csv
     #   Supervision : solver-supervised — teacher labels come from RMP dual
     #                 variables (lambda > 1e-6 → label=1) and reduced costs
@@ -5757,11 +6105,14 @@ if __name__ == "__main__":
 
     if _online_learning:
         print(
-            "[Mode] ONLINE LEARNING — test data.csv; GNN scores during CG AND new teacher rows are "
-            "collected; model is fine-tuned (solver-supervised, resume_checkpoint=True) at end of run."
+            "[Mode] POST-RUN FINE-TUNE (legacy name: ONLINE LEARNING) — test data.csv; "
+            "GNN scores during CG AND new teacher rows are collected; model is fine-tuned "
+            "(solver-supervised, resume_checkpoint=True) at END of run. This is NOT true "
+            "in-loop online backprop — weights are frozen during CG and updated in one "
+            "batch pass after the final iteration. See docstring above for rationale."
         )
     elif _online_inference:
-        print("[Mode] ONLINE INFERENCE — test data.csv; pre-trained GNN checkpoint loaded, no retraining.")
+        print("[Mode] ONLINE INFERENCE — test data.csv; pre-trained GNN checkpoint loaded, no retraining during CG.")
     else:
         print("[Mode] OFFLINE TRAINING — training dataset; CG → teacher rows → GNN train/validate.")
 
@@ -5773,13 +6124,20 @@ if __name__ == "__main__":
         else:
             print(f"[Cleanup] No stale managed outputs found in {RESULTS_DIR}")
 
+    # Resolve all per-component seeds from IRP_MASTER_SEED (or individual env
+    # overrides) and write Results/seed_manifest.json so every run's seed
+    # state is auditable. This runs *after* clean_managed_outputs so the
+    # manifest is not deleted, and *before* mapper construction so downstream
+    # subsystems see the resolved seed env vars.
+    _seed_manifest = resolve_seed_manifest(RESULTS_DIR)
+
     mapper = DatasetToIRPValidationMapper(
         excel_path=EXCEL_PATH,
         sheet_name="Sheet1",
-        store_limit=10,
-        sku_limit=5,
-        start_date="None",
-        end_date="None",
+        store_limit=int(os.environ.get("IRP_STORE_LIMIT", "10")),
+        sku_limit=int(os.environ.get("IRP_SKU_LIMIT", "5")),
+        start_date=os.environ.get("IRP_START_DATE"),
+        end_date=os.environ.get("IRP_END_DATE"),
     )
 
     data, base_df, validation_target, meta = mapper.build_irp_data(
@@ -5801,8 +6159,15 @@ if __name__ == "__main__":
         lt_cost_multiplier=float(os.environ.get("IRP_LT_COST_MULTIPLIER", "1.0")),
     )
 
+    # Attach identity tags so downstream logging / benchmark CSV / teacher rows
+    # all agree on which base dataset + scenario this run belongs to. Set via
+    # env by the scenario generator; fall back to the dataset filename stem.
+    data.dataset_id = os.environ.get("IRP_DATASET_ID") or EXCEL_PATH.stem
+    data.scenario_id = os.environ.get("IRP_SCENARIO_ID", "")
+
     print("Mapped dataset metadata:")
     pprint.pprint(meta)
+    print(f"[Identity] dataset_id={data.dataset_id} | scenario_id={data.scenario_id}")
 
     # Cost unit diagnostic — helps detect scale mismatch between cost components.
     # Shortage cost and LT cost should be on the same economic scale for valid optimisation.
