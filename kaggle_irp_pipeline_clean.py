@@ -55,6 +55,7 @@ END_DATE:    Optional[str] = None
 
 # ── Solver / GNN ─────────────────────────────────────────
 CG_ITERATIONS    = 20
+CG_STOPPING_MODE = "convergence"   # stop when no new negative-RC columns enter the pool; CG_ITERATIONS is only a safety cap
 BP_MAX_NODES     = 15
 BP_MAX_DEPTH     = 6
 # First-run recommendation: 60–100 epochs to validate the pipeline end-to-end
@@ -89,6 +90,7 @@ RUN_PHASE_2          = True
 RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
 RUN_BENCHMARK        = True     # flip to False on first run; enable after Phase 1 + Phase 2 validated
+BENCHMARK_N_REPEATS  = 3        # each A/B/C variant repeats with varying demand-shock seed → mean/std
 HEURISTIC_TOP_K      = 20
 DEMAND_SHOCK_SEED    = 42
 
@@ -372,6 +374,8 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # Propagate to all subprocesses (scenario generator, GNN trainer, graph
 # builder, offline tester) so they write into the canonical RESULTS_DIR.
 os.environ["IRP_RESULTS_DIR"] = str(RESULTS_DIR)
+# Force a strict CG convergence stop rule across direct runs and subprocesses.
+os.environ["IRP_CG_STOPPING_MODE"] = CG_STOPPING_MODE
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -574,6 +578,11 @@ print(f"\n  checkpoint exists : {checkpoint.exists()}")
 print(f"  history rows      : {len(gnn_history)}")
 
 # -- 7c: Offline held-out test -------------------------------------------------
+# Runtime category: OFFLINE GNN TEST ONLY — forward pass on held-out graphs,
+# no solver involved. `04_test.py` additionally writes forward-pass timing to
+# gnn/offline_test/test_runtime_seconds.json. The subprocess wall time below
+# bounds that with Python startup + I/O overhead.
+offline_gnn_test_wall_seconds: Optional[float] = None
 if test_samples and checkpoint.exists():
     print(f"\n[Step 7c] Offline test on {len(test_samples)} held-out samples...")
     test_cmd = [
@@ -583,11 +592,14 @@ if test_samples and checkpoint.exists():
         "--split",      "test",
         "--out-file",   str(offline_test_csv),
     ]
+    _t_off = time.perf_counter()
     r = subprocess.run(test_cmd, cwd=str(REPO_ROOT))
+    offline_gnn_test_wall_seconds = time.perf_counter() - _t_off
     if r.returncode != 0:
         print(f"[WARNING] Offline test exited with code {r.returncode}")
     else:
         show_offline_test_results(offline_test_csv)
+    print(f"  [Offline GNN test] subprocess wall time: {offline_gnn_test_wall_seconds:.2f} s")
 else:
     print(f"\n[Step 7c] Offline test skipped — "
           f"test_samples={len(test_samples)}, checkpoint={checkpoint.exists()}")
@@ -633,6 +645,7 @@ ol_results:  Optional[Dict[str, Any]] = None
 # 9) Phase 2 — online inference (test data, GNN scoring)
 # =========================================================
 
+online_inference_wall_seconds: Optional[float] = None
 if RUN_PHASE_2 and checkpoint.exists() and gnn_history:
     print("\n" + "=" * 70)
     print("PHASE 2 — ONLINE INFERENCE  (test data, GNN scoring)")
@@ -642,12 +655,17 @@ if RUN_PHASE_2 and checkpoint.exists() and gnn_history:
     _, p2_data, _, p2_val_target, p2_meta = build_data(irp, TEST_DATA_PATH)
     show_json("Phase 2 test data metadata", p2_meta)
 
+    # Runtime category: ONLINE INFERENCE END-TO-END — full CG solve with GNN
+    # embedded inside the pricing loop. Separate from offline GNN test.
+    _t_p2 = time.perf_counter()
     gnn_results = run_phase(irp, p2_data, use_gnn=True, collect_teacher=False)
+    online_inference_wall_seconds = time.perf_counter() - _t_p2
 
     p2_summary = phase_summary(gnn_results, "phase2_online_inference")
     phase_summaries.append(p2_summary)
     show_df("Phase 2 Summary", pd.DataFrame([p2_summary]))
     save_phase_outputs(gnn_results, "phase2_online_inference", validation_target=p2_val_target)
+    print(f"  [Online inference] Phase 2 end-to-end wall time: {online_inference_wall_seconds:.2f} s")
 
 elif RUN_PHASE_2:
     print(f"\n[Phase 2 skipped]  checkpoint={checkpoint.exists()}  "
@@ -707,13 +725,21 @@ elif RUN_ONLINE_LEARNING:
 # =========================================================
 
 benchmark_df: Optional[pd.DataFrame] = None
+benchmark_wall_seconds: Optional[float] = None
 
 if RUN_BENCHMARK:
     print("\n" + "=" * 70)
-    print("3-WAY BENCHMARK  (Classical / Heuristic / GNN-Guided)")
+    print(f"3-WAY BENCHMARK  (Classical / Heuristic / GNN-Guided)  on TEST data  ×  {BENCHMARK_N_REPEATS} repeats")
     print("=" * 70)
 
-    _, bm_data, _, _, _ = build_data(irp, TRAIN_DATA_PATH)
+    # The external A/B/C benchmark runs on the TEST holdout, not training data.
+    # Training data is reserved for teacher generation + offline GNN train/valid/test.
+    # `run_three_way_benchmark` internally writes comparison_per_run.csv +
+    # comparison_aggregate.csv (mean/std) and mirrors the aggregate to
+    # thesis_summary/benchmark_comparison.csv.
+    require_path(TEST_DATA_PATH, "TEST_DATA_PATH (Benchmark)")
+    _, bm_data, _, _, _ = build_data(irp, TEST_DATA_PATH)
+    _t_bm = time.perf_counter()
     benchmark_df = irp.run_three_way_benchmark(
         data=bm_data,
         cg_iterations=CG_ITERATIONS,
@@ -729,15 +755,16 @@ if RUN_BENCHMARK:
         lt_activation_threshold=0.0,
         heuristic_top_k=HEURISTIC_TOP_K,
         enforce_integer_flows=False,
+        n_repeats=BENCHMARK_N_REPEATS,
+        results_dir=RESULTS_DIR,
     )
-    show_df("3-Way Benchmark Comparison", benchmark_df)
-    bench_dir = RESULTS_DIR / "benchmark"
-    bench_dir.mkdir(parents=True, exist_ok=True)
-    benchmark_df.to_csv(bench_dir / "comparison.csv", index=False)
-    # Mirror into thesis_summary/ for reporting alongside phase_comparison.csv
-    thesis_dir = RESULTS_DIR / "thesis_summary"
-    thesis_dir.mkdir(parents=True, exist_ok=True)
-    benchmark_df.to_csv(thesis_dir / "benchmark_comparison.csv", index=False)
+    benchmark_wall_seconds = time.perf_counter() - _t_bm
+    show_df("3-Way Benchmark Comparison (per-run)", benchmark_df)
+    bench_agg_path = RESULTS_DIR / "benchmark" / "comparison_aggregate.csv"
+    if bench_agg_path.exists():
+        show_df("3-Way Benchmark Comparison (aggregate mean/std)",
+                pd.read_csv(bench_agg_path))
+    print(f"  [External benchmark] total wall time: {benchmark_wall_seconds:.2f} s")
 
 
 # =========================================================
@@ -794,17 +821,113 @@ print("=" * 70)
 
 import datetime as _dt
 
+# --- Runtime breakdown --------------------------------------------------------
+# Three runtime categories — never mixed:
+#   1. offline GNN test: model forward-pass only (GNN/04_test.py)
+#   2. online inference : end-to-end Phase 2 CG solve with GNN embedded
+#   3. external benchmark: wall time of run_three_way_benchmark across repeats
+runtime_breakdown: Dict[str, Any] = {
+    "offline_gnn_test_subprocess_wall_seconds": offline_gnn_test_wall_seconds,
+    "online_inference_phase2_wall_seconds":     online_inference_wall_seconds,
+    "external_benchmark_total_wall_seconds":    benchmark_wall_seconds,
+}
+# Pull the GNN forward-pass timing produced inside 04_test.py (more granular).
+_offline_runtime_json = offline_test_dir / "test_runtime_seconds.json"
+if _offline_runtime_json.exists():
+    try:
+        with open(_offline_runtime_json) as _f:
+            _offline_payload = json.load(_f)
+        runtime_breakdown["offline_gnn_test_forward_pass_total_seconds"] = \
+            _offline_payload.get("forward_pass_seconds_total")
+        runtime_breakdown["offline_gnn_test_forward_pass_mean_seconds"] = \
+            _offline_payload.get("forward_pass_seconds_mean")
+    except Exception as _exc:
+        print(f"[Runtime] could not read {_offline_runtime_json}: {_exc}")
+
+thesis_dir = RESULTS_DIR / "thesis_summary"
+thesis_dir.mkdir(parents=True, exist_ok=True)
+with open(thesis_dir / "runtime_breakdown.json", "w") as _f:
+    json.dump(runtime_breakdown, _f, indent=2, default=str)
+print("\n[Runtime breakdown]")
+for _k, _v in runtime_breakdown.items():
+    print(f"  {_k:<56s}  {_v}")
+
+# --- Effectiveness report + Results/README.md --------------------------------
+# Consolidate per-stage KPIs into a single examiner-facing file and write a
+# human-readable directory map so reviewers can navigate Results/ unaided.
+_training_summary_json = gnn_dir / "training_summary.json"
+_training_summary_obj: Optional[Dict[str, Any]] = None
+if _training_summary_json.exists():
+    try:
+        with open(_training_summary_json) as _f:
+            _training_summary_obj = json.load(_f)
+    except Exception as _exc:
+        print(f"[Effectiveness] could not read training_summary: {_exc}")
+
+try:
+    irp.build_effectiveness_report(
+        RESULTS_DIR,
+        phase_summaries=phase_summaries,
+        gnn_training_history=gnn_history,
+        gnn_training_summary=_training_summary_obj,
+        gnn_offline_test_csv=offline_test_csv,
+        benchmark_aggregate_csv=(RESULTS_DIR / "benchmark" / "comparison_aggregate.csv")
+            if (RESULTS_DIR / "benchmark" / "comparison_aggregate.csv").exists() else None,
+        runtime_breakdown=runtime_breakdown,
+    )
+except Exception as _exc:
+    print(f"[Effectiveness] report skipped: {_exc}")
+
+try:
+    _split_counts = {}
+    _graph_summary_path = graph_dir / "dataset_summary.json"
+    if _graph_summary_path.exists():
+        with open(_graph_summary_path) as _f:
+            _ds = json.load(_f)
+        for _k in ("train", "valid", "test"):
+            if _k in _ds:
+                _split_counts[_k] = int(_ds[_k].get("num_samples", 0)) if isinstance(_ds[_k], dict) else int(_ds[_k])
+    _scenario_counts: Dict[str, Any] = {}
+    _manifest_path = Path(TEACHER_SCENARIO_OUT_DIR) / "scenarios_manifest.json"
+    if _manifest_path.exists():
+        with open(_manifest_path) as _f:
+            _manifest = json.load(_f)
+        _scenario_counts["n_scenarios"] = len(_manifest.get("scenarios", []))
+        _split_assign = _manifest.get("split_assignment", {})
+        for _sp in ("train", "valid", "test"):
+            _scenario_counts[f"{_sp}_scenarios"] = sum(1 for _v in _split_assign.values() if _v == _sp)
+    irp.write_results_readme(
+        RESULTS_DIR,
+        source_files={
+            "training_csv (teacher + phase1)":   str(TRAIN_DATA_PATH),
+            "test_csv (phase2 + phase3 + benchmark)": str(TEST_DATA_PATH),
+            "distance_matrix":                   str(DIST_PATH),
+        },
+        split_counts=_split_counts,
+        scenario_counts=_scenario_counts,
+        phase_summaries=phase_summaries,
+        runtime_breakdown=runtime_breakdown,
+    )
+except Exception as _exc:
+    print(f"[README] skipped: {_exc}")
+
 # Core thesis outputs — ONE reporting file per headline question.
 # If any of these is missing, the thesis report has a gap.
 thesis_summary_files = [
-    ("thesis_summary/phase_comparison.csv",    "Phase-by-phase headline KPIs"),
-    ("thesis_summary/benchmark_comparison.csv","3-way benchmark (classical/heuristic/GNN)"),
-    ("gnn/training_history.csv",               "GNN training loss curve"),
-    ("gnn/training_summary.json",              "GNN best-epoch summary"),
-    ("gnn/offline_test/test_per_sample.csv",   "Offline held-out test metrics"),
-    ("graphs/graph_dataset_summary.json",      "Graph dataset split sizes"),
-    ("scenarios/scenarios_manifest.json",      "Scenario-generation manifest"),
-    ("scenarios/aggregate_teacher_rows.csv",   "Aggregated teacher rows"),
+    ("README.md",                               "Human-readable results directory map"),
+    ("thesis_summary/phase_comparison.csv",     "Phase-by-phase headline KPIs"),
+    ("thesis_summary/benchmark_comparison.csv", "3-way benchmark aggregate (mean/std across repeats)"),
+    ("thesis_summary/effectiveness_report.csv", "One-file scoreboard: solver costs + GNN metrics + runtimes"),
+    ("thesis_summary/runtime_breakdown.json",   "Offline-test vs online-inference vs benchmark wall times"),
+    ("benchmark/comparison_per_run.csv",        "Per-repeat benchmark rows (for variance check)"),
+    ("benchmark/comparison_aggregate.csv",      "Per-variant mean/std/min/max"),
+    ("gnn/training_history.csv",                "GNN training loss curve"),
+    ("gnn/training_summary.json",               "GNN best-epoch summary"),
+    ("gnn/offline_test/test_per_sample.csv",    "Offline held-out test metrics"),
+    ("gnn/offline_test/test_runtime_seconds.json", "Offline GNN forward-pass runtime (model only)"),
+    ("graphs/graph_dataset_summary.json",       "Graph dataset split sizes"),
+    ("scenarios/scenarios_manifest.json",       "Scenario-generation manifest"),
+    ("scenarios/aggregate_teacher_rows.csv",    "Aggregated teacher rows"),
 ]
 
 print("\n[Thesis-summary files] — open these first for reporting")
@@ -851,8 +974,12 @@ run_manifest = {
     "gnn_checkpoint": str(checkpoint),
     "gnn_checkpoint_exists": checkpoint.exists(),
     "benchmark_variants": (
-        list(benchmark_df["variant"]) if benchmark_df is not None and not benchmark_df.empty else []
+        sorted(set(benchmark_df["variant"]))
+        if benchmark_df is not None and not benchmark_df.empty else []
     ),
+    "benchmark_n_repeats": BENCHMARK_N_REPEATS if RUN_BENCHMARK else 0,
+    "benchmark_data_source": "TEST_DATA_PATH" if RUN_BENCHMARK else None,
+    "runtime_breakdown": runtime_breakdown,
     "artifacts_by_stage": artifacts_by_phase,
 }
 manifest_path = RESULTS_DIR / "run_manifest.json"
@@ -862,7 +989,12 @@ print(f"\n[Manifest] wrote {manifest_path}")
 
 print("\n=== PIPELINE COMPLETE ===")
 print(f"  Results root      : {RESULTS_DIR}")
+print(f"  CG stopping mode  : {CG_STOPPING_MODE}")
 print(f"  Phases run        : {[s['phase'] for s in phase_summaries]}")
 if benchmark_df is not None and not benchmark_df.empty:
-    print(f"  Benchmark variants: {list(benchmark_df['variant'])}")
+    print(f"  Benchmark variants: {sorted(set(benchmark_df['variant']))}  "
+          f"(repeats per variant: {BENCHMARK_N_REPEATS}, source=TEST_DATA_PATH)")
 print(f"  GNN checkpoint    : {checkpoint}  (exists={checkpoint.exists()})")
+print("\n  Runtime (seconds):")
+for _k, _v in runtime_breakdown.items():
+    print(f"    {_k:<56s}  {_v}")

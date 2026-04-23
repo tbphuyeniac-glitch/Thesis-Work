@@ -257,6 +257,63 @@ def resolve_phase_label() -> str:
     return "phase1_offline_baseline"
 
 
+# ---------------------------------------------------------------------------
+# Integer enforcement for final operational outputs
+# ---------------------------------------------------------------------------
+# The CG LP relaxation produces fractional lambda values and therefore fractional
+# shipment quantities; the demand-shock reallocation also produces fractional
+# demand deltas. For a thesis-grade IRP result, the *final* operational plan
+# (what to ship, how many units, resulting inventory, shortage) must be integer.
+# These helpers round final output DataFrames at save time while preserving the
+# LP-relaxed values in a parallel <phase>/debug/ folder so examiners can audit
+# the relaxation gap.
+INTEGER_FINAL_OUTPUT_COLUMNS = {
+    "lt_qty",
+    "predicted_end_qty",
+    "actual_end_qty",
+    "shortage",
+    "post_shock_shortage",
+    "total_realized_demand",
+    "fulfilled_demand",
+    "forecast_demand",
+    "forecast_fulfilled_demand",
+    "forecast_shortage",
+    "total_direct_qty",
+    "total_lt_qty",
+    "load_departure",
+}
+
+
+def _integer_final_outputs_enabled() -> bool:
+    """Return True when final CSVs should show integer qty/inv/shortage values.
+
+    Default ON. Set IRP_INTEGER_FINAL_OUTPUTS=0 to keep raw LP-relaxed floats
+    in the primary output files (debug copies are always written).
+    """
+    return os.environ.get("IRP_INTEGER_FINAL_OUTPUTS", "1").lower() not in {"0", "false", "no", ""}
+
+
+def _round_integer_columns(df: "pd.DataFrame", extra_cols: Optional[Iterable[str]] = None) -> "pd.DataFrame":
+    """Return a copy of df with all known integer-valued columns rounded to int.
+
+    Uses banker's rounding (np.rint) then casts to nullable Int64 so missing
+    values remain representable. Non-present columns are skipped silently.
+    """
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    cols = set(INTEGER_FINAL_OUTPUT_COLUMNS)
+    if extra_cols:
+        cols.update(extra_cols)
+    for c in cols:
+        if c in out.columns:
+            numeric = pd.to_numeric(out[c], errors="coerce")
+            rounded = numeric.round(0)
+            # Use nullable Int64 so NaN survives a round-trip through CSV.
+            out[c] = rounded.astype("Int64")
+    return out
+
+
 class ResultsLayout:
     """Owns every output path the pipeline writes to.
 
@@ -6069,21 +6126,46 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
     cg_sol = results.get("cg_solution")
     realized_no_lt = results.get("realized_no_lt_cost_breakdown") or {}
     realized_with_lt = results.get("realized_with_lt_cost_breakdown") or {}
+    # cg_episode_history rows carry high-level objective curve (episode, total_cost,
+    # proposed_columns, added_columns). cg_episode_diagnostics rows carry the
+    # fine-grained per-episode column counts (patterns_built_before_gnn,
+    # patterns_kept_after_gnn, patterns_added_to_pool). The two files never share
+    # schemas — earlier code mistakenly pulled the diagnostic keys from
+    # cg_episode_history and got zeros.
     cg_history = results.get("cg_episode_history") or []
-    column_pool = results.get("column_pool_diagnostics") or []
-    total_cols_generated = sum(int(r.get("patterns_built_before_gnn", 0) or 0) for r in cg_history)
-    total_cols_added = sum(int(r.get("patterns_added_to_pool", 0) or 0) for r in cg_history)
-    total_cols_selected_by_gnn = sum(int(r.get("patterns_kept_after_gnn", 0) or 0) for r in cg_history)
-    final_pool = column_pool[-1] if column_pool else {}
-    pool_size = int(final_pool.get("pool_size", 0) or 0)
-    selected_in_rmp = int(final_pool.get("selected_in_rmp", 0) or 0)
+    cg_diags = results.get("cg_episode_diagnostics") or []
+    total_cols_generated = sum(int(r.get("patterns_built_before_gnn", 0) or 0) for r in cg_diags)
+    total_cols_added = sum(int(r.get("patterns_added_to_pool", 0) or 0) for r in cg_diags)
+    total_cols_selected_by_gnn = sum(int(r.get("patterns_kept_after_gnn", 0) or 0) for r in cg_diags)
+    # Fallback: if diagnostics were not recorded, use cg_history's proposed/added
+    # fields so the row is never silently zero.
+    if total_cols_generated == 0 and cg_history:
+        total_cols_generated = sum(int(r.get("proposed_columns", 0) or 0) for r in cg_history)
+    if total_cols_added == 0 and cg_history:
+        total_cols_added = sum(int(r.get("added_columns", 0) or 0) for r in cg_history)
+    # Final pool size = number of columns remaining in the RMP; selected = columns
+    # with lambda > 0 in the final solution. Both come directly from cg_solution.
+    pool_size = len(getattr(cg_sol, "lambda_values", {}) or {}) if cg_sol is not None else 0
+    selected_in_rmp = len(getattr(cg_sol, "selected_patterns", []) or []) if cg_sol is not None else 0
     pool_util = (selected_in_rmp / pool_size) if pool_size > 0 else 0.0
     gnn_scoring_failures = int(results.get("gnn_scoring_failures", 0) or 0)
-    baseline_runtime = float(getattr(baseline_sol, "runtime_seconds", float("nan")) or float("nan"))
+    # Baseline ALNS runtime lives in efficiency_metrics["alns_runtime_seconds"]
+    # (there is no baseline_sol.runtime_seconds attribute — earlier code was
+    # always getting NaN here).
+    baseline_eff = getattr(baseline_sol, "efficiency_metrics", {}) or {}
+    baseline_runtime = float(
+        baseline_eff.get("alns_runtime_seconds",
+                         baseline_eff.get("gurobi_runtime_seconds", float("nan")))
+    )
+    # cg_solution.efficiency_metrics["gurobi_runtime_seconds"] is the sum of
+    # RMP-solve runtimes (_add_efficiency_metrics accumulates it across solves);
+    # there is no "rmp_total_runtime" key.
     cg_runtime = float(
-        (cg_sol.efficiency_metrics or {}).get("rmp_total_runtime", float("nan"))
+        (cg_sol.efficiency_metrics or {}).get("gurobi_runtime_seconds", float("nan"))
         if cg_sol is not None else float("nan")
     )
+    # GNN inference runtime is reported via comparison → cg_rmp_efficiency_metrics
+    # when runtime_gnn_mode was enabled. Fall back to 0 when it wasn't tracked.
     gnn_inference_runtime = float((cg_sol.efficiency_metrics or {}).get("gnn_total_runtime", 0.0)) if cg_sol else 0.0
     # Stopping reason: infer from last CG episode — added==0 means convergence,
     # else budget exhausted.
@@ -6139,16 +6221,28 @@ def save_phase_artifacts(
     phase_label = phase_label or layout.phase_label
     phase_dir = layout.root / phase_label
     phase_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = phase_dir / "debug"
     if save_routes is None:
         save_routes = os.environ.get("IRP_SAVE_ROUTES", "0").lower() not in {"0", "false", "no", ""}
     written: Dict[str, str] = {}
+    apply_integer_rounding = _integer_final_outputs_enabled()
 
     def _put(name: str, path: Path) -> None:
         written[name] = str(path.relative_to(layout.root))
 
     def _csv(name: str, df: pd.DataFrame) -> None:
+        """Write df as CSV. If any INTEGER_FINAL_OUTPUT_COLUMNS column is
+        present and IRP_INTEGER_FINAL_OUTPUTS is enabled (default), write the
+        rounded-integer version to the main path and keep the LP-relaxed floats
+        under <phase>/debug/<name> for auditing."""
         path = phase_dir / name
-        df.to_csv(path, index=False)
+        has_qty_cols = any(c in df.columns for c in INTEGER_FINAL_OUTPUT_COLUMNS)
+        if apply_integer_rounding and has_qty_cols:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            df.to_csv(debug_dir / name, index=False)
+            _round_integer_columns(df).to_csv(path, index=False)
+        else:
+            df.to_csv(path, index=False)
         _put(name, path)
 
     # Cost breakdowns
@@ -6270,14 +6364,69 @@ def save_phase_artifacts(
             print(f"[artifacts/{phase_label}] baseline_routes: {exc}")
 
     # Predicted inventory + validation comparison (only if validation_target given).
+    #
+    # Emits BOTH the forecast-only inventory (`predicted_end_qty_forecast`) and
+    # the realized-after-LT inventory (`predicted_end_qty_realized`) alongside
+    # `actual_end_qty`, so examiners can see which trajectory matches reality.
+    # A validation_diagnostics.json captures the merge statistics and a clear
+    # reason string when the comparison is effectively unavailable (e.g. the
+    # test data has no overlapping (store, sku, period) keys).
     if validation_target is not None:
         try:
-            predicted = build_predicted_inventory_df(results["baseline_solution"])
-            cmp = predicted.merge(validation_target, on=["store", "sku", "period"], how="inner")
-            cmp["error"] = cmp["predicted_end_qty"] - cmp["actual_end_qty"]
+            baseline_sol = results["baseline_solution"]
+            forecast_inv = getattr(baseline_sol, "inv_store", {}) or {}
+            realized_inv = getattr(baseline_sol, "realized_inventory_after_lt", None) or {}
+            rows = []
+            for (s, p, t), inv in forecast_inv.items():
+                rows.append({
+                    "store": s, "sku": p, "period": t,
+                    "predicted_end_qty_forecast": float(inv),
+                    "predicted_end_qty_realized": float(realized_inv.get((s, p, t), inv)),
+                })
+            predicted = pd.DataFrame(rows)
+            cmp = predicted.merge(
+                validation_target, on=["store", "sku", "period"], how="inner"
+            )
+            # Keep the legacy `predicted_end_qty` / `error` columns so downstream
+            # reporting (compute_validation_metrics) still works; they mirror the
+            # realized-after-LT trajectory which is what the model claims lands
+            # on shelves.
+            if not cmp.empty:
+                cmp["predicted_end_qty"] = cmp["predicted_end_qty_realized"]
+                cmp["error"] = cmp["predicted_end_qty_realized"] - cmp["actual_end_qty"]
+                cmp["forecast_error"] = cmp["predicted_end_qty_forecast"] - cmp["actual_end_qty"]
             _csv("validation_comparison.csv", cmp)
+            # Diagnostics: where did rows come from / why are they zero?
+            diag = {
+                "rows_validation_target": int(len(validation_target)),
+                "rows_predicted_forecast": int(len(predicted)),
+                "rows_merged": int(len(cmp)),
+                "n_predicted_zero_realized": int((cmp["predicted_end_qty_realized"] == 0).sum()) if not cmp.empty else 0,
+                "n_predicted_zero_forecast": int((cmp["predicted_end_qty_forecast"] == 0).sum()) if not cmp.empty else 0,
+                "mean_actual_end_qty": float(cmp["actual_end_qty"].mean()) if not cmp.empty else float("nan"),
+                "mean_predicted_realized": float(cmp["predicted_end_qty_realized"].mean()) if not cmp.empty else float("nan"),
+                "mean_predicted_forecast": float(cmp["predicted_end_qty_forecast"].mean()) if not cmp.empty else float("nan"),
+                "mean_abs_error_realized": float((cmp["predicted_end_qty_realized"] - cmp["actual_end_qty"]).abs().mean()) if not cmp.empty else float("nan"),
+                "reason": (
+                    "ok" if not cmp.empty
+                    else "empty_merge: validation_target and predicted share no (store, sku, period) keys"
+                ),
+            }
+            diag_path = phase_dir / "validation_diagnostics.json"
+            with open(diag_path, "w", encoding="utf-8") as f:
+                json.dump(diag, f, indent=2, default=str)
+            _put("validation_diagnostics.json", diag_path)
         except Exception as exc:
             print(f"[artifacts/{phase_label}] validation_comparison: {exc}")
+            # Emit an NA-with-reason file so examiners know validation ran and failed,
+            # rather than silently missing.
+            try:
+                diag_path = phase_dir / "validation_diagnostics.json"
+                with open(diag_path, "w", encoding="utf-8") as f:
+                    json.dump({"rows_merged": 0, "reason": f"exception: {exc}"}, f, indent=2)
+                _put("validation_diagnostics.json", diag_path)
+            except Exception:
+                pass
 
     # CG cost curve → charts/ with phase suffix
     try:
@@ -6291,6 +6440,291 @@ def save_phase_artifacts(
         print(f"[artifacts/{phase_label}] cg_cost_curve: {exc}")
 
     return written
+
+
+# ============================================================================
+# THESIS EFFECTIVENESS REPORT + RESULTS/README.md
+# ============================================================================
+
+
+def build_effectiveness_report(
+    results_dir: Path,
+    *,
+    phase_summaries: Optional[List[Dict[str, Any]]] = None,
+    gnn_training_history: Optional[List[Dict[str, Any]]] = None,
+    gnn_training_summary: Optional[Dict[str, Any]] = None,
+    gnn_offline_test_csv: Optional[Path] = None,
+    benchmark_aggregate_csv: Optional[Path] = None,
+    runtime_breakdown: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """Consolidate every 'is this working?' signal into two files examiners
+    actually open first:
+      - thesis_summary/effectiveness_report.csv  (tabular per-stage KPIs)
+      - thesis_summary/effectiveness_report.json (same data, structured)
+      - charts/effectiveness_overview.png        (bar chart)
+
+    Returns a mapping {artifact: relative_path}. Missing inputs are skipped
+    silently — the report degrades gracefully when a pipeline stage wasn't run.
+    """
+    results_dir = Path(results_dir)
+    thesis_dir = results_dir / THESIS_SUMMARY_SUBDIR
+    thesis_dir.mkdir(parents=True, exist_ok=True)
+    charts_dir = results_dir / CHARTS_SUBDIR
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, Any]] = []
+
+    # Offline training (Phase 1) — baseline solver without GNN
+    if phase_summaries:
+        for summary in phase_summaries:
+            rows.append({
+                "stage": summary.get("phase", ""),
+                "metric": "realized_operating_cost_no_lt",
+                "value": summary.get("cost_no_lt_M", float("nan")) * 1e6,
+                "unit": "currency",
+            })
+            rows.append({
+                "stage": summary.get("phase", ""),
+                "metric": "realized_operating_cost_with_lt",
+                "value": summary.get("cost_with_lt_M", float("nan")) * 1e6,
+                "unit": "currency",
+            })
+            rows.append({
+                "stage": summary.get("phase", ""),
+                "metric": "lt_saving",
+                "value": summary.get("lt_saving_M", float("nan")) * 1e6,
+                "unit": "currency",
+            })
+            rows.append({
+                "stage": summary.get("phase", ""),
+                "metric": "runtime_end_to_end",
+                "value": summary.get("runtime_sec", float("nan")),
+                "unit": "seconds",
+            })
+
+    # GNN training (offline) — train/valid best-epoch summary
+    if gnn_training_summary:
+        for key in ("best_epoch", "best_valid_mrr", "best_train_loss",
+                    "best_valid_loss", "final_train_loss", "final_valid_loss"):
+            if key in gnn_training_summary:
+                rows.append({
+                    "stage": "gnn_offline_training",
+                    "metric": key,
+                    "value": gnn_training_summary[key],
+                    "unit": "metric",
+                })
+    if gnn_training_history:
+        last = gnn_training_history[-1]
+        for key in ("train_loss", "valid_loss", "valid_mrr", "epoch"):
+            if key in last:
+                rows.append({
+                    "stage": "gnn_offline_training",
+                    "metric": f"final_{key}",
+                    "value": last[key],
+                    "unit": "metric",
+                })
+
+    # GNN offline held-out test
+    if gnn_offline_test_csv is not None and Path(gnn_offline_test_csv).exists():
+        try:
+            df = pd.read_csv(gnn_offline_test_csv)
+            if not df.empty:
+                group_col = next((c for c in ["mass_threshold", "threshold"] if c in df.columns), None)
+                if group_col:
+                    agg = df.groupby(group_col).mean(numeric_only=True).reset_index()
+                    for _, row in agg.iterrows():
+                        tag = row[group_col]
+                        for metric in ("mrr", "ndcg", "top1_hit", "top3_hit", "adaptive_f1"):
+                            if metric in row:
+                                rows.append({
+                                    "stage": "gnn_offline_test",
+                                    "metric": f"{metric}@{tag}",
+                                    "value": float(row[metric]),
+                                    "unit": "metric",
+                                })
+                else:
+                    for metric in ("mrr", "ndcg", "top1_hit", "top3_hit", "adaptive_f1"):
+                        if metric in df.columns:
+                            rows.append({
+                                "stage": "gnn_offline_test",
+                                "metric": metric,
+                                "value": float(df[metric].mean()),
+                                "unit": "metric",
+                            })
+        except Exception as exc:
+            print(f"[EffectivenessReport] offline test: {exc}")
+
+    # External benchmark on test data — the aggregate mean/std
+    if benchmark_aggregate_csv is not None and Path(benchmark_aggregate_csv).exists():
+        try:
+            df = pd.read_csv(benchmark_aggregate_csv)
+            for _, row in df.iterrows():
+                variant = row.get("variant", "?")
+                for metric in ("realized_cost_with_lt_mean",
+                               "realized_cost_with_lt_std",
+                               "total_runtime_seconds_mean",
+                               "total_runtime_seconds_std",
+                               "columns_generated_mean",
+                               "columns_added_to_rmp_mean",
+                               "cg_iterations_mean"):
+                    if metric in df.columns:
+                        rows.append({
+                            "stage": f"external_benchmark_{variant}",
+                            "metric": metric,
+                            "value": float(row[metric]) if pd.notna(row[metric]) else float("nan"),
+                            "unit": "mean_std" if metric.endswith(("_mean", "_std")) else "metric",
+                        })
+        except Exception as exc:
+            print(f"[EffectivenessReport] benchmark aggregate: {exc}")
+
+    if runtime_breakdown:
+        for label, seconds in runtime_breakdown.items():
+            try:
+                rows.append({
+                    "stage": "runtime_breakdown",
+                    "metric": str(label),
+                    "value": float(seconds),
+                    "unit": "seconds",
+                })
+            except (TypeError, ValueError):
+                continue
+
+    report_df = pd.DataFrame(rows)
+    csv_path = thesis_dir / "effectiveness_report.csv"
+    report_df.to_csv(csv_path, index=False)
+    json_path = thesis_dir / "effectiveness_report.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, default=str)
+
+    out: Dict[str, str] = {
+        "effectiveness_report.csv":  str(csv_path.relative_to(results_dir)),
+        "effectiveness_report.json": str(json_path.relative_to(results_dir)),
+    }
+
+    # Bar chart of a small, examiner-friendly subset.
+    try:
+        _, plt = _mpl_agg()
+        if plt is not None and not report_df.empty:
+            highlights = report_df[report_df["metric"].isin([
+                "realized_operating_cost_with_lt",
+                "realized_cost_with_lt_mean",
+                "runtime_end_to_end",
+                "total_runtime_seconds_mean",
+            ])]
+            if not highlights.empty:
+                plt.figure(figsize=(10, 5))
+                labels = highlights.apply(lambda r: f"{r['stage']}\n{r['metric']}", axis=1)
+                values = pd.to_numeric(highlights["value"], errors="coerce").fillna(0.0)
+                plt.bar(range(len(values)), values.values)
+                plt.xticks(range(len(values)), labels, rotation=30, ha="right", fontsize=7)
+                plt.ylabel("value")
+                plt.title("Pipeline Effectiveness Overview")
+                chart_path = charts_dir / "effectiveness_overview.png"
+                _save_fig(plt, str(chart_path))
+                out["effectiveness_overview.png"] = str(chart_path.relative_to(results_dir))
+    except Exception as exc:
+        print(f"[EffectivenessReport] chart skipped: {exc}")
+
+    print(f"[EffectivenessReport] wrote {csv_path}")
+    return out
+
+
+def write_results_readme(
+    results_dir: Path,
+    *,
+    source_files: Optional[Dict[str, Any]] = None,
+    split_counts: Optional[Dict[str, int]] = None,
+    scenario_counts: Optional[Dict[str, Any]] = None,
+    phase_summaries: Optional[List[Dict[str, Any]]] = None,
+    runtime_breakdown: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Emit Results/README.md documenting where each output lives and how
+    to read the primary reporting files. Always overwrites."""
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    readme = results_dir / "README.md"
+    lines: List[str] = []
+    lines.append("# IRP-LT + BiGAT — Results Layout")
+    lines.append("")
+    lines.append("This folder is the single source of truth for a pipeline run.")
+    lines.append("Each sub-folder corresponds to one pipeline stage. File names inside")
+    lines.append("a folder are short — the folder already tells you which stage/split.")
+    lines.append("")
+    if source_files:
+        lines.append("## Source files")
+        for k, v in source_files.items():
+            lines.append(f"- **{k}**: `{v}`")
+        lines.append("")
+    if split_counts:
+        lines.append("## Graph dataset splits (from `graphs/graph_dataset_summary.json`)")
+        for split, n in split_counts.items():
+            lines.append(f"- **{split}**: {n} samples")
+        lines.append("")
+    if scenario_counts:
+        lines.append("## Teacher scenarios")
+        for k, v in scenario_counts.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+    if phase_summaries:
+        lines.append("## Phase-level headline metrics")
+        for s in phase_summaries:
+            lines.append(
+                f"- **{s.get('phase', '?')}**  "
+                f"cost_no_lt_M={s.get('cost_no_lt_M', 'NA'):.3f}  "
+                f"cost_with_lt_M={s.get('cost_with_lt_M', 'NA'):.3f}  "
+                f"lt_saving_M={s.get('lt_saving_M', 'NA'):.3f}  "
+                f"runtime_sec={s.get('runtime_sec', 'NA'):.1f}"
+            )
+        lines.append("")
+    if runtime_breakdown:
+        lines.append("## Runtime categories (do not mix)")
+        for k, v in runtime_breakdown.items():
+            try:
+                lines.append(f"- **{k}**: {float(v):.2f} s")
+            except (TypeError, ValueError):
+                lines.append(f"- **{k}**: {v}")
+        lines.append("")
+    lines.append("## Directory map")
+    lines.append("")
+    lines.append("| Folder | What it contains | How to read it |")
+    lines.append("|---|---|---|")
+    lines.append("| `scenarios/` | teacher-collection runs (one CG solve per scenario) | `scenarios_manifest.json` lists every scenario; `aggregate_teacher_rows.csv` is the concatenated teacher table |")
+    lines.append("| `teacher/` | canonical teacher CSV feeding GNN graph builder | `teacher_rows.csv` |")
+    lines.append("| `graphs/` | GNN graph dataset split sizes | `graph_dataset_summary.json` |")
+    lines.append("| `gnn/` | BiGAT training artifacts | `training_history.csv`, `training_summary.json` |")
+    lines.append("| `gnn/offline_test/` | Offline held-out GNN ranking metrics | `test_per_sample.csv` (ranking-only, **not** solver runtime) |")
+    lines.append("| `phase1_offline_baseline/` | Phase 1: ALNS + classical CG on training data | `baseline_cost_breakdown.csv`, `realized_cost_breakdown.csv`, `lt_plan.csv`, `validation_comparison.csv`, `validation_diagnostics.json` |")
+    lines.append("| `phase2_online_inference/` | Phase 2: pre-trained GNN scores columns during CG on test data | same file set as phase 1 |")
+    lines.append("| `phase3_online_learning/` | Phase 3 (optional): collects NEW teacher rows on test data + fine-tunes checkpoint | same file set |")
+    lines.append("| `benchmark/` | external A/B/C benchmark on held-out test data | `comparison_per_run.csv` (per repeat), `comparison_aggregate.csv` (mean/std) |")
+    lines.append("| `charts/` | every PNG the pipeline produces | filenames suffix the phase label |")
+    lines.append("| `thesis_summary/` | the files examiners read first | `phase_comparison.csv`, `benchmark_comparison.csv` (aggregate), `effectiveness_report.csv` |")
+    lines.append("| `<phase>/debug/` | LP-relaxed (fractional) copies of every CSV whose main version was integer-rounded | same filenames; diff for audit |")
+    lines.append("")
+    lines.append("## Which file answers which question?")
+    lines.append("")
+    lines.append("| Question | File |")
+    lines.append("|---|---|")
+    lines.append("| Is GNN training converging? | `gnn/training_history.csv` + `charts/gnn_training_loss_*.png` |")
+    lines.append("| How well does GNN rank columns on held-out graphs? | `gnn/offline_test/test_per_sample.csv` (MRR, NDCG, top-k, adaptive-F1) |")
+    lines.append("| Does GNN-guided CG improve cost vs classical CG on test data? | `benchmark/comparison_aggregate.csv` (mean/std over repeats) |")
+    lines.append("| How much runtime do we pay for GNN guidance? | `benchmark/comparison_aggregate.csv` → `total_runtime_seconds_{mean,std}` |")
+    lines.append("| Does Phase 2 (GNN embedded) match actual inventory? | `phase2_online_inference/validation_comparison.csv` + `validation_diagnostics.json` |")
+    lines.append("| Final A/B/C end-to-end comparison | `thesis_summary/benchmark_comparison.csv` (aggregate of per-run) |")
+    lines.append("| Single examiner-readable scoreboard | `thesis_summary/effectiveness_report.csv` |")
+    lines.append("")
+    lines.append("## Runtime reporting — three categories, never mixed")
+    lines.append("")
+    lines.append("1. **Offline GNN test runtime** — model forward-pass only, no solver. Reported by `GNN/04_test.py` and saved as `gnn/offline_test/test_runtime_seconds.json`.")
+    lines.append("2. **External online inference runtime** — end-to-end Phase 2 solve on test data with GNN embedded in CG. Reported under `phase2_online_inference/` efficiency metrics and in `thesis_summary/runtime_breakdown.json`.")
+    lines.append("3. **External A/B/C benchmark runtime** — wall-clock of each variant's end-to-end solve on the test data. Reported in `benchmark/comparison_per_run.csv` (`total_runtime_seconds`) and aggregated in `benchmark/comparison_aggregate.csv`.")
+    lines.append("")
+    lines.append("## Integer vs LP-relaxed outputs")
+    lines.append("")
+    lines.append("Primary CSVs (`lt_plan.csv`, `validation_comparison.csv`, etc.) show **integer** quantities for shipment, inventory, shortage, demand. The fractional LP-relaxed copies are preserved under `<phase>/debug/` so examiners can audit the relaxation gap. Set `IRP_INTEGER_FINAL_OUTPUTS=0` to disable rounding.")
+    lines.append("")
+    readme.write_text("\n".join(lines))
+    print(f"[README] wrote {readme}")
+    return readme
 
 
 def run_three_way_benchmark(
@@ -6309,103 +6743,173 @@ def run_three_way_benchmark(
     lt_activation_threshold: float,
     heuristic_top_k: int = 20,
     enforce_integer_flows: bool = False,
+    n_repeats: int = 3,
+    results_dir: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Run Classical CG, Heuristic Ranking CG, and GNN-Guided CG on the same data.
 
-    Writes Results/benchmark/comparison.csv and returns the DataFrame.
-    Each variant reuses the same `data` object so the comparison is apples-to-apples.
+    Each variant runs `n_repeats` times with a different demand-shock seed per
+    repeat (derived deterministically from the base seed). Outputs:
+      - <results_dir>/benchmark/comparison_per_run.csv  (one row per (variant, repeat))
+      - <results_dir>/benchmark/comparison_aggregate.csv  (mean/std per variant)
+      - <results_dir>/thesis_summary/benchmark_comparison.csv  (the aggregate, for reporting)
+      - <results_dir>/benchmark/variant_<name>_summary.json     (one per variant)
+    Returns the per-run DataFrame.
+    CG stopping mode is forced to "convergence" so each variant stops only when
+    no negative reduced-cost column can be priced — a fixed iteration budget
+    would bias runtime comparisons.
     """
-    variants: List[Tuple[str, Dict[str, Any]]] = [
-        ("A_classical_cg",  {"use_gnn": False, "collect_teacher_mode": False,
-                              "runtime_gnn_mode": False, "heuristic_top_k_mode": False}),
-        ("B_heuristic_cg",  {"use_gnn": False, "collect_teacher_mode": False,
-                              "runtime_gnn_mode": False, "heuristic_top_k_mode": True,
-                              "heuristic_top_k": heuristic_top_k}),
-        ("C_gnn_guided_cg", {"use_gnn": True,  "collect_teacher_mode": False,
-                              "runtime_gnn_mode": True,  "heuristic_top_k_mode": False}),
-    ]
-    rows: List[Dict[str, Any]] = []
-    for variant_name, variant_kwargs in variants:
-        print("\n" + "#" * 80)
-        print(f"# BENCHMARK VARIANT: {variant_name}")
-        print("#" * 80)
-        t0 = time.perf_counter()
-        try:
-            variant_results = IRPResearchPipeline(data).run(
-                use_random_initial_patterns=True,
-                n_initial_patterns_per_product_period=5,
-                cg_iterations=cg_iterations,
-                msg=False,
-                time_limit=time_limit,
-                enforce_integer_flows=enforce_integer_flows,
-                gnn_checkpoint=gnn_checkpoint_path,
-                use_classical_fallback=False,
-                gnn_mass_threshold=0.55,
-                gnn_max_keep=150,
-                gnn_max_keep_fraction=0.30,
-                use_branch_and_price=True,
-                bp_max_nodes=bp_max_nodes,
-                bp_max_depth=bp_max_depth,
-                lt_activation_threshold=lt_activation_threshold,
-                demand_shock_probability=demand_shock_probability,
-                demand_shock_reallocation_fraction=demand_shock_reallocation_fraction,
-                demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
-                demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
-                demand_shock_seed=demand_shock_seed,
-                **variant_kwargs,
-            )
-        except Exception as exc:
-            # Surface the failure instead of silently dropping the run.
-            print(f"[Benchmark] Variant {variant_name} FAILED: {exc}")
-            rows.append({
-                "variant": variant_name, "run_label": variant_name,
-                "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
-                "seed": demand_shock_seed,
-                "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
-                "rmp_objective": float("nan"),
-                "realized_cost_no_lt": float("nan"), "realized_cost_with_lt": float("nan"),
-                "lt_cost_with_lt": float("nan"), "shortage_cost_with_lt": float("nan"),
-                "cg_iterations": 0, "total_runtime_seconds": time.perf_counter() - t0,
-                "columns_generated": 0, "columns_added_to_rmp": 0,
-                "column_pool_utilization": 0.0, "error": str(exc),
-                "stopping_reason": "failed",
-            })
-            continue
-        runtime = time.perf_counter() - t0
-        run_context = {
-            "run_label": variant_name,
-            "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
-            "dataset_id": getattr(data, "dataset_id", "") or "",
-            "scenario_id": str(demand_shock_seed),
-            "seed": demand_shock_seed,
-            "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
-            "fine_tune_runtime_seconds": 0.0,
-        }
-        row = _collect_benchmark_metrics(variant_name, variant_results, runtime, run_context=run_context)
-        rows.append(row)
-        print(f"[Benchmark] {variant_name}: obj={row['rmp_objective']:.2f} "
-              f"cost_with_lt={row['realized_cost_with_lt']:.2f} runtime={runtime:.1f}s")
+    if results_dir is None:
+        results_dir = Path(RESULTS_DIR)
+    results_dir = Path(results_dir)
+    # Force convergence-based CG termination for the entire benchmark so no
+    # variant is artificially clipped by max_iter. Restore on exit.
+    _prior_stop_mode = os.environ.get("IRP_CG_STOPPING_MODE")
+    os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
+    try:
+        variants: List[Tuple[str, Dict[str, Any]]] = [
+            ("A_classical_cg",  {"use_gnn": False, "collect_teacher_mode": False,
+                                  "runtime_gnn_mode": False, "heuristic_top_k_mode": False}),
+            ("B_heuristic_cg",  {"use_gnn": False, "collect_teacher_mode": False,
+                                  "runtime_gnn_mode": False, "heuristic_top_k_mode": True,
+                                  "heuristic_top_k": heuristic_top_k}),
+            ("C_gnn_guided_cg", {"use_gnn": True,  "collect_teacher_mode": False,
+                                  "runtime_gnn_mode": True,  "heuristic_top_k_mode": False}),
+        ]
+        # Same seed sequence is reused across variants so variant differences
+        # aren't confounded by different demand realizations.
+        n_repeats = max(1, int(n_repeats))
+        seeds = [int(demand_shock_seed) + 10007 * r for r in range(n_repeats)]
+        print(f"\n[Benchmark] {len(variants)} variants × {n_repeats} repeats — "
+              f"seeds={seeds}  stopping_mode=convergence")
+        rows: List[Dict[str, Any]] = []
+        for variant_name, variant_kwargs in variants:
+            for repeat_idx, seed in enumerate(seeds):
+                run_label = f"{variant_name}__repeat{repeat_idx + 1}"
+                print("\n" + "#" * 80)
+                print(f"# BENCHMARK VARIANT: {variant_name}  repeat {repeat_idx + 1}/{n_repeats}  seed={seed}")
+                print("#" * 80)
+                t0 = time.perf_counter()
+                try:
+                    variant_results = IRPResearchPipeline(data).run(
+                        use_random_initial_patterns=True,
+                        n_initial_patterns_per_product_period=5,
+                        cg_iterations=cg_iterations,
+                        msg=False,
+                        time_limit=time_limit,
+                        enforce_integer_flows=enforce_integer_flows,
+                        gnn_checkpoint=gnn_checkpoint_path,
+                        use_classical_fallback=False,
+                        gnn_mass_threshold=0.55,
+                        gnn_max_keep=150,
+                        gnn_max_keep_fraction=0.30,
+                        use_branch_and_price=True,
+                        bp_max_nodes=bp_max_nodes,
+                        bp_max_depth=bp_max_depth,
+                        lt_activation_threshold=lt_activation_threshold,
+                        demand_shock_probability=demand_shock_probability,
+                        demand_shock_reallocation_fraction=demand_shock_reallocation_fraction,
+                        demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+                        demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
+                        demand_shock_seed=seed,
+                        **variant_kwargs,
+                    )
+                except Exception as exc:
+                    print(f"[Benchmark] Variant {run_label} FAILED: {exc}")
+                    rows.append({
+                        "variant": variant_name, "run_label": run_label,
+                        "repeat": repeat_idx + 1,
+                        "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
+                        "seed": seed,
+                        "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
+                        "rmp_objective": float("nan"),
+                        "realized_cost_no_lt": float("nan"), "realized_cost_with_lt": float("nan"),
+                        "lt_cost_with_lt": float("nan"), "shortage_cost_with_lt": float("nan"),
+                        "cg_iterations": 0, "total_runtime_seconds": time.perf_counter() - t0,
+                        "columns_generated": 0, "columns_added_to_rmp": 0,
+                        "column_pool_utilization": 0.0, "error": str(exc),
+                        "stopping_reason": "failed",
+                    })
+                    continue
+                runtime = time.perf_counter() - t0
+                run_context = {
+                    "run_label": run_label,
+                    "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
+                    "dataset_id": getattr(data, "dataset_id", "") or "",
+                    "scenario_id": str(seed),
+                    "seed": seed,
+                    "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
+                    "fine_tune_runtime_seconds": 0.0,
+                }
+                row = _collect_benchmark_metrics(variant_name, variant_results, runtime, run_context=run_context)
+                row["repeat"] = repeat_idx + 1
+                rows.append(row)
+                print(f"[Benchmark] {run_label}: obj={row['rmp_objective']:.2f} "
+                      f"cost_with_lt={row['realized_cost_with_lt']:.2f} runtime={runtime:.1f}s "
+                      f"cols_gen={row['columns_generated']} cols_added={row['columns_added_to_rmp']}")
 
-    df = pd.DataFrame(rows)
-    benchmark_dir = Path(RESULTS_DIR) / BENCHMARK_SUBDIR
-    benchmark_dir.mkdir(parents=True, exist_ok=True)
-    out_path = benchmark_dir / "comparison.csv"
-    df.to_csv(out_path, index=False)
-    # Mirror into thesis_summary/ for reporting convenience
-    thesis_dir = Path(RESULTS_DIR) / THESIS_SUMMARY_SUBDIR
-    thesis_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(thesis_dir / "benchmark_comparison.csv", index=False)
-    # Per-variant JSON summaries for quick inspection
-    for row in rows:
-        variant = str(row.get("variant") or row.get("run_label") or "unknown")
-        with open(benchmark_dir / f"variant_{variant}_summary.json", "w", encoding="utf-8") as f:
-            json.dump(row, f, indent=2, default=str)
-    print("\n" + "=" * 80)
-    print("BENCHMARK COMPARISON SUMMARY")
-    print("=" * 80)
-    print(df.to_string(index=False))
-    print(f"\nSaved benchmark comparison to: {out_path}")
-    return df
+        per_run_df = pd.DataFrame(rows)
+        benchmark_dir = results_dir / BENCHMARK_SUBDIR
+        benchmark_dir.mkdir(parents=True, exist_ok=True)
+        per_run_path = benchmark_dir / "comparison_per_run.csv"
+        per_run_df.to_csv(per_run_path, index=False)
+
+        # Aggregate: mean + std per variant for numeric columns.
+        numeric_cols = [
+            "rmp_objective", "realized_cost_no_lt", "realized_cost_with_lt",
+            "lt_cost_with_lt", "shortage_cost_with_lt",
+            "cg_iterations", "total_runtime_seconds",
+            "phase1_baseline_runtime_seconds", "phase2_cg_runtime_seconds",
+            "gnn_inference_runtime_seconds",
+            "columns_generated", "columns_selected_by_gnn", "columns_added_to_rmp",
+            "column_pool_utilization", "gnn_scoring_failures",
+        ]
+        numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
+        agg_rows: List[Dict[str, Any]] = []
+        for variant_name, grp in per_run_df.groupby("variant"):
+            row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
+            for c in numeric_cols:
+                numeric = pd.to_numeric(grp[c], errors="coerce")
+                row[f"{c}_mean"] = float(numeric.mean())
+                row[f"{c}_std"]  = float(numeric.std(ddof=0)) if len(numeric) else float("nan")
+                row[f"{c}_min"]  = float(numeric.min()) if len(numeric) else float("nan")
+                row[f"{c}_max"]  = float(numeric.max()) if len(numeric) else float("nan")
+            agg_rows.append(row)
+        aggregate_df = pd.DataFrame(agg_rows)
+        aggregate_path = benchmark_dir / "comparison_aggregate.csv"
+        aggregate_df.to_csv(aggregate_path, index=False)
+
+        # Also keep the legacy filename so existing readers don't break.
+        per_run_df.to_csv(benchmark_dir / "comparison.csv", index=False)
+
+        thesis_dir = results_dir / THESIS_SUMMARY_SUBDIR
+        thesis_dir.mkdir(parents=True, exist_ok=True)
+        aggregate_df.to_csv(thesis_dir / "benchmark_comparison.csv", index=False)
+
+        # Per-variant JSON summaries for quick inspection
+        for variant_name, grp in per_run_df.groupby("variant"):
+            summary = {
+                "variant": variant_name,
+                "n_repeats": int(len(grp)),
+                "runs": grp.to_dict(orient="records"),
+            }
+            with open(benchmark_dir / f"variant_{variant_name}_summary.json", "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2, default=str)
+
+        print("\n" + "=" * 80)
+        print("BENCHMARK COMPARISON SUMMARY (per-run)")
+        print("=" * 80)
+        print(per_run_df.to_string(index=False))
+        print("\n[Aggregate]")
+        print(aggregate_df.to_string(index=False))
+        print(f"\nSaved per-run comparison to : {per_run_path}")
+        print(f"Saved aggregate comparison to: {aggregate_path}")
+        return per_run_df
+    finally:
+        if _prior_stop_mode is None:
+            os.environ.pop("IRP_CG_STOPPING_MODE", None)
+        else:
+            os.environ["IRP_CG_STOPPING_MODE"] = _prior_stop_mode
 
 
 # ============================================================================

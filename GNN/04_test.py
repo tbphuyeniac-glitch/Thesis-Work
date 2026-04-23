@@ -50,8 +50,10 @@ def ranking_metrics(logits: torch.Tensor, labels: torch.Tensor):
 
 def evaluate(model, samples, device: str, mass_thresholds):
     rows = []
+    forward_times: list[float] = []
     for sample_id, sample in enumerate(samples):
         graph = {key: value.to(device) for key, value in sample.items()}
+        _fwd_start = time.perf_counter()
         with torch.no_grad():
             logits = model(
                 graph["column_features"],
@@ -59,6 +61,7 @@ def evaluate(model, samples, device: str, mass_thresholds):
                 graph["edge_index_col_to_con"],
                 graph["edge_attr_col_to_con"],
             )
+        forward_times.append(time.perf_counter() - _fwd_start)
         labels = graph.get("labels_binary", graph["labels"]).detach().cpu()
         logits_cpu = logits.detach().cpu()
         probs = torch.sigmoid(logits_cpu)
@@ -92,7 +95,7 @@ def evaluate(model, samples, device: str, mass_thresholds):
             row["adaptive_zero_selected"] = float(info["adaptive_k"] == 0)
             row["sample_id"] = sample_id
             rows.append(row)
-    return rows
+    return rows, forward_times
 
 
 def main() -> None:
@@ -112,7 +115,9 @@ def main() -> None:
         raise RuntimeError(f"No {args.split} samples found under {args.data_dir}")
     samples = apply_stats(samples, checkpoint["normalization"])
     mass_thresholds = [args.mass_threshold] if args.mass_threshold is not None else args.mass_thresholds
-    rows = evaluate(model, samples, args.device, mass_thresholds=mass_thresholds)
+    _eval_start = time.perf_counter()
+    rows, forward_times = evaluate(model, samples, args.device, mass_thresholds=mass_thresholds)
+    total_eval_seconds = time.perf_counter() - _eval_start
 
     summaries = []
     for threshold in sorted({row["mass_threshold"] for row in rows}):
@@ -150,6 +155,25 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"Saved per-sample metrics to {out_path}")
+
+    runtime_path = out_path.parent / "test_runtime_seconds.json"
+    total_forward = float(sum(forward_times))
+    runtime_payload = {
+        "runtime_category": "offline_gnn_test",
+        "description": "Model forward-pass runtime on held-out graph split. Does NOT include solver runtime; see thesis_summary/runtime_breakdown.json for end-to-end categories.",
+        "n_samples": len(samples),
+        "mass_thresholds": list(mass_thresholds),
+        "forward_pass_seconds_total": total_forward,
+        "forward_pass_seconds_mean": total_forward / max(len(forward_times), 1),
+        "forward_pass_seconds_min": float(min(forward_times)) if forward_times else 0.0,
+        "forward_pass_seconds_max": float(max(forward_times)) if forward_times else 0.0,
+        "evaluate_function_seconds": float(total_eval_seconds),
+        "device": args.device,
+    }
+    with open(runtime_path, "w", encoding="utf-8") as f:
+        import json as _json
+        _json.dump(runtime_payload, f, indent=2)
+    print(f"Saved offline-GNN-test runtime to {runtime_path}")
 
 
 if __name__ == "__main__":
