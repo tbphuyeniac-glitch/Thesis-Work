@@ -57,8 +57,18 @@ END_DATE:    Optional[str] = None
 CG_ITERATIONS    = 20
 BP_MAX_NODES     = 15
 BP_MAX_DEPTH     = 6
-GNN_TRAIN_EPOCHS = 500
+# First-run recommendation: 60–100 epochs to validate the pipeline end-to-end
+# without burning Kaggle GPU quota.  Bump to 500 only after Phase 1 + Phase 2
+# produce sensible numbers.
+GNN_TRAIN_EPOCHS = 80
 LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
+
+# ── Time limits ──────────────────────────────────────────
+# Per-phase CG solver time limit (seconds). None = unlimited (use for final runs).
+# Kaggle T4 / P100: 600–900 s is a reasonable guard for Phase 1 & 2 first runs.
+PHASE_TIME_LIMIT: Optional[int] = 600   # seconds; set None for unlimited
+# Benchmark gets its own limit — 3 variants × PHASE_TIME_LIMIT can be long.
+BENCHMARK_TIME_LIMIT: Optional[int] = 300  # seconds per benchmark variant
 
 # ── Teacher / scenario generation ────────────────────────
 # Set MULTI_SCENARIO_MODE=True to run generate_teacher_scenarios.py for
@@ -76,13 +86,16 @@ BASE_SPECS = [
     "base_c:8:4",
     "base_d:5:2",
 ]
-TEACHER_SCENARIO_OUT_DIR = "Results/scenarios"
+TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 
 # ── Optional stages ───────────────────────────────────────
+# First run: keep RUN_BENCHMARK=False until Phase 1 + Phase 2 look correct.
+# Benchmark runs 3 CG variants on the same data — adds significant wall-clock
+# time and can hit Kaggle's 9-hour session limit if CG_ITERATIONS is high.
 RUN_PHASE_2          = True
 RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
-RUN_BENCHMARK        = True
+RUN_BENCHMARK        = False    # set True only after Phase 1 + Phase 2 validated
 HEURISTIC_TOP_K      = 20
 DEMAND_SHOCK_SEED    = 42
 
@@ -322,7 +335,7 @@ def run_phase(irp: Any, data: Any, *, use_gnn: bool, collect_teacher: bool,
         n_initial_patterns_per_product_period=10,
         cg_iterations=CG_ITERATIONS,
         msg=False,
-        time_limit=None,
+        time_limit=PHASE_TIME_LIMIT,
         enforce_integer_flows=False,
         cw_dispatch_cycle=5,
         use_gnn=use_gnn,
@@ -363,6 +376,9 @@ require_path(TEST_DATA_PATH,  "TEST_DATA_PATH")
 require_path(DIST_PATH,       "DIST_PATH", fatal=False)
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# Propagate to all subprocesses (scenario generator, GNN trainer, graph
+# builder, offline tester) so they write into the canonical RESULTS_DIR.
+os.environ["IRP_RESULTS_DIR"] = str(RESULTS_DIR)
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -421,7 +437,7 @@ if MULTI_SCENARIO_MODE:
         print(f"[WARNING] Scenario generator exited with code {r.returncode}. "
               "Some scenarios may have failed — continuing with collected rows.")
 
-    agg_csv = REPO_ROOT / TEACHER_SCENARIO_OUT_DIR / "aggregate_teacher_rows.csv"
+    agg_csv = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
     if not agg_csv.exists() or agg_csv.stat().st_size < 100:
         raise RuntimeError(
             f"Scenario generation produced no aggregate CSV at {agg_csv}. "
@@ -446,7 +462,7 @@ if MULTI_SCENARIO_MODE:
     print(f"  teacher CSV       : {teacher_csv_path}")
 
     # Manifest summary
-    manifest_path = REPO_ROOT / TEACHER_SCENARIO_OUT_DIR / "scenarios_manifest.json"
+    manifest_path = Path(TEACHER_SCENARIO_OUT_DIR) / "scenarios_manifest.json"
     if manifest_path.exists():
         with open(manifest_path) as f:
             manifest = json.load(f)
@@ -701,7 +717,7 @@ if RUN_BENCHMARK:
     benchmark_df = irp.run_three_way_benchmark(
         data=bm_data,
         cg_iterations=CG_ITERATIONS,
-        time_limit=None,
+        time_limit=BENCHMARK_TIME_LIMIT,
         bp_max_nodes=BP_MAX_NODES,
         bp_max_depth=BP_MAX_DEPTH,
         gnn_checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
