@@ -42,7 +42,7 @@ Environment variables read by __main__ (all optional, all have defaults)
 - IRP_STORE_INIT_MULTIPLIER, IRP_CLEAN_RESULTS
 - IRP_LT_COST_MULTIPLIER                 : sensitivity multiplier on transship_unit_cost
 - IRP_ENFORCE_INTEGER                    : force integer delivery + inventory + LT flows
-- IRP_RUN_BENCHMARK                      : run 3-way Classical/Heuristic/GNN benchmark and exit
+- IRP_RUN_BENCHMARK                      : run A0/A/B/C benchmark and exit
 - IRP_HEURISTIC_TOP_K                    : top-k cut-off for heuristic variant B
 - IRP_ONLINE_INFERENCE                   : set to 1 to run Stage 2 — loads "test data.csv" + pre-trained GNN, no retraining
 - IRP_ONLINE_LEARNING                    : set to 1 (alongside IRP_ONLINE_INFERENCE=1) to enable solver-supervised online
@@ -232,7 +232,7 @@ RESULTS_DIR = Path(os.environ.get("IRP_RESULTS_DIR") or Path(__file__).resolve()
 #       phase1_offline_baseline/   — Phase 1 = teacher-collection / classical CG
 #       phase2_online_inference/   — Phase 2 = pre-trained GNN scoring during CG
 #       phase3_online_learning/    — Phase 3 = fine-tune + inference
-#       benchmark/                 — 3-way classical / heuristic / GNN comparison
+#       benchmark/                 — A0/A/B/C benchmark comparison outputs
 #       thesis_summary/            — headline tables for reporting
 #       charts/                    — all PNGs in one place, phase-suffixed
 #
@@ -249,6 +249,12 @@ GNN_SUBDIR             = "gnn"
 BENCHMARK_SUBDIR       = "benchmark"
 CHARTS_SUBDIR          = "charts"
 THESIS_SUMMARY_SUBDIR  = "thesis_summary"
+BENCHMARK_VARIANT_ORDER = [
+    "A0_cg_full_exact",
+    "A_classical_cg",
+    "B_heuristic_cg",
+    "C_gnn_guided_cg",
+]
 
 _KNOWN_PHASE_LABELS = (
     "phase1_offline_baseline",
@@ -2864,6 +2870,7 @@ class LateralTransshipmentCG:
         diagnostic_verbosity: str = "summary",
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
+        exact_full_mode: bool = False,
         source_instance: Optional[str] = None,
     ):
         self.data = data
@@ -2927,6 +2934,16 @@ class LateralTransshipmentCG:
         # before they enter RMP. Active only when use_gnn=False and collect_teacher_mode=False.
         self.heuristic_top_k_mode = bool(heuristic_top_k_mode)
         self.heuristic_top_k = max(1, int(heuristic_top_k))
+        # Run-A0 (benchmark) — exact CG pricing via one Gurobi MIP per active
+        # (product, period), with no feature pruning, Stackelberg game, GNN, or
+        # top-k ranking anywhere in the path.
+        self.exact_full_mode = bool(exact_full_mode)
+        if self.exact_full_mode:
+            # Exact mode overrides all heuristic filters unconditionally.
+            self.collect_teacher_mode = False
+            self.runtime_gnn_mode = False
+            self.use_gnn = False
+            self.heuristic_top_k_mode = False
         self._gnn_loaded = False
         self._gnn_unavailable_reason: Optional[str] = None
         self._gnn_model = None
@@ -3529,7 +3546,7 @@ class LateralTransshipmentCG:
                 )
             return selected
         except Exception as exc:
-            # Track scoring failures so the 3-way benchmark can detect when Run C
+            # Track scoring failures so the benchmark can detect when Run C
             # silently degraded to the all-patterns fallback (was previously a
             # blind passthrough with no accounting).
             self._gnn_scoring_failures = int(getattr(self, "_gnn_scoring_failures", 0)) + 1
@@ -4243,6 +4260,180 @@ class LateralTransshipmentCG:
                     })
         return new_patterns
 
+    def _solve_exact_pricing_subproblem(
+        self,
+        p: Product,
+        t: Period,
+        need: Dict[Tuple[Store, Product, Period], float],
+        surplus: Dict[Tuple[Store, Product, Period], float],
+        dual_need: Dict[Tuple[Store, Product, Period], float],
+        dual_surplus: Dict[Tuple[Store, Product, Period], float],
+        rc_tol: float,
+        episode: int,
+    ) -> List[LTPattern]:
+        """Exact CG pricing subproblem solved by Gurobi for one (product, period).
+
+        Enumerates all donor-receiver pairs with strictly positive movable qty
+        and solves the MIP
+
+            min  sum_{i,j} [f_ij * y_ij + (c_ij - dual_need_j - dual_surplus_i) * q_ij]
+            s.t. sum_j q_ij <= surplus_i                      (donor capacity)
+                 sum_i q_ij <= need_j                         (receiver capacity)
+                 q_ij <= min(surplus_i, need_j) * y_ij        (fixed-charge activation)
+                 sum_{i,j} y_ij <= max_pairs_per_pattern      (pattern shape cap)
+                 y_ij in {0,1}, q_ij >= 0
+
+        The objective is the reduced cost of the resulting column. Returns the
+        single exact optimal column when its reduced cost is strictly below
+        `rc_tol`. NO heuristic filter (pruning / Stackelberg / GNN / top-k) is
+        applied anywhere in this path — that is the whole point of the A0
+        "CG_full_exact" benchmark.
+        """
+        d = self.data
+        donors = [s for s in d.stores if float(surplus.get((s, p, t), 0.0)) > 1e-9]
+        receivers = [s for s in d.stores if float(need.get((s, p, t), 0.0)) > 1e-9]
+        pairs = [(i, j) for i in donors for j in receivers if i != j]
+        if not pairs:
+            return []
+
+        mdl = gp.Model(f"ExactPricing_{p}_T{t}", env=get_gurobi_env())
+        mdl.Params.OutputFlag = 0
+
+        q = mdl.addVars(pairs, lb=0.0, vtype=GRB.CONTINUOUS, name="q")
+        y = mdl.addVars(pairs, lb=0.0, ub=1.0, vtype=GRB.BINARY, name="y")
+
+        for (i, j) in pairs:
+            qty_cap = min(float(surplus[(i, p, t)]), float(need[(j, p, t)]))
+            if qty_cap <= 1e-9:
+                # Should not happen (filtered above), but keep safe.
+                mdl.addConstr(q[(i, j)] == 0.0)
+                mdl.addConstr(y[(i, j)] == 0.0)
+                continue
+            mdl.addConstr(q[(i, j)] <= qty_cap * y[(i, j)])
+
+        for i in donors:
+            outgoing = [(i, j) for (ii, j) in pairs if ii == i]
+            if outgoing:
+                mdl.addConstr(
+                    gp.quicksum(q[key] for key in outgoing) <= float(surplus[(i, p, t)])
+                )
+        for j in receivers:
+            incoming = [(i, j) for (i, jj) in pairs if jj == j]
+            if incoming:
+                mdl.addConstr(
+                    gp.quicksum(q[key] for key in incoming) <= float(need[(j, p, t)])
+                )
+
+        if self.max_pairs_per_pattern > 0:
+            mdl.addConstr(
+                gp.quicksum(y[key] for key in pairs) <= int(self.max_pairs_per_pattern)
+            )
+
+        mdl.setObjective(
+            gp.quicksum(
+                float(d.fixed_dispatch_lt[(i, j)]) * y[(i, j)]
+                + (
+                    float(d.ship_cost_lt[(i, j, p)])
+                    - float(dual_need.get((j, p, t), 0.0))
+                    - float(dual_surplus.get((i, p, t), 0.0))
+                ) * q[(i, j)]
+                for (i, j) in pairs
+            ),
+            GRB.MINIMIZE,
+        )
+
+        mdl.optimize()
+
+        if mdl.Status != GRB.OPTIMAL or mdl.SolCount == 0:
+            return []
+
+        sol_obj = float(mdl.ObjVal)
+        if sol_obj >= rc_tol:
+            return []
+        flows: Dict[Tuple[Store, Store], float] = {}
+        pattern_cost = 0.0
+        for (i, j) in pairs:
+            q_val = float(q[(i, j)].X)
+            y_val = float(y[(i, j)].X)
+            if q_val > 1e-9 and y_val > 0.5:
+                flows[(i, j)] = q_val
+                pattern_cost += float(d.fixed_dispatch_lt[(i, j)]) + float(
+                    d.ship_cost_lt[(i, j, p)]
+                ) * q_val
+        if not flows:
+            return []
+        return [
+            LTPattern(
+                pattern_id=f"EXACT_E{episode}_{p}_T{t}",
+                period=t,
+                product=p,
+                pattern_flows=flows,
+                column_cost=round(pattern_cost, 6),
+                metadata={
+                    "source": "exact_pricing_gurobi",
+                    "reduced_cost": round(sol_obj, 6),
+                    "pruning_used": False,
+                    "stackelberg_used": False,
+                    "gnn_used": False,
+                    "heuristic_top_k_used": False,
+                    "feature_name": "exact_full",
+                },
+            )
+        ]
+
+    def _candidate_patterns_exact_full(
+        self,
+        need,
+        surplus,
+        active_product_periods: Set[Tuple[Product, Period]],
+        dual_need: Dict[Tuple[Store, Product, Period], float],
+        dual_surplus: Dict[Tuple[Store, Product, Period], float],
+        rc_tol: float,
+        episode: int,
+    ) -> List[LTPattern]:
+        """Generate A0 benchmark candidates via exact Gurobi pricing only.
+
+        One exact pricing MIP is solved per active (product, period). No
+        pruning, Stackelberg game, GNN filtering, or top-k ranking is applied.
+        """
+        new_patterns: List[LTPattern] = []
+        pairs_enumerated = 0
+        subproblems_with_negative_rc = 0
+        for p, t in sorted(active_product_periods):
+            donors = [s for s in self.data.stores if float(surplus.get((s, p, t), 0.0)) > 1e-9]
+            receivers = [s for s in self.data.stores if float(need.get((s, p, t), 0.0)) > 1e-9]
+            pairs_enumerated += sum(1 for i in donors for j in receivers if i != j)
+            priced = self._solve_exact_pricing_subproblem(
+                p=p,
+                t=t,
+                need=need,
+                surplus=surplus,
+                dual_need=dual_need,
+                dual_surplus=dual_surplus,
+                rc_tol=rc_tol,
+                episode=episode,
+            )
+            if priced:
+                subproblems_with_negative_rc += 1
+            new_patterns.extend(priced)
+        patterns_built_before_dedup = len(new_patterns)
+        new_patterns = self._deduplicate_priced_patterns(new_patterns, episode=episode)
+        self._last_pricing_summary = {
+            "candidate_pairs_before_pruning": pairs_enumerated,
+            "pairs_after_pruning": pairs_enumerated,  # no pruning in exact mode
+            "pairs_accepted_stackelberg": 0,
+            "pairs_recovered_stackelberg_fallback": 0,
+            "patterns_built_before_dedup": patterns_built_before_dedup,
+            "patterns_deduplicated_before_gnn": patterns_built_before_dedup - len(new_patterns),
+            "patterns_removed_by_product_period_cap": 0,
+            "patterns_built_before_gnn": len(new_patterns),
+            "max_columns_per_product_period": self.max_columns_per_product_period,
+            "exact_full_mode": True,
+            "exact_subproblems_with_negative_rc": subproblems_with_negative_rc,
+            "exact_subproblems_solved": len(active_product_periods),
+        }
+        return new_patterns
+
     def _candidate_patterns_from_duals(
         self,
         need,
@@ -4451,6 +4642,22 @@ class LateralTransshipmentCG:
     def pricing_step(self, master_solution: CGSolution, rc_tol: float = -1e-6) -> List[LTPattern]:
         need, surplus = self._build_need_and_surplus_proxies(master_solution=master_solution)
         active_product_periods = self._compute_active_product_periods(need, surplus)
+        if self.exact_full_mode:
+            # A0 benchmark: exact Gurobi pricing, no pruning / Stackelberg / GNN / top-k.
+            selected_patterns = self._candidate_patterns_exact_full(
+                need=need,
+                surplus=surplus,
+                active_product_periods=active_product_periods,
+                dual_need=master_solution.dual_need,
+                dual_surplus=master_solution.dual_surplus,
+                rc_tol=rc_tol,
+                episode=self.current_episode,
+            )
+            self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
+            self._last_pricing_summary["patterns_kept_after_gnn"] = len(selected_patterns)
+            self._last_pricing_summary["collect_teacher_mode"] = False
+            self._last_pricing_summary["runtime_gnn_mode"] = False
+            return selected_patterns
         new_patterns = self._candidate_patterns_from_duals(
             need=need,
             surplus=surplus,
@@ -6019,6 +6226,7 @@ class IRPResearchPipeline:
         diagnostic_verbosity: str = "summary",
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
+        exact_full_mode: bool = False,
     ) -> Dict:
         pipeline_started_at = time.perf_counter()
         print("=" * 80)
@@ -6151,6 +6359,7 @@ class IRPResearchPipeline:
             diagnostic_verbosity=diagnostic_verbosity,
             heuristic_top_k_mode=heuristic_top_k_mode,
             heuristic_top_k=heuristic_top_k,
+            exact_full_mode=exact_full_mode,
         )
         if use_branch_and_price:
             cg_sol = cg_engine.run_branch_and_price(
@@ -6701,6 +6910,13 @@ def build_effectiveness_report(
     if benchmark_aggregate_csv is not None and Path(benchmark_aggregate_csv).exists():
         try:
             df = pd.read_csv(benchmark_aggregate_csv)
+            if "variant" in df.columns:
+                df["variant"] = pd.Categorical(
+                    df["variant"],
+                    categories=BENCHMARK_VARIANT_ORDER,
+                    ordered=True,
+                )
+                df = df.sort_values("variant").reset_index(drop=True)
             for _, row in df.iterrows():
                 variant = row.get("variant", "?")
                 for metric in ("realized_cost_with_lt_mean",
@@ -6765,6 +6981,45 @@ def build_effectiveness_report(
                 chart_path = charts_dir / "effectiveness_overview.png"
                 _save_fig(plt, str(chart_path))
                 out["effectiveness_overview.png"] = str(chart_path.relative_to(results_dir))
+        if plt is not None and benchmark_aggregate_csv is not None and Path(benchmark_aggregate_csv).exists():
+            bench_df = pd.read_csv(benchmark_aggregate_csv)
+            if not bench_df.empty and "variant" in bench_df.columns:
+                bench_df["variant"] = pd.Categorical(
+                    bench_df["variant"],
+                    categories=BENCHMARK_VARIANT_ORDER,
+                    ordered=True,
+                )
+                bench_df = bench_df.sort_values("variant").reset_index(drop=True)
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                plotted = False
+                if "realized_cost_with_lt_mean" in bench_df.columns:
+                    axes[0].bar(
+                        bench_df["variant"].astype(str),
+                        pd.to_numeric(bench_df["realized_cost_with_lt_mean"], errors="coerce").fillna(0.0) / 1e6,
+                        color="#4472C4",
+                    )
+                    axes[0].set_title("Benchmark Cost With LT")
+                    axes[0].set_ylabel("Cost (M)")
+                    axes[0].tick_params(axis="x", rotation=20)
+                    plotted = True
+                else:
+                    axes[0].axis("off")
+                if "total_runtime_seconds_mean" in bench_df.columns:
+                    axes[1].bar(
+                        bench_df["variant"].astype(str),
+                        pd.to_numeric(bench_df["total_runtime_seconds_mean"], errors="coerce").fillna(0.0),
+                        color="#70AD47",
+                    )
+                    axes[1].set_title("Benchmark Runtime")
+                    axes[1].set_ylabel("Seconds")
+                    axes[1].tick_params(axis="x", rotation=20)
+                    plotted = True
+                else:
+                    axes[1].axis("off")
+                if plotted:
+                    chart_path = charts_dir / "benchmark_overview.png"
+                    _save_fig(plt, str(chart_path))
+                    out["benchmark_overview.png"] = str(chart_path.relative_to(results_dir))
     except Exception as exc:
         print(f"[EffectivenessReport] chart skipped: {exc}")
 
@@ -6844,7 +7099,7 @@ def write_results_readme(
     lines.append("| `phase1_offline_baseline/` | Phase 1: ALNS + classical CG on training data | `baseline_cost_breakdown.csv`, `realized_cost_breakdown.csv`, `lt_plan.csv`, `validation_comparison.csv`, `validation_diagnostics.json` |")
     lines.append("| `phase2_online_inference/` | Phase 2: pre-trained GNN scores columns during CG on test data | same file set as phase 1 |")
     lines.append("| `phase3_online_learning/` | Phase 3 (optional): collects NEW teacher rows on test data + fine-tunes checkpoint | same file set |")
-    lines.append("| `benchmark/` | external A/B/C benchmark on held-out test data | `comparison_per_run.csv` (per repeat), `comparison_aggregate.csv` (mean/std) |")
+    lines.append("| `benchmark/` | external A0/A/B/C benchmark on held-out test data | `comparison_per_run.csv` (per repeat), `comparison_aggregate.csv` (mean/std) |")
     lines.append("| `charts/` | every PNG the pipeline produces | filenames suffix the phase label |")
     lines.append("| `thesis_summary/` | the files examiners read first | `phase_comparison.csv`, `benchmark_comparison.csv` (aggregate), `effectiveness_report.csv` |")
     lines.append("| `<phase>/debug/` | LP-relaxed (fractional) copies of every CSV whose main version was integer-rounded | same filenames; diff for audit |")
@@ -6858,14 +7113,14 @@ def write_results_readme(
     lines.append("| Does GNN-guided CG improve cost vs classical CG on test data? | `benchmark/comparison_aggregate.csv` (mean/std over repeats) |")
     lines.append("| How much runtime do we pay for GNN guidance? | `benchmark/comparison_aggregate.csv` → `total_runtime_seconds_{mean,std}` |")
     lines.append("| Does Phase 2 (GNN embedded) match actual inventory? | `phase2_online_inference/validation_comparison.csv` + `validation_diagnostics.json` |")
-    lines.append("| Final A/B/C end-to-end comparison | `thesis_summary/benchmark_comparison.csv` (aggregate of per-run) |")
+    lines.append("| Final A0/A/B/C end-to-end comparison | `thesis_summary/benchmark_comparison.csv` (aggregate of per-run) |")
     lines.append("| Single examiner-readable scoreboard | `thesis_summary/effectiveness_report.csv` |")
     lines.append("")
     lines.append("## Runtime reporting — three categories, never mixed")
     lines.append("")
     lines.append("1. **Offline GNN test runtime** — model forward-pass only, no solver. Reported by `GNN/04_test.py` and saved as `gnn/offline_test/test_runtime_seconds.json`.")
     lines.append("2. **External online inference runtime** — end-to-end Phase 2 solve on test data with GNN embedded in CG. Reported under `phase2_online_inference/` efficiency metrics and in `thesis_summary/runtime_breakdown.json`.")
-    lines.append("3. **External A/B/C benchmark runtime** — wall-clock of each variant's end-to-end solve on the test data. Reported in `benchmark/comparison_per_run.csv` (`total_runtime_seconds`) and aggregated in `benchmark/comparison_aggregate.csv`.")
+    lines.append("3. **External A0/A/B/C benchmark runtime** — wall-clock of each variant's end-to-end solve on the test data. Reported in `benchmark/comparison_per_run.csv` (`total_runtime_seconds`) and aggregated in `benchmark/comparison_aggregate.csv`.")
     lines.append("")
     lines.append("## Integer vs LP-relaxed outputs")
     lines.append("")
@@ -6895,7 +7150,7 @@ def run_three_way_benchmark(
     n_repeats: int = 3,
     results_dir: Optional[Path] = None,
 ) -> pd.DataFrame:
-    """Run Classical CG, Heuristic Ranking CG, and GNN-Guided CG on the same data.
+    """Run A0/A/B/C benchmark variants on the same data.
 
     Each variant runs `n_repeats` times with a different demand-shock seed per
     repeat (derived deterministically from the base seed). Outputs:
@@ -6917,6 +7172,13 @@ def run_three_way_benchmark(
     os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
     try:
         variants: List[Tuple[str, Dict[str, Any]]] = [
+            # A0: pure CG with exact Gurobi pricing — no pruning, no Stackelberg,
+            # no GNN, no top-k heuristic. One exact pricing MIP is solved per
+            # active (product, period); this is the reference variant that A/B/C
+            # are measured against.
+            ("A0_cg_full_exact", {"use_gnn": False, "collect_teacher_mode": False,
+                                    "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+                                    "exact_full_mode": True}),
             ("A_classical_cg",  {"use_gnn": False, "collect_teacher_mode": False,
                                   "runtime_gnn_mode": False, "heuristic_top_k_mode": False}),
             ("B_heuristic_cg",  {"use_gnn": False, "collect_teacher_mode": False,
@@ -6998,6 +7260,14 @@ def run_three_way_benchmark(
                       f"cols_gen={row['columns_generated']} cols_added={row['columns_added_to_rmp']}")
 
         per_run_df = pd.DataFrame(rows)
+        if not per_run_df.empty and "variant" in per_run_df.columns:
+            per_run_df["variant"] = pd.Categorical(
+                per_run_df["variant"],
+                categories=BENCHMARK_VARIANT_ORDER,
+                ordered=True,
+            )
+            sort_cols = ["variant"] + [c for c in ("repeat", "run_label") if c in per_run_df.columns]
+            per_run_df = per_run_df.sort_values(sort_cols).reset_index(drop=True)
         benchmark_dir = results_dir / BENCHMARK_SUBDIR
         benchmark_dir.mkdir(parents=True, exist_ok=True)
         per_run_path = benchmark_dir / "comparison_per_run.csv"
@@ -7015,7 +7285,7 @@ def run_three_way_benchmark(
         ]
         numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
         agg_rows: List[Dict[str, Any]] = []
-        for variant_name, grp in per_run_df.groupby("variant"):
+        for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
             row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
             for c in numeric_cols:
                 numeric = pd.to_numeric(grp[c], errors="coerce")
@@ -7025,6 +7295,13 @@ def run_three_way_benchmark(
                 row[f"{c}_max"]  = float(numeric.max()) if len(numeric) else float("nan")
             agg_rows.append(row)
         aggregate_df = pd.DataFrame(agg_rows)
+        if not aggregate_df.empty and "variant" in aggregate_df.columns:
+            aggregate_df["variant"] = pd.Categorical(
+                aggregate_df["variant"],
+                categories=BENCHMARK_VARIANT_ORDER,
+                ordered=True,
+            )
+            aggregate_df = aggregate_df.sort_values("variant").reset_index(drop=True)
         aggregate_path = benchmark_dir / "comparison_aggregate.csv"
         aggregate_df.to_csv(aggregate_path, index=False)
 
@@ -7036,7 +7313,7 @@ def run_three_way_benchmark(
         aggregate_df.to_csv(thesis_dir / "benchmark_comparison.csv", index=False)
 
         # Per-variant JSON summaries for quick inspection
-        for variant_name, grp in per_run_df.groupby("variant"):
+        for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
             summary = {
                 "variant": variant_name,
                 "n_repeats": int(len(grp)),
@@ -7257,7 +7534,7 @@ if __name__ == "__main__":
     env_time_limit = os.environ.get("IRP_TIME_LIMIT")
     enforce_integer_flows = os.environ.get("IRP_ENFORCE_INTEGER", "0").lower() not in {"0", "false", "no"}
 
-    # ----- 3-way benchmark short-circuit -----
+    # ----- A0/A/B/C benchmark short-circuit -----
     if os.environ.get("IRP_RUN_BENCHMARK", "0").lower() not in {"0", "false", "no"}:
         heuristic_top_k_env = int(os.environ.get("IRP_HEURISTIC_TOP_K", "20"))
         run_three_way_benchmark(
@@ -7276,7 +7553,7 @@ if __name__ == "__main__":
             heuristic_top_k=heuristic_top_k_env,
             enforce_integer_flows=enforce_integer_flows,
         )
-        print("\n[Benchmark] IRP_RUN_BENCHMARK=1 — exiting after 3-way comparison.")
+        print("\n[Benchmark] IRP_RUN_BENCHMARK=1 — exiting after A0/A/B/C comparison.")
         sys.exit(0)
 
     results = IRPResearchPipeline(data).run(

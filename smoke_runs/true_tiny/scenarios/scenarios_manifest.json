@@ -1,0 +1,115 @@
+{
+  "generated_at": "2026-04-24T04:20:14Z",
+  "master_csv": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/1BISCR501V_90100140_20260323-150407111_filtered_sites.csv",
+  "master_seed": 42,
+  "split_by": "base",
+  "split_ratios": {
+    "train": 0.6,
+    "valid": 0.2,
+    "test": 0.2
+  },
+  "bases": [
+    {
+      "base_dataset_id": "base_a",
+      "store_limit": "4",
+      "sku_limit": "2",
+      "start_date": "2025-08-01",
+      "end_date": "2025-08-07"
+    },
+    {
+      "base_dataset_id": "base_b",
+      "store_limit": "5",
+      "sku_limit": "2",
+      "start_date": "2025-08-01",
+      "end_date": "2025-08-07"
+    },
+    {
+      "base_dataset_id": "base_c",
+      "store_limit": "6",
+      "sku_limit": "2",
+      "start_date": "2025-08-01",
+      "end_date": "2025-08-07"
+    }
+  ],
+  "scenarios": [
+    {
+      "base_dataset_id": "base_a",
+      "store_limit": "4",
+      "sku_limit": "2",
+      "start_date": "2025-08-01",
+      "end_date": "2025-08-07",
+      "scenario_idx": 0,
+      "scenario_id": "normal_global__seed1373158607",
+      "shock_profile": "normal_global",
+      "shock_seed": 1373158607,
+      "source_instance": "base_a__normal_global__seed1373158607",
+      "IRP_DEMAND_SHOCK_PROBABILITY": "0.85",
+      "IRP_DEMAND_SHOCK_REALLOCATION_FRACTION": "0.60",
+      "IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD": "3",
+      "IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER": "1.8",
+      "run_idx": 1,
+      "run_dir": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios/run_001__base_a__normal_global__seed1373158607",
+      "teacher_rows_written": 48,
+      "runtime_seconds": 4.893625875003636,
+      "ok": true,
+      "resumed": false,
+      "split": "train"
+    },
+    {
+      "base_dataset_id": "base_b",
+      "store_limit": "5",
+      "sku_limit": "2",
+      "start_date": "2025-08-01",
+      "end_date": "2025-08-07",
+      "scenario_idx": 0,
+      "scenario_id": "normal_global__seed239081664",
+      "shock_profile": "normal_global",
+      "shock_seed": 239081664,
+      "source_instance": "base_b__normal_global__seed239081664",
+      "IRP_DEMAND_SHOCK_PROBABILITY": "0.85",
+      "IRP_DEMAND_SHOCK_REALLOCATION_FRACTION": "0.60",
+      "IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD": "3",
+      "IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER": "1.8",
+      "run_idx": 2,
+      "run_dir": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios/run_002__base_b__normal_global__seed239081664",
+      "teacher_rows_written": 65,
+      "runtime_seconds": 3.4388816249993397,
+      "ok": true,
+      "resumed": false,
+      "split": "train"
+    },
+    {
+      "base_dataset_id": "base_c",
+      "store_limit": "6",
+      "sku_limit": "2",
+      "start_date": "2025-08-01",
+      "end_date": "2025-08-07",
+      "scenario_idx": 0,
+      "scenario_id": "normal_global__seed53710185",
+      "shock_profile": "normal_global",
+      "shock_seed": 53710185,
+      "source_instance": "base_c__normal_global__seed53710185",
+      "IRP_DEMAND_SHOCK_PROBABILITY": "0.85",
+      "IRP_DEMAND_SHOCK_REALLOCATION_FRACTION": "0.60",
+      "IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD": "3",
+      "IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER": "1.8",
+      "run_idx": 3,
+      "run_dir": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios/run_003__base_c__normal_global__seed53710185",
+      "teacher_rows_written": 57,
+      "runtime_seconds": 3.5306001669960096,
+      "ok": true,
+      "resumed": false,
+      "split": "test"
+    }
+  ],
+  "split_assignment": {
+    "base_a__normal_global__seed1373158607": "train",
+    "base_b__normal_global__seed239081664": "train",
+    "base_c__normal_global__seed53710185": "test"
+  },
+  "run_directory": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios",
+  "aggregate_csv": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios/aggregate_teacher_rows.csv",
+  "build_teacher_graph_command": "python GNN/build_teacher_graph_dataset.py --teacher-csv /Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios/aggregate_teacher_rows.csv --out-dir GNN/data/irplt_teacher",
+  "aggregate_sha1": "bfbb481da30c2d790aaa600f9ad942cf5c8828c8",
+  "aggregate_rows": 170
+}

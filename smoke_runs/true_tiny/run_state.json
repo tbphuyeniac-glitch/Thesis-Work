@@ -1,0 +1,29 @@
+{
+  "scenario_generation": {
+    "started_at": "2026-04-24T04:20:14.890227+00:00",
+    "ok": true,
+    "command": [
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+      "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/GNN/generate_teacher_scenarios.py",
+      "--master-csv",
+      "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/1BISCR501V_90100140_20260323-150407111_filtered_sites.csv",
+      "--bases",
+      "base_a:4:2:2025-08-01:2025-08-07",
+      "base_b:5:2:2025-08-01:2025-08-07",
+      "base_c:6:2:2025-08-01:2025-08-07",
+      "--scenarios-per-base",
+      "1",
+      "--cg-iterations",
+      "4",
+      "--time-limit",
+      "300",
+      "--master-seed",
+      "42",
+      "--out-dir",
+      "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios",
+      "--continue-on-failure"
+    ],
+    "finished_at": "2026-04-24T04:20:26.828659+00:00",
+    "returncode": 0
+  }
+}

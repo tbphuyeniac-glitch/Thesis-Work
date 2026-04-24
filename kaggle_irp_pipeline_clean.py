@@ -50,21 +50,24 @@ RESULTS_DIR     = Path("/kaggle/working/Results")
 # ── Master reproducibility seed ──────────────────────────
 MASTER_SEED = 42
 
-# ── Scope limits for single-run mode ─────────────────────
-STORE_LIMIT: Optional[int] = None
-SKU_LIMIT:   Optional[int] = 5
-START_DATE:  Optional[str] = None
-END_DATE:    Optional[str] = None
+# ── Scope limits for Kaggle runtime control ──────────────
+# Keep the run bounded enough for Kaggle while preserving every stage.
+STORE_LIMIT: Optional[int] = 4
+SKU_LIMIT:   Optional[int] = 2
+TRAIN_START_DATE: Optional[str] = "2025-08-01"
+TRAIN_END_DATE:   Optional[str] = "2025-08-14"
+TEST_START_DATE:  Optional[str] = "2025-02-01"
+TEST_END_DATE:    Optional[str] = "2025-02-14"
 
 # ── Solver / GNN ─────────────────────────────────────────
-CG_ITERATIONS    = 20
+CG_ITERATIONS    = 10
 CG_STOPPING_MODE = "convergence"   # stop when no new negative-RC columns enter the pool; CG_ITERATIONS is only a safety cap
-BP_MAX_NODES     = 15
-BP_MAX_DEPTH     = 6
+BP_MAX_NODES     = 6
+BP_MAX_DEPTH     = 3
 # First-run recommendation: 60–100 epochs to validate the pipeline end-to-end
 # without burning Kaggle GPU quota.  Bump to 500 only after Phase 1 + Phase 2
 # produce sensible numbers.
-GNN_TRAIN_EPOCHS = 80
+GNN_TRAIN_EPOCHS = 20
 LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 
 
@@ -73,16 +76,15 @@ LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 # multi-instance diversity (required for instance-level train/valid/test split).
 # Set False for a fast single-run smoke test.
 MULTI_SCENARIO_MODE   = True
-SCENARIOS_PER_BASE    = 5       # scenarios per base dataset
-CG_ITERATIONS_TEACHER = 10      # CG iters per scenario run (keep low for speed)
-TIME_LIMIT_TEACHER    = 300     # seconds per scenario run
+SCENARIOS_PER_BASE    = 2       # scenarios per base dataset
+CG_ITERATIONS_TEACHER = 5       # CG iters per scenario run (keep low for speed)
+TIME_LIMIT_TEACHER    = 180     # seconds per scenario run
 # Base specs: "name:store_limit:sku_limit[:start_date[:end_date]]"
 # Vary store/SKU limits to produce topologically distinct instances.
 BASE_SPECS = [
-    "base_a:4:2",
-    "base_b:6:3",
-    "base_c:8:4",
-    "base_d:5:2",
+    "base_a:4:2:2025-08-01:2025-08-14",
+    "base_b:5:2:2025-08-01:2025-08-14",
+    "base_c:6:2:2025-08-01:2025-08-14",
 ]
 TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 
@@ -92,9 +94,9 @@ TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 RUN_PHASE_2          = True
 RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
-RUN_BENCHMARK        = True     # flip to False on first run; enable after Phase 1 + Phase 2 validated
-BENCHMARK_N_REPEATS  = 3        # each A/B/C variant repeats with varying demand-shock seed → mean/std
-HEURISTIC_TOP_K      = 20
+RUN_BENCHMARK        = True     # keep on so A0/A/B/C benchmark is produced in one Kaggle run
+BENCHMARK_N_REPEATS  = 1        # Kaggle runtime budget: one repeat per A0/A/B/C variant
+HEURISTIC_TOP_K      = 10
 DEMAND_SHOCK_SEED    = 42
 
 
@@ -305,8 +307,12 @@ def show_offline_test_results(test_csv_path: Path) -> None:
 # =========================================================
 
 def build_data(irp: Any, data_path: Path,
-               store_limit=STORE_LIMIT, sku_limit=SKU_LIMIT,
-               start_date=START_DATE, end_date=END_DATE):
+               store_limit: Optional[int] = None, sku_limit: Optional[int] = None,
+               start_date: Optional[str] = None, end_date: Optional[str] = None):
+    if store_limit is None:
+        store_limit = STORE_LIMIT
+    if sku_limit is None:
+        sku_limit = SKU_LIMIT
     mapper = irp.DatasetToIRPValidationMapper(
         excel_path=str(data_path),
         sheet_name=None,
@@ -383,6 +389,12 @@ require_path(REPO_ROOT,       "REPO_ROOT")
 require_path(TRAIN_DATA_PATH, "TRAIN_DATA_PATH")
 require_path(TEST_DATA_PATH,  "TEST_DATA_PATH")
 require_path(DIST_PATH,       "DIST_PATH", fatal=False)
+print("[Run scope]")
+print(f"  store_limit={STORE_LIMIT}  sku_limit={SKU_LIMIT}")
+print(f"  train_window={TRAIN_START_DATE}..{TRAIN_END_DATE}")
+print(f"  test_window ={TEST_START_DATE}..{TEST_END_DATE}")
+print(f"  cg_iterations={CG_ITERATIONS}  bp_nodes={BP_MAX_NODES}  bp_depth={BP_MAX_DEPTH}")
+print(f"  gnn_epochs={GNN_TRAIN_EPOCHS}  scenarios_per_base={SCENARIOS_PER_BASE}  benchmark_repeats={BENCHMARK_N_REPEATS}")
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # Propagate to all subprocesses (scenario generator, GNN trainer, graph
@@ -525,7 +537,12 @@ else:
     print("  WARNING: only 1 source_instance — test split will be empty.")
     print("  Switch MULTI_SCENARIO_MODE=True for a real train/valid/test split.")
 
-    _, single_data, _, _, single_meta = build_data(irp, TRAIN_DATA_PATH)
+    _, single_data, _, _, single_meta = build_data(
+        irp,
+        TRAIN_DATA_PATH,
+        start_date=TRAIN_START_DATE,
+        end_date=TRAIN_END_DATE,
+    )
     show_json("Dataset metadata", single_meta)
 
     p1_results = run_phase(irp, single_data, use_gnn=False, collect_teacher=True)
@@ -712,7 +729,12 @@ if RUN_STATE.is_done("phase1") and _p1_summary_json.exists():
     print(f"[phase1] already done — reused summary from {_p1_summary_json}")
 else:
     RUN_STATE.mark_start("phase1")
-    _, p1_data, _, p1_val_target, p1_meta = build_data(irp, TRAIN_DATA_PATH)
+    _, p1_data, _, p1_val_target, p1_meta = build_data(
+        irp,
+        TRAIN_DATA_PATH,
+        start_date=TRAIN_START_DATE,
+        end_date=TRAIN_END_DATE,
+    )
     show_json("Phase 1 dataset metadata", p1_meta)
 
     # Cost-scale diagnostic (LT vs shortage — thesis examiners will ask)
@@ -760,7 +782,12 @@ if RUN_PHASE_2 and checkpoint.exists() and gnn_history:
         print("=" * 70)
 
         require_path(TEST_DATA_PATH, "TEST_DATA_PATH (Phase 2)")
-        _, p2_data, _, p2_val_target, p2_meta = build_data(irp, TEST_DATA_PATH)
+        _, p2_data, _, p2_val_target, p2_meta = build_data(
+            irp,
+            TEST_DATA_PATH,
+            start_date=TEST_START_DATE,
+            end_date=TEST_END_DATE,
+        )
         show_json("Phase 2 test data metadata", p2_meta)
 
         # Runtime category: ONLINE INFERENCE END-TO-END — full CG solve with GNN
@@ -803,7 +830,12 @@ elif RUN_ONLINE_LEARNING and checkpoint.exists():
     print("=" * 70)
 
     require_path(TEST_DATA_PATH, "TEST_DATA_PATH (Phase 3)")
-    _, ol_data, _, ol_val_target, _ = build_data(irp, TEST_DATA_PATH)
+    _, ol_data, _, ol_val_target, _ = build_data(
+        irp,
+        TEST_DATA_PATH,
+        start_date=TEST_START_DATE,
+        end_date=TEST_END_DATE,
+    )
 
     ol_results = run_phase(irp, ol_data, use_gnn=True, collect_teacher=True)
 
@@ -840,7 +872,7 @@ elif RUN_ONLINE_LEARNING:
 
 
 # =========================================================
-# 11) 3-way benchmark (optional)
+# 11) A0/A/B/C benchmark (optional)
 # =========================================================
 
 benchmark_df: Optional[pd.DataFrame] = None
@@ -848,10 +880,10 @@ benchmark_wall_seconds: Optional[float] = None
 
 if RUN_BENCHMARK:
     print("\n" + "=" * 70)
-    print(f"3-WAY BENCHMARK  (Classical / Heuristic / GNN-Guided)  on TEST data  ×  {BENCHMARK_N_REPEATS} repeats")
+    print(f"A0/A/B/C BENCHMARK  (Exact / Classical / Heuristic / GNN-Guided)  on TEST data  ×  {BENCHMARK_N_REPEATS} repeats")
     print("=" * 70)
 
-    # The external A/B/C benchmark runs on the TEST holdout, not training data.
+    # The external A0/A/B/C benchmark runs on the TEST holdout, not training data.
     # Training data is reserved for teacher generation + offline GNN train/valid/test.
     # `run_three_way_benchmark` internally writes comparison_per_run.csv +
     # comparison_aggregate.csv (mean/std) and mirrors the aggregate to
@@ -865,7 +897,12 @@ if RUN_BENCHMARK:
         benchmark_wall_seconds = float(RUN_STATE.get("benchmark").get("wall_seconds") or 0.0)
     else:
         RUN_STATE.mark_start("benchmark", n_repeats=BENCHMARK_N_REPEATS)
-        _, bm_data, _, _, _ = build_data(irp, TEST_DATA_PATH)
+        _, bm_data, _, _, _ = build_data(
+            irp,
+            TEST_DATA_PATH,
+            start_date=TEST_START_DATE,
+            end_date=TEST_END_DATE,
+        )
         _t_bm = time.perf_counter()
         try:
             benchmark_df = irp.run_three_way_benchmark(
@@ -893,9 +930,9 @@ if RUN_BENCHMARK:
             print(f"[WARNING] Benchmark failed: {_exc} — will retry on next run")
             RUN_STATE.update("benchmark", wall_seconds=benchmark_wall_seconds, error=str(_exc))
             benchmark_df = None
-    show_df("3-Way Benchmark Comparison (per-run)", benchmark_df)
+    show_df("A0/A/B/C Benchmark Comparison (per-run)", benchmark_df)
     if bench_agg_path.exists():
-        show_df("3-Way Benchmark Comparison (aggregate mean/std)",
+        show_df("A0/A/B/C Benchmark Comparison (aggregate mean/std)",
                 pd.read_csv(bench_agg_path))
     print(f"  [External benchmark] total wall time: {benchmark_wall_seconds:.2f} s")
 
@@ -1047,13 +1084,16 @@ except Exception as _exc:
 # Core thesis outputs — ONE reporting file per headline question.
 # If any of these is missing, the thesis report has a gap.
 thesis_summary_files = [
+    ("run.log",                                 "Full execution log captured outside notebook output"),
+    ("run_state.json",                          "Phase completion / resume state"),
     ("README.md",                               "Human-readable results directory map"),
     ("thesis_summary/phase_comparison.csv",     "Phase-by-phase headline KPIs"),
-    ("thesis_summary/benchmark_comparison.csv", "3-way benchmark aggregate (mean/std across repeats)"),
+    ("thesis_summary/benchmark_comparison.csv", "A0/A/B/C benchmark aggregate (mean/std across repeats)"),
     ("thesis_summary/effectiveness_report.csv", "One-file scoreboard: solver costs + GNN metrics + runtimes"),
     ("thesis_summary/runtime_breakdown.json",   "Offline-test vs online-inference vs benchmark wall times"),
     ("benchmark/comparison_per_run.csv",        "Per-repeat benchmark rows (for variance check)"),
     ("benchmark/comparison_aggregate.csv",      "Per-variant mean/std/min/max"),
+    ("charts/benchmark_overview.png",           "Benchmark cost/runtime chart for A0/A/B/C"),
     ("gnn/training_history.csv",                "GNN training loss curve"),
     ("gnn/training_summary.json",               "GNN best-epoch summary"),
     ("gnn/offline_test/test_per_sample.csv",    "Offline held-out test metrics"),
@@ -1070,6 +1110,11 @@ for rel, desc in thesis_summary_files:
     print(f"  {rel:<48s}  {status}   {desc}")
 
 print("\n[Results/ tree by stage]")
+root_files = [p for p in RESULTS_DIR.iterdir() if p.is_file()] if RESULTS_DIR.exists() else []
+if root_files:
+    print("\n  [root files]")
+    for p in sorted(root_files):
+        print(f"    {p.name:<70s}  {p.stat().st_size / 1024:>7.1f} KB")
 stage_dirs = [
     "scenarios", "teacher", "graphs", "gnn",
     "phase1_offline_baseline", "phase2_online_inference",

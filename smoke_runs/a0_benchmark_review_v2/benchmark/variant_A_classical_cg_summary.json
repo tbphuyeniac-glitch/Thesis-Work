@@ -1,0 +1,26 @@
+{
+  "variant": "A_classical_cg",
+  "n_repeats": 1,
+  "runs": [
+    {
+      "variant": "A_classical_cg",
+      "run_label": "A_classical_cg__repeat1",
+      "repeat": 1,
+      "source_instance": "",
+      "seed": 42,
+      "benchmark_mode": "default",
+      "rmp_objective": NaN,
+      "realized_cost_no_lt": NaN,
+      "realized_cost_with_lt": NaN,
+      "lt_cost_with_lt": NaN,
+      "shortage_cost_with_lt": NaN,
+      "cg_iterations": 0,
+      "total_runtime_seconds": 0.5503322500007926,
+      "columns_generated": 0,
+      "columns_added_to_rmp": 0,
+      "column_pool_utilization": 0.0,
+      "error": "Could not resolve host: token.gurobi.com (code 6, command POST https://token.gurobi.com/api/v1/tokens)",
+      "stopping_reason": "failed"
+    }
+  ]
+}

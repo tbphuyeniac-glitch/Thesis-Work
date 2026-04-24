@@ -1,0 +1,12 @@
+{
+  "rows_validation_target": 60,
+  "rows_predicted_forecast": 70,
+  "rows_merged": 60,
+  "n_predicted_zero_realized": 0,
+  "n_predicted_zero_forecast": 12,
+  "mean_actual_end_qty": 620.0333333333333,
+  "mean_predicted_realized": 55.80613333333334,
+  "mean_predicted_forecast": 46.28666666666667,
+  "mean_abs_error_realized": 564.8535884333335,
+  "reason": "ok"
+}

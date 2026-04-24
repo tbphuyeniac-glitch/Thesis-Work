@@ -1,0 +1,170 @@
+[
+  {
+    "stage": "external_benchmark_A0_cg_full_exact",
+    "metric": "realized_cost_with_lt_mean",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A0_cg_full_exact",
+    "metric": "realized_cost_with_lt_std",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A0_cg_full_exact",
+    "metric": "total_runtime_seconds_mean",
+    "value": 0.4792800419963896,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A0_cg_full_exact",
+    "metric": "total_runtime_seconds_std",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A0_cg_full_exact",
+    "metric": "columns_generated_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A0_cg_full_exact",
+    "metric": "columns_added_to_rmp_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A0_cg_full_exact",
+    "metric": "cg_iterations_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A_classical_cg",
+    "metric": "realized_cost_with_lt_mean",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A_classical_cg",
+    "metric": "realized_cost_with_lt_std",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A_classical_cg",
+    "metric": "total_runtime_seconds_mean",
+    "value": 0.5503322500007926,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A_classical_cg",
+    "metric": "total_runtime_seconds_std",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A_classical_cg",
+    "metric": "columns_generated_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A_classical_cg",
+    "metric": "columns_added_to_rmp_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_A_classical_cg",
+    "metric": "cg_iterations_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_B_heuristic_cg",
+    "metric": "realized_cost_with_lt_mean",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_B_heuristic_cg",
+    "metric": "realized_cost_with_lt_std",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_B_heuristic_cg",
+    "metric": "total_runtime_seconds_mean",
+    "value": 0.3254388749919599,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_B_heuristic_cg",
+    "metric": "total_runtime_seconds_std",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_B_heuristic_cg",
+    "metric": "columns_generated_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_B_heuristic_cg",
+    "metric": "columns_added_to_rmp_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_B_heuristic_cg",
+    "metric": "cg_iterations_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_C_gnn_guided_cg",
+    "metric": "realized_cost_with_lt_mean",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_C_gnn_guided_cg",
+    "metric": "realized_cost_with_lt_std",
+    "value": NaN,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_C_gnn_guided_cg",
+    "metric": "total_runtime_seconds_mean",
+    "value": 0.3241027909971308,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_C_gnn_guided_cg",
+    "metric": "total_runtime_seconds_std",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_C_gnn_guided_cg",
+    "metric": "columns_generated_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_C_gnn_guided_cg",
+    "metric": "columns_added_to_rmp_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  },
+  {
+    "stage": "external_benchmark_C_gnn_guided_cg",
+    "metric": "cg_iterations_mean",
+    "value": 0.0,
+    "unit": "mean_std"
+  }
+]

@@ -1,0 +1,3 @@
+model,alns_runtime_seconds,alns_iterations,alns_accepts,alns_improvements,alns_new_best,gurobi_runtime_seconds,lp_iterations,barrier_iterations,nodes_explored,lp_relaxations_solved_estimate,rmp_solves,branch_price_nodes_explored,branch_price_nodes_remaining
+baseline_irpt,0.3087932080088649,2000.0,1624.0,136.0,2.0,0.3087932080088649,0.0,0.0,2000.0,1.0,,,
+cg_rmp_total,,,,,,0.0005309581756591797,26.0,0.0,0.0,1.0,1.0,15.0,4.0

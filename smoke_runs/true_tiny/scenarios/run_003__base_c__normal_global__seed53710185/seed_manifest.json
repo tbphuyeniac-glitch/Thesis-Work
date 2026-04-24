@@ -1,0 +1,12 @@
+{
+  "master_seed": null,
+  "derived_seeds": {
+    "demand_shock_seed": 53710185,
+    "alns_seed": 42,
+    "pattern_init_seed": 123,
+    "cg_pricing_seed": 0,
+    "gnn_train_seed": 0,
+    "gnn_build_seed": 0
+  },
+  "resolved_at_utc": "2026-04-24T04:20:23.583927Z"
+}

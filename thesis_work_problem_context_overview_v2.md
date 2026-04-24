@@ -64,11 +64,20 @@ The baseline stage is important because it creates the reference solution from w
 
 Thus, the thesis assumes that the baseline DC-to-store plan is generated first, using planned demand data.
 
+### 3.4 Baseline solver implementation
+
+The thesis uses two baseline solver implementations:
+
+- **`BaselineALNSModel`** (primary): ALNS (Adaptive Large Neighborhood Search) metaheuristic. Scalable, runs without a Gurobi license, suitable for Kaggle and large instances.
+- **`AchamrahFullIRPTModel`** (reference): Gurobi MIP formulation following Achamrah 2022. Exact solver, used for small-instance validation and benchmarking.
+
+Both solvers produce the same output format: baseline inventory trajectories, routing patterns, and shortage profiles across stores, products, and periods.
+
 ---
 
 ## 4. Demand Fluctuation Through Shocking Factor
 
-After the baseline plan is created, actual store demand may no longer match the planned demand. To model this, the thesis introduces a **shocking factor**.
+After the baseline plan is created, actual store demand may no longer match the planned demand. To model this, the thesis introduces a **shocking factor** implemented by the `DemandShockEngine` class.
 
 ### 4.1 Meaning of the shocking factor
 
@@ -79,9 +88,19 @@ For example:
 - if forecast demand is 100 units and the shocking factor is 1.20, realized demand becomes 120 units,
 - if forecast demand is 100 units and the shocking factor is 0.80, realized demand becomes 80 units.
 
-This mechanism allows the thesis to simulate demand volatility in a controlled way.
+This mechanism allows the thesis to simulate demand volatility in a controlled and reproducible way.
 
-### 4.2 Why it matters
+### 4.2 Shock distributions implemented
+
+Three types of shock distribution are implemented:
+
+- **`normal`**: Gaussian perturbation around baseline demand. Represents typical day-to-day demand variation.
+- **`gamma`**: Skewed positive perturbation. Represents demand surge scenarios (holiday effects, promotions).
+- **`sku_spike`**: Concentrated spike on a subset of SKUs per period. Represents category-level demand spike.
+
+These distributions can be rotated across scenarios to create diverse training instances.
+
+### 4.3 Why it matters
 
 Once the shocking factor changes demand, the original baseline replenishment may no longer be optimal or even sufficient:
 
@@ -91,16 +110,29 @@ Once the shocking factor changes demand, the original baseline replenishment may
 
 This is exactly the reason why lateral transshipment is introduced.
 
+### 4.4 Control parameters
+
+```
+IRP_DEMAND_SHOCK_PROBABILITY             # fraction of store-product-periods shocked (default 0.3)
+IRP_DEMAND_SHOCK_REALLOCATION_FRACTION   # how much demand is redistributed
+IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER # multiplicative factor on shocked demand (default 1.3)
+IRP_DEMAND_SHOCK_SEED                    # reproducibility seed
+```
+
 ---
 
 ## 5. Why Lateral Transshipment Is Needed
 
 Lateral transshipment is needed because the baseline plan is based on forecast demand, while actual realized demand may differ after the shocking factor is applied.
-In this thesis, lateral transshipment is not treated merely as an emergency inventory movement, but as a cost-optimizing corrective mechanism after demand disruption. The baseline replenishment plan from the DC to stores is first established based on forecast demand. However, once actual demand deviates from forecast through the shocking factor, inventory imbalances emerge across stores. In such cases, lateral transshipment plays a crucial role in redistributing inventory from surplus stores to shortage stores, thereby mitigating stockout risk, reducing unnecessary emergency replenishment from the DC, utilizing available inventory more efficiently, and improving the overall total cost of the system.
+
+In this thesis, lateral transshipment is not treated merely as an emergency inventory movement, but as a **cost-optimizing corrective mechanism** after demand disruption. The baseline replenishment plan from the DC to stores is first established based on forecast demand. However, once actual demand deviates from forecast through the shocking factor, inventory imbalances emerge across stores. In such cases, lateral transshipment plays a crucial role in:
+- redistributing inventory from surplus stores to shortage stores,
+- mitigating stockout risk,
+- reducing unnecessary emergency replenishment from the DC,
+- utilizing available inventory more efficiently,
+- improving the overall total cost of the system.
 
 ### 5.1 Core logic
-
-The logic is:
 
 - The DC sends products to stores according to the baseline plan.
 - Real demand is then realized with demand shocks.
@@ -117,11 +149,15 @@ Lateral transshipment may improve system performance by:
 - improving service level,
 - potentially reducing response time when compared with waiting for a new DC shipment.
 
-### 5.3 Role in the thesis framework
+### 5.3 LT activation condition
 
-In this thesis, LT is treated as a **second-stage balancing mechanism** activated only when the realized demand pattern creates meaningful imbalance across stores.
+LT is only activated when both total shortage and total surplus in a product-period exceed the activation threshold:
+```
+total_need >= IRP_LT_ACTIVATION_THRESHOLD  (default 10.0)
+total_surplus >= IRP_LT_ACTIVATION_THRESHOLD
+```
 
-This makes the framework more realistic than solving only a static baseline replenishment problem.
+This prevents activating LT for trivially small imbalances.
 
 ---
 
@@ -175,41 +211,67 @@ Typical cost and decision considerations include:
 
 ---
 
-## 8. Intended Methodological Direction
+## 8. Methodological Framework (Implemented)
 
-The broader methodological direction of the thesis is not only to model the operational problem, but also to solve it efficiently for larger instances.
+The thesis implements the following complete framework:
 
-The intended framework includes:
+### 8.1 Baseline optimization
+- ALNS metaheuristic (`BaselineALNSModel`) as primary solver.
+- Gurobi MIP (`AchamrahFullIRPTModel`) as reference solver for validation.
 
-- a **baseline optimization model** for DC-to-store replenishment,
-- a **column generation structure** to represent candidate lateral transshipment patterns,
-- possible **branch-and-price or restricted master problem logic** for scalable solution search,
-- and a **GNN-assisted selection/ranking mechanism** to improve the efficiency of choosing promising columns.
+### 8.2 Column generation for LT
+- Restricted Master Problem (RMP) with need-cover and surplus-cap constraints.
+- Pricing step: dual-based pair candidates with feature pruning and Stackelberg acceptance.
+- Iterative re-optimization until convergence.
+- Optional Branch-and-Price (B&P).
 
-Within this structure:
+### 8.3 Feature-driven pruning (4 signals)
+For each donor-receiver pair:
+1. `shortage_ratio`: receiver's share of total period shortage.
+2. `surplus_ratio`: donor's share of total period surplus.
+3. `time_urgency`: receiver's temporal urgency (1 / (1 + days_to_stockout)).
+4. `negative_reduced_cost`: economic attractiveness from dual-based pricing.
 
-- the baseline demand plan provides the initial state,
-- the shocking factor creates post-plan demand deviation,
-- and lateral transshipment columns represent recovery patterns for redistributing stock across stores.
+### 8.4 Stackelberg acceptance filter
+A game-theoretic filter that models practical donor-receiver negotiation:
+- Donor computes required compensation based on risk, burden, and service loss.
+- Receiver evaluates whether the benefit justifies the compensation.
+- Only mutually accepted pairs proceed to pattern building.
+
+### 8.5 BiGAT-guided column selection
+A bipartite graph attention network:
+- Column nodes (12 features) ↔ Constraint nodes (7 features), connected by edge features (3).
+- 2-layer bidirectional attention with residual connections and LayerNorm.
+- Scoring head produces admission priority per column.
+- Top-k selection controls how many columns are inserted per CG iteration.
+
+### 8.6 Three-phase deployment
+- **Phase 1 (offline baseline)**: collect teacher data via CG → build graph dataset → train BiGAT.
+- **Phase 2 (online inference)**: load pre-trained BiGAT → use GNN scoring during CG, no retraining.
+- **Phase 3 (online learning)**: load checkpoint → CG with GNN scoring → fine-tune in-place after each run.
+
+### 8.7 Three-way benchmark
+Systematic comparison under identical conditions:
+- **Classical CG**: all negative reduced-cost columns, no top-k filter.
+- **Heuristic CG**: rule-based top-k selection, no GNN.
+- **GNN CG**: BiGAT-guided top-k selection.
 
 ---
 
 ## 9. Expected Thesis Outputs
 
-The expected outputs of the thesis are not limited to a final mathematical model. The thesis is expected to deliver several layers of results.
-
 ### 9.1 Conceptual output
 
-A clear problem formulation that explains:
+A clear problem formulation explaining:
 
 - the retail distribution context,
 - the baseline DC-to-store replenishment logic,
-- the impact of demand fluctuation,
+- the impact of demand fluctuation through shocking factor,
 - and the role of lateral transshipment as a corrective balancing mechanism.
 
 ### 9.2 Mathematical/modeling output
 
-A model or integrated framework that defines:
+A model or integrated framework defining:
 
 - indices, sets, and parameters,
 - decision variables,
@@ -220,52 +282,74 @@ A model or integrated framework that defines:
 
 ### 9.3 Algorithmic output
 
-A solution framework capable of generating and selecting promising LT patterns, especially for larger instances where exhaustive enumeration is inefficient.
+A solution framework generating and selecting promising LT patterns, including:
 
-This may include:
-
-- baseline solver output,
-- column generation iterations,
-- reduced cost evaluation,
-- and possibly GNN-guided column ranking.
+- baseline solver output (ALNS or Gurobi),
+- demand shock scenario generation,
+- column generation iterations with pricing and pruning,
+- Stackelberg acceptance filter,
+- GNN-guided column ranking (BiGAT),
+- three-phase pipeline management.
 
 ### 9.4 Computational output
 
-The thesis should produce numerical experiments showing:
+Numerical experiments showing:
 
-- baseline replenishment results,
-- demand shock scenarios,
+- baseline replenishment results (cost, inventory, shortage),
+- demand shock scenarios (shortage/surplus profiles),
 - transshipment decisions after shock realization,
-- total cost comparison with and without LT,
+- total cost comparison: no-LT vs Classical CG vs Heuristic CG vs GNN CG,
 - service level or shortage improvements,
-- and computational performance of the proposed method.
+- computational performance and runtime comparison,
+- GNN generalization metrics (MRR, validation loss, pos/neg score gap).
 
 ### 9.5 Managerial output
 
-The thesis should also provide insight into when lateral transshipment is useful, such as:
+Insight into when lateral transshipment is useful:
 
 - under what level of demand volatility LT becomes valuable,
 - which stores tend to become donors or receivers,
 - whether LT reduces total shortage significantly,
-- and whether the proposed framework improves responsiveness compared with DC-only replenishment.
+- and whether the GNN-guided framework improves responsiveness compared with classical CG.
 
 ---
 
-## 10. Desired Final Outcome of the Thesis Work
+## 10. Current Implementation Status
 
-The desired end result of the thesis is a practical and academically sound framework that demonstrates the following idea:
+As of April 2026, the following components are **fully implemented**:
 
-> A retail network should not rely only on a static DC-to-store replenishment plan. Because realized demand can deviate from forecast through demand shocks, the system should include a second-stage inventory rebalancing mechanism through lateral transshipment.
+| Component | Status | File |
+|---|---|---|
+| Data loading and IRPData construction | Done | `irp_gurobi_converted.py` |
+| ALNS baseline solver | Done | `irp_gurobi_converted.py` |
+| Gurobi MIP baseline (reference) | Done | `irp_gurobi_converted.py` |
+| Demand shock engine | Done | `irp_gurobi_converted.py` |
+| LT column generation (CG + RMP) | Done | `irp_gurobi_converted.py` |
+| Feature pruning (4 signals) | Done | `irp_gurobi_converted.py` |
+| Stackelberg acceptance filter | Done | `irp_gurobi_converted.py` |
+| Teacher data collection | Done | `irp_gurobi_converted.py` |
+| Multi-instance scenario generator | Done | `GNN/generate_teacher_scenarios.py` |
+| Graph dataset builder | Done | `GNN/build_teacher_graph_dataset.py` |
+| BiGAT model (PyTorch, no torch_geometric) | Done | `GNN/models/attention/model.py` |
+| BiGAT training loop (pairwise rank + BCE) | Done | `GNN/03_train_bigat.py` |
+| Three-phase pipeline orchestration | Done | `irp_gurobi_converted.py` |
+| Three-way benchmark runner | Done | `irp_gurobi_converted.py` |
+| Results layout and phase labeling | Done | `irp_gurobi_converted.py` |
+| Run infrastructure (logging, checkpointing) | Done | `run_infrastructure.py` |
+| Branch-and-Price (optional) | Done | `irp_gurobi_converted.py` |
 
-More specifically, the thesis aims to show that:
+Components that may need **calibration and validation**:
 
-- the **baseline replenishment plan** is necessary as the first planning layer,
-- the **shocking factor** realistically creates post-plan imbalance,
-- **lateral transshipment** is justified as a recovery mechanism,
-- and an advanced optimization / learning-assisted framework can solve this integrated problem more effectively.
+| Component | What needs attention |
+|---|---|
+| Shocking factor parameters | Calibrate to produce realistic imbalance for test dataset |
+| Teacher data volume | May need more scenario runs for robust GNN generalization |
+| GNN hyperparameters | Tune hidden_dim, dropout, patience for best MRR on test set |
+| Online learning stability | Monitor for overfitting on single-run fine-tuning |
+| B&P correctness | Validate on small instances with known optima |
 
 ---
 
 ## 11. Summary in One Paragraph
 
-This thesis studies a retail inventory routing problem in which a central DC first creates a baseline replenishment plan for stores based on expected demand. After that, realized demand changes due to a shocking factor, causing some stores to face shortages and others to hold surplus stock. To correct this imbalance, the system allows lateral transshipment between stores. The thesis therefore develops an integrated framework that links baseline DC-to-store planning with post-shock store-to-store rebalancing, with the goal of reducing total system cost, improving service performance, and supporting scalable solution methods such as column generation and GNN-assisted column selection.
+This thesis studies a retail inventory routing problem in which a central DC first creates a baseline replenishment plan for stores based on expected demand. After that, realized demand changes due to a shocking factor (implemented via `DemandShockEngine` with normal, gamma, or sku_spike distributions), causing some stores to face shortages and others to hold surplus stock. To correct this imbalance, the system uses lateral transshipment guided by column generation. The thesis develops an integrated framework that links baseline DC-to-store planning (ALNS or Gurobi MIP) with post-shock store-to-store rebalancing (CG + RMP + pricing + pruning + Stackelberg), augmented by a BiGAT neural network that learns to rank candidate LT columns by their column-constraint interaction in the current RMP state. The framework operates in three deployment phases (offline training, online inference, online learning) and is evaluated through a three-way benchmark comparing Classical CG, Heuristic CG, and GNN-guided CG on the same instances.

@@ -1,0 +1,5 @@
+variant,run_label,repeat,source_instance,seed,benchmark_mode,rmp_objective,realized_cost_no_lt,realized_cost_with_lt,lt_cost_with_lt,shortage_cost_with_lt,cg_iterations,total_runtime_seconds,columns_generated,columns_added_to_rmp,column_pool_utilization,error,stopping_reason
+A0_cg_full_exact,A0_cg_full_exact__repeat1,1,,42,default,,,,,,0,0.4792800419963896,0,0,0.0,"Could not resolve host: token.gurobi.com (code 6, command POST https://token.gurobi.com/api/v1/tokens)",failed
+A_classical_cg,A_classical_cg__repeat1,1,,42,default,,,,,,0,0.5503322500007926,0,0,0.0,"Could not resolve host: token.gurobi.com (code 6, command POST https://token.gurobi.com/api/v1/tokens)",failed
+B_heuristic_cg,B_heuristic_cg__repeat1,1,,42,default,,,,,,0,0.3254388749919599,0,0,0.0,"Could not resolve host: token.gurobi.com (code 6, command POST https://token.gurobi.com/api/v1/tokens)",failed
+C_gnn_guided_cg,C_gnn_guided_cg__repeat1,1,,42,default,,,,,,0,0.3241027909971308,0,0,0.0,"Could not resolve host: token.gurobi.com (code 6, command POST https://token.gurobi.com/api/v1/tokens)",failed

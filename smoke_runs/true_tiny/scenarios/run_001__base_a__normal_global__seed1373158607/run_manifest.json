@@ -1,0 +1,46 @@
+{
+  "run_id": "20260424T042019Z",
+  "started_at_utc": "2026-04-24T04:20:19.594914Z",
+  "phase_label": "scenario",
+  "dataset_id": "base_a",
+  "scenario_id": "normal_global__seed1373158607",
+  "dataset_path": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/1BISCR501V_90100140_20260323-150407111_filtered_sites.csv",
+  "mode": "phase1_offline_baseline",
+  "results_root": "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/true_tiny/scenarios/run_001__base_a__normal_global__seed1373158607",
+  "artifacts_by_phase": {
+    "scenario": {
+      "baseline_cost_breakdown.csv": "scenario/baseline_cost_breakdown.csv",
+      "realized_cost_breakdown.csv": "scenario/realized_cost_breakdown.csv",
+      "solver_efficiency.csv": "scenario/solver_efficiency.csv",
+      "demand_fulfillment.csv": "scenario/demand_fulfillment.csv",
+      "lt_plan.csv": "scenario/lt_plan.csv",
+      "demand_shock_summary.csv": "scenario/demand_shock_summary.csv",
+      "cg_episode_history.csv": "scenario/cg_episode_history.csv",
+      "branch_price_history.csv": "scenario/branch_price_history.csv",
+      "cg_episode_diagnostics.csv": "scenario/cg_episode_diagnostics.csv",
+      "column_pool_diagnostics.csv": "scenario/column_pool_diagnostics.csv",
+      "alns_history.csv": "scenario/alns_history.csv",
+      "selected_columns.json": "scenario/selected_columns.json",
+      "validation_comparison.csv": "scenario/validation_comparison.csv",
+      "validation_diagnostics.json": "scenario/validation_diagnostics.json",
+      "cg_cost_curve.png": "charts/cg_cost_curve_scenario.png"
+    }
+  },
+  "validation_metrics": {
+    "MAE": 636.3435360833333,
+    "RMSE": 762.5282060920575,
+    "Bias": -636.014,
+    "MAPE": 0.8832217614654049
+  },
+  "charts": [
+    "charts/cg_convergence_scenario.png",
+    "charts/cost_breakdown_scenario.png",
+    "charts/shortage_reduction_scenario.png",
+    "charts/fulfillment_by_store_scenario.png",
+    "charts/lt_flow_heatmap_scenario.png",
+    "charts/branch_price_scenario.png",
+    "charts/pricing_funnel_scenario.png",
+    "charts/alns_convergence_scenario.png",
+    "charts/chart_11_cost_breakdown_log.png"
+  ]
+}
