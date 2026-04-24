@@ -1,0 +1,16 @@
+{
+  "runtime_category": "offline_gnn_test",
+  "description": "Model forward-pass runtime on held-out graph split. Does NOT include solver runtime; see thesis_summary/runtime_breakdown.json for end-to-end categories.",
+  "n_samples": 3,
+  "mass_thresholds": [
+    0.6,
+    0.7,
+    0.8
+  ],
+  "forward_pass_seconds_total": 0.0034658749937079847,
+  "forward_pass_seconds_mean": 0.0011552916645693283,
+  "forward_pass_seconds_min": 0.0008191660017473623,
+  "forward_pass_seconds_max": 0.0017719589959597215,
+  "evaluate_function_seconds": 0.0049618749908404425,
+  "device": "cpu"
+}

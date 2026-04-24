@@ -30,6 +30,7 @@ import json
 import math
 import os
 import random
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -175,6 +176,39 @@ def run_epoch(model, samples, optimizer=None, device="cpu", objective="pairwise_
     return metrics
 
 
+def _atomic_torch_save(payload: dict, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(target)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _atomic_json_save(obj, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+        tmp_path.replace(target)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
 def save_loss_chart(history, out_path: Path) -> None:
     episodes = [row.get("epoch", row.get("episode")) for row in history]
     train_loss = [row["train_loss"] for row in history]
@@ -206,6 +240,12 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--objective", choices=["binary", "pairwise_rank", "score_regression"], default="pairwise_rank")
     parser.add_argument("--resume-checkpoint", default=None, help="Optional checkpoint to fine-tune from.")
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        default=os.environ.get("IRP_TRAINING_AUTO_RESUME", "0").lower() in {"1", "true", "yes"},
+        help="If set (or IRP_TRAINING_AUTO_RESUME=1), resume from <out-dir>/last_model.pt when present.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -256,13 +296,18 @@ def main() -> None:
     best_valid = float("-inf") if _maximize_primary else float("inf")
     bad_epochs = 0
     best_path = out_dir / "best_model.pt"
+    last_path = out_dir / "last_model.pt"
     chart_path = out_dir / "training_loss_curve.png"
     history_path = out_dir / "training_history.json"
     history = []
     start_epoch = 1
     checkpoint = None
-    if args.resume_checkpoint:
-        resume_path = Path(args.resume_checkpoint)
+    resume_source = args.resume_checkpoint
+    if resume_source is None and args.auto_resume and last_path.exists():
+        resume_source = str(last_path)
+        utilities.log(f"auto-resume enabled; resuming from {last_path}", logfile)
+    if resume_source:
+        resume_path = Path(resume_source)
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
         try:
@@ -372,57 +417,63 @@ def main() -> None:
         if improved:
             best_valid = current_primary
             bad_epochs = 0
-            torch.save({
-                "state_dict": model.state_dict(),
-                "config": {
-                    "column_dim": model.column_dim,
-                    "constraint_dim": model.constraint_dim,
-                    "edge_dim": model.edge_dim,
-                    "hidden_dim": model.hidden_dim,
-                    "dropout": args.dropout,
-                },
-                "normalization": stats,
-                "feature_names": {
-                    "column": utilities.COLUMN_FEATURE_NAMES,
-                    "constraint": utilities.CONSTRAINT_FEATURE_NAMES,
-                    "edge": utilities.EDGE_FEATURE_NAMES,
-                },
-                "valid_metrics": valid_metrics,
-                "optimizer_state": optimizer.state_dict(),
-                "best_valid_loss": best_valid if not _maximize_primary else valid_metrics["loss"],
-                "best_valid_mrr": best_valid if _maximize_primary else valid_metrics.get("ranking_mrr", float("nan")),
-                "last_epoch": epoch,
-                "objective": args.objective,
-                "dataset_type": args.dataset_type,
-                "label_sources": label_sources,
-            }, best_path)
-            utilities.log("saved best BiGAT model", logfile)
         else:
             bad_epochs += 1
-            if bad_epochs >= args.patience:
-                utilities.log("early stopping", logfile)
-                break
 
-    with open(history_path, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
+        checkpoint_payload = {
+            "state_dict": model.state_dict(),
+            "config": {
+                "column_dim": model.column_dim,
+                "constraint_dim": model.constraint_dim,
+                "edge_dim": model.edge_dim,
+                "hidden_dim": model.hidden_dim,
+                "dropout": args.dropout,
+            },
+            "normalization": stats,
+            "feature_names": {
+                "column": utilities.COLUMN_FEATURE_NAMES,
+                "constraint": utilities.CONSTRAINT_FEATURE_NAMES,
+                "edge": utilities.EDGE_FEATURE_NAMES,
+            },
+            "valid_metrics": valid_metrics,
+            "optimizer_state": optimizer.state_dict(),
+            "best_valid_loss": best_valid if not _maximize_primary else valid_metrics["loss"],
+            "best_valid_mrr": best_valid if _maximize_primary else valid_metrics.get("ranking_mrr", float("nan")),
+            "last_epoch": epoch,
+            "bad_epochs": bad_epochs,
+            "objective": args.objective,
+            "dataset_type": args.dataset_type,
+            "label_sources": label_sources,
+        }
+        _atomic_torch_save(checkpoint_payload, last_path)
+        _atomic_json_save(history, history_path)
+        if improved:
+            _atomic_torch_save(checkpoint_payload, best_path)
+            utilities.log("saved best BiGAT model", logfile)
+        if not improved and bad_epochs >= args.patience:
+            utilities.log("early stopping", logfile)
+            break
+
+    _atomic_json_save(history, history_path)
     save_loss_chart(history, chart_path)
     utilities.log(f"saved training history to {history_path}", logfile)
     utilities.log(f"saved training loss chart to {chart_path}", logfile)
 
-    with open(out_dir / "training_summary.json", "w", encoding="utf-8") as f:
-        json.dump({
-            "best_valid_loss": best_valid,
-            "objective": args.objective,
-            "dataset_type": args.dataset_type,
-            "data_dir": args.data_dir,
-            "resume_checkpoint": args.resume_checkpoint,
-            "label_sources": label_sources,
-            "last_epoch": history[-1]["epoch"] if history else 0,
-            "history_rows": len(history),
-            "checkpoint": str(best_path),
-            "history": str(history_path),
-            "loss_chart": str(chart_path),
-        }, f, indent=2)
+    _atomic_json_save({
+        "best_valid_loss": best_valid,
+        "objective": args.objective,
+        "dataset_type": args.dataset_type,
+        "data_dir": args.data_dir,
+        "resume_checkpoint": resume_source,
+        "auto_resume": bool(args.auto_resume),
+        "label_sources": label_sources,
+        "last_epoch": history[-1]["epoch"] if history else 0,
+        "history_rows": len(history),
+        "checkpoint": str(best_path),
+        "last_checkpoint": str(last_path),
+        "history": str(history_path),
+        "loss_chart": str(chart_path),
+    }, out_dir / "training_summary.json")
 
 
 if __name__ == "__main__":

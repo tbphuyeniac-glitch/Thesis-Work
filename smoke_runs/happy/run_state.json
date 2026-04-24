@@ -1,0 +1,48 @@
+{
+  "scenario_generation": {
+    "started_at": "2026-04-24T03:56:08.172562+00:00",
+    "ok": true,
+    "command": [
+      "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+      "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/GNN/generate_teacher_scenarios.py",
+      "--master-csv",
+      "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/1BISCR501V_90100140_20260323-150407111_filtered_sites.csv",
+      "--bases",
+      "base_a:4:2",
+      "base_b:5:2",
+      "base_c:6:3",
+      "--scenarios-per-base",
+      "2",
+      "--cg-iterations",
+      "10",
+      "--time-limit",
+      "300",
+      "--master-seed",
+      "42",
+      "--out-dir",
+      "/Users/trannguyenhung/Documents/THESIS/Code/Current Code/smoke_runs/happy/scenarios",
+      "--continue-on-failure"
+    ],
+    "finished_at": "2026-04-24T03:58:31.270495+00:00",
+    "returncode": 0
+  },
+  "gnn_training": {
+    "started_at": "2026-04-24T03:58:32.420162+00:00",
+    "ok": true,
+    "epochs": 3,
+    "finished_at": "2026-04-24T03:58:35.779379+00:00",
+    "returncode": 0
+  },
+  "offline_gnn_test": {
+    "started_at": "2026-04-24T03:58:35.783470+00:00",
+    "ok": true,
+    "n_samples": 3,
+    "finished_at": "2026-04-24T03:58:36.552266+00:00",
+    "returncode": 0,
+    "wall_seconds": 0.7683824580017244
+  },
+  "phase1": {
+    "started_at": "2026-04-24T03:58:36.561533+00:00",
+    "ok": false
+  }
+}

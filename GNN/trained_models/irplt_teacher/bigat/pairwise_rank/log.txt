@@ -233,3 +233,13 @@
 [2026-04-23 16:44:35.779191] epoch=005 objective=pairwise_rank train_loss=0.3660 valid_loss=0.2154 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.1938 score_gap=nan col_emb_norm=4.2279 con_emb_norm=4.0484 param_update_norm=0.168554
 [2026-04-23 16:44:35.902351] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
 [2026-04-23 16:44:35.902445] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-24 10:58:34.681256] train_samples=58 valid_samples=24
+[2026-04-24 10:58:34.681890] dataset_type=teacher data_dir=/Users/trannguyenhung/Documents/THESIS/Code/Current Code/GNN/data/irplt_teacher label_sources={'teacher_rmp': 82}
+[2026-04-24 10:58:34.681950] model=BiGAT device=cpu hidden_dim=16
+[2026-04-24 10:58:34.681997] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-24 10:58:34.967300] epoch=001 objective=pairwise_rank train_loss=0.5513 valid_loss=0.3948 ranking_valid_mrr=0.9500 ranking_valid_top1=0.9000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=2.0000 binary_valid_f1=0.0000 pos_score=0.3229 neg_score=0.3165 score_gap=0.0064 col_emb_norm=4.0807 con_emb_norm=4.0473 param_update_norm=0.737020
+[2026-04-24 10:58:34.976827] saved best BiGAT model
+[2026-04-24 10:58:35.202653] epoch=002 objective=pairwise_rank train_loss=0.5011 valid_loss=0.4030 ranking_valid_mrr=0.9500 ranking_valid_top1=0.9000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=2.0000 binary_valid_f1=0.0000 pos_score=0.2597 neg_score=0.2774 score_gap=-0.0177 col_emb_norm=4.1095 con_emb_norm=4.1023 param_update_norm=0.690649
+[2026-04-24 10:58:35.428153] epoch=003 objective=pairwise_rank train_loss=0.4291 valid_loss=0.4275 ranking_valid_mrr=0.9500 ranking_valid_top1=0.9000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=2.0000 binary_valid_f1=0.0000 pos_score=0.1759 neg_score=0.2186 score_gap=-0.0428 col_emb_norm=4.2134 con_emb_norm=4.1027 param_update_norm=0.780188
+[2026-04-24 10:58:35.548587] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-24 10:58:35.548701] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png

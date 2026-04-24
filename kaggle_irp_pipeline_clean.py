@@ -23,7 +23,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from IPython.display import display
+try:
+    from IPython.display import display  # noqa: F401  — kept for parity with prior notebook API
+except Exception:  # pragma: no cover — outside notebook
+    display = print  # type: ignore[assignment]
 
 
 # =========================================================
@@ -200,15 +203,26 @@ def verify_gurobi() -> bool:
 
 
 def show_df(title: str, df: pd.DataFrame, max_rows: int = 10) -> None:
-    print(f"\n=== {title} ===")
+    # run_infra is initialized below — we rely on module-level globals set in section 5.
+    log_path = globals().get("RUN_LOG_PATH")
+    _rinfra = globals().get("run_infrastructure")
+    if _rinfra is not None:
+        _rinfra.safe_preview(title, df, rows=max_rows, log_path=log_path)
+        return
+    print(f"=== {title} ===")
     if df is None or df.empty:
         print("  (empty)")
         return
-    display(df.head(max_rows))
+    print(df.head(max_rows).to_string(index=False))
 
 
 def show_json(title: str, obj: Any) -> None:
-    print(f"\n=== {title} ===")
+    log_path = globals().get("RUN_LOG_PATH")
+    _rinfra = globals().get("run_infrastructure")
+    if _rinfra is not None:
+        _rinfra.safe_print_json(title, obj, log_path=log_path)
+        return
+    print(f"=== {title} ===")
     pprint.pprint(obj)
 
 
@@ -376,6 +390,12 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["IRP_RESULTS_DIR"] = str(RESULTS_DIR)
 # Force a strict CG convergence stop rule across direct runs and subprocesses.
 os.environ["IRP_CG_STOPPING_MODE"] = CG_STOPPING_MODE
+# Kaggle-safety defaults: quiet CG/pipeline prints, flush partial CG diagnostics
+# to disk, and auto-resume BiGAT training from last_model.pt. Each can still be
+# overridden from outside if the user has already set the variable.
+os.environ.setdefault("IRP_QUIET", "1")
+os.environ.setdefault("IRP_CG_PARTIAL_DIR", str(RESULTS_DIR / "cg_partials"))
+os.environ.setdefault("IRP_TRAINING_AUTO_RESUME", "1")
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -390,6 +410,19 @@ if not verify_gurobi():
 
 import irp_gurobi_converted as irp
 irp = importlib.reload(irp)
+
+# --- Kaggle robustness wiring -------------------------------------------------
+# RunLogger tees stdout/stderr into Results/run.log so a kernel crash still
+# leaves a readable execution trail. RunState records phase completion so a
+# rerun can skip any stage whose artifacts already exist on disk.
+import run_infrastructure  # noqa: E402
+RUN_LOGGER = run_infrastructure.RunLogger(RESULTS_DIR)
+RUN_LOG_PATH = RUN_LOGGER.activate()
+RUN_STATE = run_infrastructure.RunState(RESULTS_DIR)
+print(f"[run_infrastructure] logging to {RUN_LOG_PATH}")
+print(f"[run_infrastructure] IRP_QUIET={os.environ.get('IRP_QUIET')} "
+      f"auto_resume={os.environ.get('IRP_TRAINING_AUTO_RESUME')} "
+      f"cg_partial_dir={os.environ.get('IRP_CG_PARTIAL_DIR')}")
 
 
 # =========================================================
@@ -429,11 +462,27 @@ if MULTI_SCENARIO_MODE:
         "--out-dir",             TEACHER_SCENARIO_OUT_DIR,
         "--continue-on-failure",
     ]
-    print("\n[Running scenario generator...]")
-    r = subprocess.run(scenario_cmd, cwd=str(REPO_ROOT))
-    if r.returncode != 0:
-        print(f"[WARNING] Scenario generator exited with code {r.returncode}. "
-              "Some scenarios may have failed — continuing with collected rows.")
+    agg_csv_probe = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
+    if RUN_STATE.is_done("scenario_generation") and agg_csv_probe.exists() and agg_csv_probe.stat().st_size > 100:
+        print(f"[scenario_generation] already done — reusing {agg_csv_probe}")
+        rc_scenarios = 0
+    else:
+        print("\n[Running scenario generator...]")
+        RUN_STATE.mark_start("scenario_generation", command=list(scenario_cmd))
+        rc_scenarios = run_infrastructure.quiet_subprocess(
+            scenario_cmd,
+            log_path=RUN_LOG_PATH,
+            cwd=REPO_ROOT,
+            env=os.environ.copy(),
+            tag="scenario_generator",
+            heartbeat_every=500,
+        )
+        if rc_scenarios == 0:
+            RUN_STATE.mark_done("scenario_generation", returncode=rc_scenarios)
+        else:
+            print(f"[WARNING] Scenario generator exited with code {rc_scenarios}. "
+                  "Some scenarios may have failed — continuing with collected rows.")
+            RUN_STATE.update("scenario_generation", returncode=rc_scenarios, partial_ok=True)
 
     agg_csv = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
     if not agg_csv.exists() or agg_csv.stat().st_size < 100:
@@ -563,10 +612,29 @@ train_cmd = [
     "--epochs",       str(GNN_TRAIN_EPOCHS),
     "--patience",     str(GNN_TRAIN_EPOCHS),   # rely on MRR early-stopping
     "--objective",    "pairwise_rank",
+    "--auto-resume",
 ]
-r = subprocess.run(train_cmd, cwd=str(REPO_ROOT))
-if r.returncode != 0:
-    print(f"[WARNING] BiGAT training exited with code {r.returncode}")
+# Skip retraining if a previous run finished and a best-checkpoint exists; the
+# BiGAT trainer itself auto-resumes from last_model.pt when a partial run
+# exists, so mid-epoch kernel deaths don't cost epochs either.
+if RUN_STATE.is_done("gnn_training") and checkpoint.exists():
+    print(f"[gnn_training] already done — reusing {checkpoint}")
+    rc_train = 0
+else:
+    RUN_STATE.mark_start("gnn_training", epochs=GNN_TRAIN_EPOCHS)
+    rc_train = run_infrastructure.quiet_subprocess(
+        train_cmd,
+        log_path=RUN_LOG_PATH,
+        cwd=REPO_ROOT,
+        env=os.environ.copy(),
+        tag="bigat_train",
+        heartbeat_every=200,
+    )
+    if rc_train == 0:
+        RUN_STATE.mark_done("gnn_training", returncode=rc_train)
+    else:
+        print(f"[WARNING] BiGAT training exited with code {rc_train} — will retry on next run")
+        RUN_STATE.update("gnn_training", returncode=rc_train, partial_ok=True)
 
 gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
 pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
@@ -592,12 +660,30 @@ if test_samples and checkpoint.exists():
         "--split",      "test",
         "--out-file",   str(offline_test_csv),
     ]
-    _t_off = time.perf_counter()
-    r = subprocess.run(test_cmd, cwd=str(REPO_ROOT))
-    offline_gnn_test_wall_seconds = time.perf_counter() - _t_off
-    if r.returncode != 0:
-        print(f"[WARNING] Offline test exited with code {r.returncode}")
+    # Skip re-running if we already have a complete offline-test CSV.
+    if RUN_STATE.is_done("offline_gnn_test") and offline_test_csv.exists() and offline_test_csv.stat().st_size > 50:
+        print(f"[offline_gnn_test] already done — reusing {offline_test_csv}")
+        offline_gnn_test_wall_seconds = float(RUN_STATE.get("offline_gnn_test").get("wall_seconds") or 0.0)
+        rc_offline = 0
     else:
+        RUN_STATE.mark_start("offline_gnn_test", n_samples=len(test_samples))
+        _t_off = time.perf_counter()
+        rc_offline = run_infrastructure.quiet_subprocess(
+            test_cmd,
+            log_path=RUN_LOG_PATH,
+            cwd=REPO_ROOT,
+            env=os.environ.copy(),
+            tag="bigat_test",
+            heartbeat_every=200,
+        )
+        offline_gnn_test_wall_seconds = time.perf_counter() - _t_off
+        if rc_offline == 0:
+            RUN_STATE.mark_done("offline_gnn_test", returncode=rc_offline,
+                                wall_seconds=offline_gnn_test_wall_seconds)
+        else:
+            print(f"[WARNING] Offline test exited with code {rc_offline} — will retry on next run")
+            RUN_STATE.update("offline_gnn_test", returncode=rc_offline, partial_ok=True)
+    if rc_offline == 0:
         show_offline_test_results(offline_test_csv)
     print(f"  [Offline GNN test] subprocess wall time: {offline_gnn_test_wall_seconds:.2f} s")
 else:
@@ -613,32 +699,45 @@ print("\n" + "=" * 70)
 print("PHASE 1 — OFFLINE BASELINE  (training data, no GNN)")
 print("=" * 70)
 
-_, p1_data, _, p1_val_target, p1_meta = build_data(irp, TRAIN_DATA_PATH)
-show_json("Phase 1 dataset metadata", p1_meta)
-
-# Cost-scale diagnostic (LT vs shortage — thesis examiners will ask)
-if p1_data.stores and p1_data.products:
-    _s, _p = next(iter(p1_data.stores)), next(iter(p1_data.products))
-    _pairs = [(i, j) for i in p1_data.stores for j in p1_data.stores if i != j]
-    _lt_avg = sum(p1_data.transship_unit_cost.get(pr, 0.0) for pr in _pairs) / max(1, len(_pairs))
-    _srt = p1_data.shortage_cost.get((_s, _p), float("nan"))
-    ratio = _lt_avg / max(float(_srt), 1e-12)
-    print(f"\n[Cost Diagnostic]  shortage_unit={float(_srt):.4f}  lt_avg={_lt_avg:.4f}  "
-          f"ratio={ratio:.4f}  multiplier={LT_COST_MULTIPLIER}x")
-    if ratio < 0.1:
-        print("  *** LT near-free vs shortage — consider LT_COST_MULTIPLIER ≥ 5 for thesis ***")
-
-# validation_target is no longer dumped to disk — it is merged into each
-# phase's Results/<phase>/validation_comparison.csv inside save_phase_artifacts.
-p1_results = run_phase(irp, p1_data, use_gnn=False, collect_teacher=False)
-
-p1_summary = phase_summary(p1_results, "phase1_offline_baseline")
-show_df("Phase 1 Summary", pd.DataFrame([p1_summary]))
-save_phase_outputs(p1_results, "phase1_offline_baseline", validation_target=p1_val_target)
-
-phase_summaries: List[Dict[str, Any]] = [p1_summary]
+phase_summaries: List[Dict[str, Any]] = []
+p1_results: Optional[Dict[str, Any]] = None
 gnn_results: Optional[Dict[str, Any]] = None
-ol_results:  Optional[Dict[str, Any]] = None
+ol_results: Optional[Dict[str, Any]] = None
+
+_p1_summary_json = RESULTS_DIR / "thesis_summary" / "phase1_offline_baseline_summary.json"
+if RUN_STATE.is_done("phase1") and _p1_summary_json.exists():
+    with open(_p1_summary_json) as _f:
+        p1_summary = json.load(_f)
+    phase_summaries.append(p1_summary)
+    print(f"[phase1] already done — reused summary from {_p1_summary_json}")
+else:
+    RUN_STATE.mark_start("phase1")
+    _, p1_data, _, p1_val_target, p1_meta = build_data(irp, TRAIN_DATA_PATH)
+    show_json("Phase 1 dataset metadata", p1_meta)
+
+    # Cost-scale diagnostic (LT vs shortage — thesis examiners will ask)
+    if p1_data.stores and p1_data.products:
+        _s, _p = next(iter(p1_data.stores)), next(iter(p1_data.products))
+        _pairs = [(i, j) for i in p1_data.stores for j in p1_data.stores if i != j]
+        _lt_avg = sum(p1_data.transship_unit_cost.get(pr, 0.0) for pr in _pairs) / max(1, len(_pairs))
+        _srt = p1_data.shortage_cost.get((_s, _p), float("nan"))
+        ratio = _lt_avg / max(float(_srt), 1e-12)
+        print(f"\n[Cost Diagnostic]  shortage_unit={float(_srt):.4f}  lt_avg={_lt_avg:.4f}  "
+              f"ratio={ratio:.4f}  multiplier={LT_COST_MULTIPLIER}x")
+        if ratio < 0.1:
+            print("  *** LT near-free vs shortage — consider LT_COST_MULTIPLIER ≥ 5 for thesis ***")
+
+    # validation_target is no longer dumped to disk — it is merged into each
+    # phase's Results/<phase>/validation_comparison.csv inside save_phase_artifacts.
+    p1_results = run_phase(irp, p1_data, use_gnn=False, collect_teacher=False)
+
+    p1_summary = phase_summary(p1_results, "phase1_offline_baseline")
+    show_df("Phase 1 Summary", pd.DataFrame([p1_summary]))
+    save_phase_outputs(p1_results, "phase1_offline_baseline", validation_target=p1_val_target)
+    _p1_summary_json.parent.mkdir(parents=True, exist_ok=True)
+    run_infrastructure.write_json_atomic(_p1_summary_json, p1_summary)
+    phase_summaries.append(p1_summary)
+    RUN_STATE.mark_done("phase1")
 
 
 # =========================================================
@@ -646,26 +745,37 @@ ol_results:  Optional[Dict[str, Any]] = None
 # =========================================================
 
 online_inference_wall_seconds: Optional[float] = None
+_p2_summary_json = RESULTS_DIR / "thesis_summary" / "phase2_online_inference_summary.json"
 if RUN_PHASE_2 and checkpoint.exists() and gnn_history:
-    print("\n" + "=" * 70)
-    print("PHASE 2 — ONLINE INFERENCE  (test data, GNN scoring)")
-    print("=" * 70)
+    if RUN_STATE.is_done("phase2") and _p2_summary_json.exists():
+        with open(_p2_summary_json) as _f:
+            p2_summary = json.load(_f)
+        phase_summaries.append(p2_summary)
+        online_inference_wall_seconds = float(RUN_STATE.get("phase2").get("wall_seconds") or 0.0)
+        print(f"[phase2] already done — reused summary from {_p2_summary_json}")
+    else:
+        RUN_STATE.mark_start("phase2")
+        print("\n" + "=" * 70)
+        print("PHASE 2 — ONLINE INFERENCE  (test data, GNN scoring)")
+        print("=" * 70)
 
-    require_path(TEST_DATA_PATH, "TEST_DATA_PATH (Phase 2)")
-    _, p2_data, _, p2_val_target, p2_meta = build_data(irp, TEST_DATA_PATH)
-    show_json("Phase 2 test data metadata", p2_meta)
+        require_path(TEST_DATA_PATH, "TEST_DATA_PATH (Phase 2)")
+        _, p2_data, _, p2_val_target, p2_meta = build_data(irp, TEST_DATA_PATH)
+        show_json("Phase 2 test data metadata", p2_meta)
 
-    # Runtime category: ONLINE INFERENCE END-TO-END — full CG solve with GNN
-    # embedded inside the pricing loop. Separate from offline GNN test.
-    _t_p2 = time.perf_counter()
-    gnn_results = run_phase(irp, p2_data, use_gnn=True, collect_teacher=False)
-    online_inference_wall_seconds = time.perf_counter() - _t_p2
+        # Runtime category: ONLINE INFERENCE END-TO-END — full CG solve with GNN
+        # embedded inside the pricing loop. Separate from offline GNN test.
+        _t_p2 = time.perf_counter()
+        gnn_results = run_phase(irp, p2_data, use_gnn=True, collect_teacher=False)
+        online_inference_wall_seconds = time.perf_counter() - _t_p2
 
-    p2_summary = phase_summary(gnn_results, "phase2_online_inference")
-    phase_summaries.append(p2_summary)
-    show_df("Phase 2 Summary", pd.DataFrame([p2_summary]))
-    save_phase_outputs(gnn_results, "phase2_online_inference", validation_target=p2_val_target)
-    print(f"  [Online inference] Phase 2 end-to-end wall time: {online_inference_wall_seconds:.2f} s")
+        p2_summary = phase_summary(gnn_results, "phase2_online_inference")
+        phase_summaries.append(p2_summary)
+        show_df("Phase 2 Summary", pd.DataFrame([p2_summary]))
+        save_phase_outputs(gnn_results, "phase2_online_inference", validation_target=p2_val_target)
+        run_infrastructure.write_json_atomic(_p2_summary_json, p2_summary)
+        RUN_STATE.mark_done("phase2", wall_seconds=online_inference_wall_seconds)
+        print(f"  [Online inference] Phase 2 end-to-end wall time: {online_inference_wall_seconds:.2f} s")
 
 elif RUN_PHASE_2:
     print(f"\n[Phase 2 skipped]  checkpoint={checkpoint.exists()}  "
@@ -679,7 +789,14 @@ elif RUN_PHASE_2:
 # Fine-tunes the checkpoint in-place (resume_checkpoint=True).
 # Keep OFF by default; enable after Phase 2 is validated.
 
-if RUN_ONLINE_LEARNING and checkpoint.exists():
+_p3_summary_json = RESULTS_DIR / "thesis_summary" / "phase3_online_learning_summary.json"
+if RUN_ONLINE_LEARNING and checkpoint.exists() and RUN_STATE.is_done("phase3") and _p3_summary_json.exists():
+    with open(_p3_summary_json) as _f:
+        p3_summary = json.load(_f)
+    phase_summaries.append(p3_summary)
+    print(f"[phase3] already done — reused summary from {_p3_summary_json}")
+elif RUN_ONLINE_LEARNING and checkpoint.exists():
+    RUN_STATE.mark_start("phase3")
     print("\n" + "=" * 70)
     print("PHASE 3 — ONLINE LEARNING  (test data, fine-tune checkpoint)")
     print(f"  epochs={ONLINE_LEARNING_EPOCHS}  resume_checkpoint=True")
@@ -715,6 +832,8 @@ if RUN_ONLINE_LEARNING and checkpoint.exists():
     phase_summaries.append(p3_summary)
     show_df("Phase 3 Summary", pd.DataFrame([p3_summary]))
     save_phase_outputs(ol_results, "phase3_online_learning", validation_target=ol_val_target)
+    run_infrastructure.write_json_atomic(_p3_summary_json, p3_summary)
+    RUN_STATE.mark_done("phase3")
 
 elif RUN_ONLINE_LEARNING:
     print("[Phase 3 skipped] checkpoint not found — run and validate Phase 2 first.")
@@ -738,29 +857,43 @@ if RUN_BENCHMARK:
     # comparison_aggregate.csv (mean/std) and mirrors the aggregate to
     # thesis_summary/benchmark_comparison.csv.
     require_path(TEST_DATA_PATH, "TEST_DATA_PATH (Benchmark)")
-    _, bm_data, _, _, _ = build_data(irp, TEST_DATA_PATH)
-    _t_bm = time.perf_counter()
-    benchmark_df = irp.run_three_way_benchmark(
-        data=bm_data,
-        cg_iterations=CG_ITERATIONS,
-        time_limit=None,
-        bp_max_nodes=BP_MAX_NODES,
-        bp_max_depth=BP_MAX_DEPTH,
-        gnn_checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
-        demand_shock_seed=DEMAND_SHOCK_SEED,
-        demand_shock_probability=0.85,
-        demand_shock_reallocation_fraction=0.60,
-        demand_shock_reallocations_per_product_period=3,
-        demand_shock_non_dispatch_multiplier=1.8,
-        lt_activation_threshold=0.0,
-        heuristic_top_k=HEURISTIC_TOP_K,
-        enforce_integer_flows=False,
-        n_repeats=BENCHMARK_N_REPEATS,
-        results_dir=RESULTS_DIR,
-    )
-    benchmark_wall_seconds = time.perf_counter() - _t_bm
-    show_df("3-Way Benchmark Comparison (per-run)", benchmark_df)
     bench_agg_path = RESULTS_DIR / "benchmark" / "comparison_aggregate.csv"
+    bench_per_run_path = RESULTS_DIR / "benchmark" / "comparison_per_run.csv"
+    if RUN_STATE.is_done("benchmark") and bench_agg_path.exists() and bench_per_run_path.exists():
+        print(f"[benchmark] already done — reusing {bench_per_run_path}")
+        benchmark_df = pd.read_csv(bench_per_run_path)
+        benchmark_wall_seconds = float(RUN_STATE.get("benchmark").get("wall_seconds") or 0.0)
+    else:
+        RUN_STATE.mark_start("benchmark", n_repeats=BENCHMARK_N_REPEATS)
+        _, bm_data, _, _, _ = build_data(irp, TEST_DATA_PATH)
+        _t_bm = time.perf_counter()
+        try:
+            benchmark_df = irp.run_three_way_benchmark(
+                data=bm_data,
+                cg_iterations=CG_ITERATIONS,
+                time_limit=None,
+                bp_max_nodes=BP_MAX_NODES,
+                bp_max_depth=BP_MAX_DEPTH,
+                gnn_checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
+                demand_shock_seed=DEMAND_SHOCK_SEED,
+                demand_shock_probability=0.85,
+                demand_shock_reallocation_fraction=0.60,
+                demand_shock_reallocations_per_product_period=3,
+                demand_shock_non_dispatch_multiplier=1.8,
+                lt_activation_threshold=0.0,
+                heuristic_top_k=HEURISTIC_TOP_K,
+                enforce_integer_flows=False,
+                n_repeats=BENCHMARK_N_REPEATS,
+                results_dir=RESULTS_DIR,
+            )
+            benchmark_wall_seconds = time.perf_counter() - _t_bm
+            RUN_STATE.mark_done("benchmark", wall_seconds=benchmark_wall_seconds)
+        except Exception as _exc:
+            benchmark_wall_seconds = time.perf_counter() - _t_bm
+            print(f"[WARNING] Benchmark failed: {_exc} — will retry on next run")
+            RUN_STATE.update("benchmark", wall_seconds=benchmark_wall_seconds, error=str(_exc))
+            benchmark_df = None
+    show_df("3-Way Benchmark Comparison (per-run)", benchmark_df)
     if bench_agg_path.exists():
         show_df("3-Way Benchmark Comparison (aggregate mean/std)",
                 pd.read_csv(bench_agg_path))

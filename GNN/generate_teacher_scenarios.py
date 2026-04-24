@@ -380,6 +380,13 @@ def main() -> None:
     if aggregate_csv.exists():
         aggregate_rows = read_csv_rows(aggregate_csv)
         print(f"[generate] resuming — aggregate already has {len(aggregate_rows)} rows")
+    # Dedup key: every row carries source_instance (written by the teacher
+    # export). A scenario is "already in aggregate" if its source_instance
+    # appears there, so a rerun can skip it entirely without re-appending.
+    done_sources = {row.get("source_instance", "") for row in aggregate_rows if row.get("source_instance")}
+    # Drop any legacy aggregate rows missing source_instance — we cannot
+    # safely resume around them, so strip them to keep dedup clean.
+    aggregate_rows = [row for row in aggregate_rows if row.get("source_instance") in done_sources]
 
     for idx, scenario in enumerate(scenarios, start=1):
         # Include base + scenario id in the run-dir name so a quick `ls`
@@ -389,6 +396,39 @@ def main() -> None:
             f"{scenario['base_dataset_id']}__{scenario['scenario_id']}"
         ).replace("/", "-").replace(" ", "_")
         run_dir = out_dir / f"run_{idx:03d}__{safe_id}"
+        per_run_csv = run_dir / "cg_teacher_dataset.csv"
+        source_instance = scenario["source_instance"]
+
+        already_done = (
+            source_instance in done_sources
+            or (per_run_csv.exists() and per_run_csv.stat().st_size > 0)
+        )
+        if already_done:
+            if source_instance not in done_sources and per_run_csv.exists():
+                existing = [
+                    row for row in read_csv_rows(per_run_csv)
+                    if row.get("source_instance") == source_instance
+                ]
+                if existing:
+                    aggregate_rows.extend(existing)
+                    done_sources.add(source_instance)
+                    write_csv_rows(aggregate_csv, aggregate_rows)
+            print(f"[generate] skip idx={idx} source_instance={source_instance} (already done)")
+            manifest["scenarios"].append({
+                **scenario,
+                "run_idx": idx,
+                "run_dir": str(run_dir),
+                "teacher_rows_written": sum(1 for row in aggregate_rows if row.get("source_instance") == source_instance),
+                "runtime_seconds": 0.0,
+                "ok": True,
+                "resumed": True,
+                "split": split_assignment[source_instance],
+            })
+            manifest_path = out_dir / "scenarios_manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+            continue
+
         ok, csv_path, runtime = run_pipeline(
             scenario=scenario,
             project_root=project_root,
@@ -399,8 +439,13 @@ def main() -> None:
             pipeline_script=args.pipeline_script,
         )
         rows = read_csv_rows(csv_path) if ok else []
-        aggregate_rows.extend(rows)
-        write_csv_rows(aggregate_csv, aggregate_rows)
+        # Guard against any stray rows carrying a different source_instance
+        # (shouldn't happen, but keeps dedup invariants honest).
+        rows = [row for row in rows if row.get("source_instance", source_instance) == source_instance]
+        if ok and rows:
+            aggregate_rows.extend(rows)
+            done_sources.add(source_instance)
+            write_csv_rows(aggregate_csv, aggregate_rows)
         manifest["scenarios"].append({
             **scenario,
             "run_idx": idx,
@@ -408,7 +453,8 @@ def main() -> None:
             "teacher_rows_written": len(rows),
             "runtime_seconds": runtime,
             "ok": ok,
-            "split": split_assignment[scenario["source_instance"]],
+            "resumed": False,
+            "split": split_assignment[source_instance],
         })
         manifest_path = out_dir / "scenarios_manifest.json"
         with open(manifest_path, "w", encoding="utf-8") as f:

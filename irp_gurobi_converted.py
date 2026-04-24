@@ -175,6 +175,20 @@ def _add_efficiency_metrics(target: Dict[str, float], source: Dict[str, float]) 
 
 
 def print_efficiency_metrics(title: str, metrics: Dict[str, float]) -> None:
+    if _is_quiet():
+        if not metrics:
+            print(f"[{title}] (empty)")
+            return
+        rt = metrics.get("gurobi_runtime_seconds")
+        solves = metrics.get("rmp_solves")
+        parts = [f"[{title}]"]
+        if rt is not None:
+            parts.append(f"runtime={float(rt):.2f}s")
+        if solves is not None:
+            parts.append(f"rmp_solves={float(solves):.0f}")
+        parts.append(f"keys={len(metrics)}")
+        print(" ".join(parts))
+        return
     print(f"\n[{title}]")
     if not metrics:
         print("  No efficiency metrics available.")
@@ -270,7 +284,11 @@ def resolve_phase_label() -> str:
 INTEGER_FINAL_OUTPUT_COLUMNS = {
     "lt_qty",
     "predicted_end_qty",
+    "predicted_end_qty_realized",
+    "predicted_end_qty_forecast",
     "actual_end_qty",
+    "error",
+    "forecast_error",
     "shortage",
     "post_shock_shortage",
     "total_realized_demand",
@@ -291,6 +309,61 @@ def _integer_final_outputs_enabled() -> bool:
     in the primary output files (debug copies are always written).
     """
     return os.environ.get("IRP_INTEGER_FINAL_OUTPUTS", "1").lower() not in {"0", "false", "no", ""}
+
+
+def _is_quiet() -> bool:
+    """Suppress per-iteration pricing/RMP/pattern prints when IRP_QUIET=1.
+
+    Kaggle's __notebook__.ipynb balloons past 1 GB when multi-scenario runs
+    emit tens of thousands of CG iteration lines. With IRP_QUIET=1 the high-
+    frequency stdout is silenced here; the same content still appears in
+    Results/run.log via subprocess/stdout tee.
+    """
+    return os.environ.get("IRP_QUIET", "0").lower() not in {"0", "false", "no", ""}
+
+
+def _qprint(*args, **kwargs) -> None:
+    """print() that is a no-op when IRP_QUIET=1."""
+    if not _is_quiet():
+        print(*args, **kwargs)
+
+
+def _cg_partial_flush_dir() -> Optional[Path]:
+    """Where to drop partial CG diagnostics each iteration (for resume audit).
+
+    Set IRP_CG_PARTIAL_DIR=<path> to enable; unset disables. Written files:
+      <dir>/cg_episode_history.partial.json
+      <dir>/cg_episode_diagnostics.partial.json
+    """
+    raw = os.environ.get("IRP_CG_PARTIAL_DIR", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return path
+
+
+def _flush_cg_partials(cg_history: List[Dict[str, Any]],
+                      cg_diags: List[Dict[str, Any]]) -> None:
+    """Atomic dump of partial CG progress — survives kernel death."""
+    partial_dir = _cg_partial_flush_dir()
+    if partial_dir is None:
+        return
+    for name, payload in (
+        ("cg_episode_history.partial.json", cg_history),
+        ("cg_episode_diagnostics.partial.json", cg_diags),
+    ):
+        try:
+            target = partial_dir / name
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, default=str)
+            tmp.replace(target)
+        except OSError:
+            pass
 
 
 def _round_integer_columns(df: "pd.DataFrame", extra_cols: Optional[Iterable[str]] = None) -> "pd.DataFrame":
@@ -558,6 +631,18 @@ def load_gnn_training_history(checkpoint_path: str = DEFAULT_GNN_CHECKPOINT) -> 
 
 
 def print_gnn_training_history(history: List[Dict[str, Any]], checkpoint_path: str = DEFAULT_GNN_CHECKPOINT) -> None:
+    if _is_quiet():
+        if not history:
+            print("[GNN Training History] (none)")
+            return
+        last = history[-1]
+        print(
+            f"[GNN Training History] epochs={len(history)} "
+            f"last_epoch={int(last.get('epoch', last.get('episode', 0))):03d} "
+            f"last_train={float(last.get('train_loss', math.nan)):.4f} "
+            f"last_valid={float(last.get('valid_loss', math.nan)):.4f}"
+        )
+        return
     print("\n[GNN Training Loss By Episode]")
     if not history:
         print("  No GNN training history found. Build teacher graphs, then run GNN/03_train_bigat.py for final training.")
@@ -4447,9 +4532,9 @@ class LateralTransshipmentCG:
             "selected_patterns": len(best_sol.selected_patterns),
         }]
 
-        print("\n[CG] Active (product, period) pairs with positive need and surplus:")
+        _qprint("\n[CG] Active (product, period) pairs with positive need and surplus:")
         if not best_sol.active_product_periods:
-            print("  None. RMP is not activated for any product-period.")
+            _qprint("  None. RMP is not activated for any product-period.")
             self.cg_episode_diagnostics.append({
                 "episode": 0,
                 "active_product_period_count": 0,
@@ -4473,12 +4558,12 @@ class LateralTransshipmentCG:
             best_sol.efficiency_metrics = dict(rmp_metrics_total)
             return best_sol
         for p, t in sorted(best_sol.active_product_periods):
-            print(f"  product={p} | period={t}")
+            _qprint(f"  product={p} | period={t}")
 
-        print("\n[RMP] Initially selected LT patterns:")
+        _qprint("\n[RMP] Initially selected LT patterns:")
         if not best_sol.selected_patterns:
-            print("  None")
-        else:
+            _qprint("  None")
+        elif not _is_quiet():
             for pat_id in best_sol.selected_patterns:
                 pat = next(p for p in self.patterns if p.pattern_id == pat_id)
                 print("  " + format_pattern_detail(pat) + f" | lambda={best_sol.lambda_values[pat_id]:.4f}")
@@ -4500,16 +4585,20 @@ class LateralTransshipmentCG:
                 "improvement": 0.0,
             })
 
-            print(f"\n[Pricing] Iter {it}: proposed={len(new_patterns)}, added={added}")
-            for pat in new_patterns[:10]:
-                print(
-                    "  " + format_pattern_detail(pat)
-                    + f" | feature={pat.metadata.get('feature_name')}"
-                    + f" | rc={pat.metadata.get('reduced_cost')}"
-                    + f" | mean_acceptance={pat.metadata.get('mean_acceptance_score')}"
-                    + f" | mean_comp={pat.metadata.get('mean_compensation')}"
-                    + f" | gnn_score={pat.metadata.get('gnn_score')}"
-                )
+            if _is_quiet():
+                # One concise progress line per iter — safe to leave in notebook.
+                print(f"[Pricing] iter={it} proposed={len(new_patterns)} added={added}")
+            else:
+                print(f"\n[Pricing] Iter {it}: proposed={len(new_patterns)}, added={added}")
+                for pat in new_patterns[:10]:
+                    print(
+                        "  " + format_pattern_detail(pat)
+                        + f" | feature={pat.metadata.get('feature_name')}"
+                        + f" | rc={pat.metadata.get('reduced_cost')}"
+                        + f" | mean_acceptance={pat.metadata.get('mean_acceptance_score')}"
+                        + f" | mean_comp={pat.metadata.get('mean_compensation')}"
+                        + f" | gnn_score={pat.metadata.get('gnn_score')}"
+                    )
 
             if added == 0 and stopping_mode != "fixed_budget":
                 best_sol.iterations_run = it - 1
@@ -4523,6 +4612,7 @@ class LateralTransshipmentCG:
                     "selected_patterns": len(best_sol.selected_patterns),
                 })
                 self.cg_episode_diagnostics.append(episode_summary)
+                _flush_cg_partials(self.cg_history, self.cg_episode_diagnostics)
                 if new_patterns:
                     print(
                         f"[CG] {len(new_patterns)} negative-RC column(s) priced but all already in pool "
@@ -4557,15 +4647,18 @@ class LateralTransshipmentCG:
                 "added_columns": added,
                 "selected_patterns": len(sol.selected_patterns),
             })
-            print(f"[CG] Iter {it}: objective = {sol.objective:.6f}, improvement = {improvement:.6f}")
-
-            print("[RMP] Selected LT patterns after re-optimization:")
-            if not sol.selected_patterns:
-                print("  None")
+            _flush_cg_partials(self.cg_history, self.cg_episode_diagnostics)
+            if _is_quiet():
+                print(f"[CG] iter={it} obj={sol.objective:.4f} delta={improvement:.4f} selected={len(sol.selected_patterns)}")
             else:
-                for pat_id in sol.selected_patterns:
-                    pat = next(p for p in self.patterns if p.pattern_id == pat_id)
-                    print("  " + format_pattern_detail(pat) + f" | lambda={sol.lambda_values[pat_id]:.4f}")
+                print(f"[CG] Iter {it}: objective = {sol.objective:.6f}, improvement = {improvement:.6f}")
+                print("[RMP] Selected LT patterns after re-optimization:")
+                if not sol.selected_patterns:
+                    print("  None")
+                else:
+                    for pat_id in sol.selected_patterns:
+                        pat = next(p for p in self.patterns if p.pattern_id == pat_id)
+                        print("  " + format_pattern_detail(pat) + f" | lambda={sol.lambda_values[pat_id]:.4f}")
 
             if stopping_mode == "hybrid" and improvement <= improvement_tol:
                 print(f"[CG] Improvement {improvement:.2e} <= tol {improvement_tol:.2e}. Converged. [stopping_mode=hybrid]")
@@ -4767,6 +4860,17 @@ class LateralTransshipmentCG:
             self.branch_bounds = original_branch_bounds
 
     def _print_cg_episode_history(self) -> None:
+        if _is_quiet():
+            if not self.cg_history:
+                print("[CG Episode History] (empty)")
+                return
+            last = self.cg_history[-1]
+            print(
+                f"[CG Episode History] episodes={len(self.cg_history)} "
+                f"final_cost={float(last['total_cost']):.4f} "
+                f"final_selected={int(last['selected_patterns'])}"
+            )
+            return
         print("\n[CG Total Cost By Episode]")
         if not self.cg_history:
             print("  No CG episode history recorded.")
@@ -4917,6 +5021,13 @@ def print_demand_fulfillment(fulfillment_df: pd.DataFrame) -> None:
 
 
 def print_post_shock_fulfillment(fulfillment_df: pd.DataFrame) -> None:
+    if _is_quiet():
+        if fulfillment_df.empty:
+            print("[Post-Shock Demand Fulfillment] (empty)")
+            return
+        mean_rate = float(fulfillment_df["post_shock_fulfillment_rate"].mean())
+        print(f"[Post-Shock Demand Fulfillment] rows={len(fulfillment_df)} mean_rate={mean_rate:.4f}")
+        return
     print("\n[Post-Shock Demand Fulfillment Rate By Store-Period]")
     if fulfillment_df.empty:
         print("  No post-shock demand fulfillment rows available.")
@@ -5095,6 +5206,10 @@ def build_realized_operating_cost_breakdown(
 
 
 def print_cost_breakdown(title: str, cost_breakdown: Dict[str, float]) -> None:
+    if _is_quiet():
+        total = sum(float(v) for v in cost_breakdown.values())
+        print(f"[{title}] total={total:.4f} keys={len(cost_breakdown)}")
+        return
     print(f"\n[{title}]")
     for key, value in cost_breakdown.items():
         print(f"  {key}: {float(value):.6f}")
@@ -5180,6 +5295,13 @@ def build_lt_plan_df_from_cg(cg_solution: CGSolution, patterns: List[LTPattern],
 
 
 def print_lt_plan(lt_plan_df: pd.DataFrame, title: str = "Lateral Transshipment Plan") -> None:
+    if _is_quiet():
+        if lt_plan_df.empty:
+            print(f"[{title}] (empty)")
+            return
+        total_cost = float(lt_plan_df["lt_total_cost"].sum()) if "lt_total_cost" in lt_plan_df else 0.0
+        print(f"[{title}] rows={len(lt_plan_df)} total_cost={total_cost:.4f}")
+        return
     print(f"\n[{title}]")
     if lt_plan_df.empty:
         print("  No lateral transshipment moves selected.")
@@ -5919,7 +6041,11 @@ class IRPResearchPipeline:
             allow_lateral_transshipment=False,
             cw_dispatch_cycle=cw_dispatch_cycle,
         )
-        pprint.pprint(baseline_sol.summary())
+        if _is_quiet():
+            _summary = baseline_sol.summary()
+            print(f"[Baseline Summary] obj={_summary.get('objective'):.4f} keys={len(_summary)}" if isinstance(_summary, dict) else "[Baseline Summary] printed")
+        else:
+            pprint.pprint(baseline_sol.summary())
         print_efficiency_metrics("Baseline Solver Efficiency", baseline_sol.efficiency_metrics)
         baseline_cost_breakdown = build_full_irpt_cost_breakdown(self.data, baseline_sol)
         print_cost_breakdown("Baseline Full IRPT Cost Breakdown", baseline_cost_breakdown)
@@ -5946,13 +6072,18 @@ class IRPResearchPipeline:
         )
         forecast_fulfillment_df = build_forecast_fulfillment_df(self.data, baseline_sol)
         demand_fulfillment_df = build_post_shock_fulfillment_df(self.data)
-        print("[Hidden Demand Shock Summary]")
-        pprint.pprint(shock_summary)
-        print("[Post-Shock Inventory State Summary]")
-        pprint.pprint(post_shock_summary)
-        print("[Post-Shock LT Diagnostics]")
-        pprint.pprint(post_shock_lt_diagnostics)
-        print_post_shock_fulfillment(demand_fulfillment_df)
+        if _is_quiet():
+            print(f"[Hidden Demand Shock Summary] keys={len(shock_summary) if isinstance(shock_summary, dict) else 'n/a'}")
+            print(f"[Post-Shock Inventory State Summary] keys={len(post_shock_summary) if isinstance(post_shock_summary, dict) else 'n/a'}")
+            print(f"[Post-Shock LT Diagnostics] keys={len(post_shock_lt_diagnostics) if isinstance(post_shock_lt_diagnostics, dict) else 'n/a'}")
+        else:
+            print("[Hidden Demand Shock Summary]")
+            pprint.pprint(shock_summary)
+            print("[Post-Shock Inventory State Summary]")
+            pprint.pprint(post_shock_summary)
+            print("[Post-Shock LT Diagnostics]")
+            pprint.pprint(post_shock_lt_diagnostics)
+            print_post_shock_fulfillment(demand_fulfillment_df)
 
         initial_patterns = []
         if use_random_initial_patterns:
@@ -6030,7 +6161,11 @@ class IRPResearchPipeline:
             )
         else:
             cg_sol = cg_engine.run_column_generation(max_iter=cg_iterations, msg=msg)
-        pprint.pprint(cg_sol.summary())
+        if _is_quiet():
+            _cg_summary = cg_sol.summary()
+            print(f"[CG Summary] obj={cg_sol.objective:.4f} selected={len(cg_sol.selected_patterns)} keys={len(_cg_summary) if isinstance(_cg_summary, dict) else 'n/a'}")
+        else:
+            pprint.pprint(cg_sol.summary())
         print_efficiency_metrics("CG RMP Solver Efficiency", cg_sol.efficiency_metrics)
         lt_plan_df = build_lt_plan_df_from_cg(cg_sol, cg_engine.patterns, self.data)
         print_lt_plan(lt_plan_df, title="CG Lateral Transshipment Plan")
@@ -6079,7 +6214,16 @@ class IRPResearchPipeline:
         print("\n" + "=" * 80)
         print("STEP 4 - Comparison")
         print("=" * 80)
-        pprint.pprint(comparison)
+        if _is_quiet():
+            print(
+                f"[Comparison] forecast_plan={comparison['forecast_dc_plan_objective']:.4f} "
+                f"realized_no_lt={comparison['realized_operating_cost_without_lt']:.4f} "
+                f"realized_with_lt={comparison['realized_operating_cost_with_cg_lt']:.4f} "
+                f"delta={comparison['realized_cost_delta_without_minus_with_lt']:.4f} "
+                f"runtime={pipeline_runtime_seconds:.2f}s"
+            )
+        else:
+            pprint.pprint(comparison)
 
         return {
             "baseline_solution": baseline_sol,
@@ -6666,13 +6810,18 @@ def write_results_readme(
         lines.append("")
     if phase_summaries:
         lines.append("## Phase-level headline metrics")
+        def _fmt(v: Any, spec: str) -> str:
+            try:
+                return format(float(v), spec)
+            except (TypeError, ValueError):
+                return "NA"
         for s in phase_summaries:
             lines.append(
                 f"- **{s.get('phase', '?')}**  "
-                f"cost_no_lt_M={s.get('cost_no_lt_M', 'NA'):.3f}  "
-                f"cost_with_lt_M={s.get('cost_with_lt_M', 'NA'):.3f}  "
-                f"lt_saving_M={s.get('lt_saving_M', 'NA'):.3f}  "
-                f"runtime_sec={s.get('runtime_sec', 'NA'):.1f}"
+                f"cost_no_lt_M={_fmt(s.get('cost_no_lt_M'), '.3f')}  "
+                f"cost_with_lt_M={_fmt(s.get('cost_with_lt_M'), '.3f')}  "
+                f"lt_saving_M={_fmt(s.get('lt_saving_M'), '.3f')}  "
+                f"runtime_sec={_fmt(s.get('runtime_sec'), '.1f')}"
             )
         lines.append("")
     if runtime_breakdown:

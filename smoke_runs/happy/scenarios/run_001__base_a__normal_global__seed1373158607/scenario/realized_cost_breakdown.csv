@@ -1,0 +1,4 @@
+scenario,direct_cw_unit_cost_executed_plan,store_holding_cost_realized,warehouse_holding_cost_executed_plan,route_distance_cost_executed_plan,vehicle_fixed_cost_executed_plan,lateral_transshipment_cost_realized,shortage_cost_realized,total_realized_operating_cost,total_realized_shortage_units,total_realized_store_inventory_units
+without_lt,21547.8,681241950752.0001,4395825617000.0005,31779.6,2950.0,0.0,24910211.608,5077092534241.009,27735.8864,376746.5648
+with_cg_lt,21547.8,681241950752.0001,4395825617000.0005,31779.6,2950.0,41568.526468,261161.708605,5077067926759.636,262.474079,376746.5648
+delta_no_lt_minus_with_lt,0.0,0.0,0.0,0.0,0.0,-41568.526468,24649049.899395,24607481.373047,27473.412321,0.0

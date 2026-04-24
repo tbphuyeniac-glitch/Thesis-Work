@@ -1,0 +1,53 @@
+[
+  {
+    "branch_node_id": 0,
+    "episode": 1,
+    "n_candidates": 787,
+    "n_selected": 787,
+    "selection_mode": "teacher_full_batch_no_gnn_prefilter",
+    "adaptive_k_star": 787,
+    "negative_reduced_cost_candidates": 787,
+    "classical_fallback_enabled": false,
+    "classical_fallback_used": false,
+    "fallback_idx": null,
+    "selected": [],
+    "per_group_diagnostics": [],
+    "gnn_min_per_group": null,
+    "groups_forced_by_quota": 0,
+    "selected_by_gnn_in_rmp": 0
+  },
+  {
+    "branch_node_id": 0,
+    "episode": 2,
+    "n_candidates": 113,
+    "n_selected": 113,
+    "selection_mode": "teacher_full_batch_no_gnn_prefilter",
+    "adaptive_k_star": 113,
+    "negative_reduced_cost_candidates": 113,
+    "classical_fallback_enabled": false,
+    "classical_fallback_used": false,
+    "fallback_idx": null,
+    "selected": [],
+    "per_group_diagnostics": [],
+    "gnn_min_per_group": null,
+    "groups_forced_by_quota": 0,
+    "selected_by_gnn_in_rmp": 0
+  },
+  {
+    "branch_node_id": 0,
+    "episode": 3,
+    "n_candidates": 4,
+    "n_selected": 4,
+    "selection_mode": "teacher_full_batch_no_gnn_prefilter",
+    "adaptive_k_star": 4,
+    "negative_reduced_cost_candidates": 4,
+    "classical_fallback_enabled": false,
+    "classical_fallback_used": false,
+    "fallback_idx": null,
+    "selected": [],
+    "per_group_diagnostics": [],
+    "gnn_min_per_group": null,
+    "groups_forced_by_quota": 0,
+    "selected_by_gnn_in_rmp": 0
+  }
+]

@@ -1,0 +1,2 @@
+direct_cw_unit_cost,store_holding_cost,warehouse_holding_cost,route_distance_cost,vehicle_fixed_cost,lateral_transshipment_cost,shortage_cost,objective_recomputed,gurobi_objective
+25689.8,132894750000.0,8892651894000.0,37071.2,3000.0,0.0,50507240.0,9025597217001.0,9025597217001.004
