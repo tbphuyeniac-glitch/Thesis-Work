@@ -231,6 +231,14 @@ def require_path(path: Path, label: str, fatal: bool = True) -> bool:
 
 
 def prepare_working_repo() -> None:
+    stable_cwd = REPO_ROOT.parent
+    stable_cwd.mkdir(parents=True, exist_ok=True)
+    try:
+        current_cwd = Path.cwd()
+    except FileNotFoundError:
+        current_cwd = None
+    if current_cwd is None or REPO_ROOT == current_cwd or REPO_ROOT in current_cwd.parents:
+        os.chdir(stable_cwd)
     if REPO_ROOT.exists() and REFRESH_WORKING_REPO:
         print("Removing old clone:", REPO_ROOT)
         shutil.rmtree(REPO_ROOT)
@@ -239,7 +247,7 @@ def prepare_working_repo() -> None:
         return
     print("Cloning:", REPO_URL)
     r = subprocess.run(["git", "clone", REPO_URL, str(REPO_ROOT)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, cwd=str(stable_cwd))
     if r.returncode != 0:
         print(r.stdout, r.stderr)
         raise RuntimeError("git clone failed")
