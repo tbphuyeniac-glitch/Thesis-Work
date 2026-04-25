@@ -1012,6 +1012,28 @@ class StackelbergDecision:
 
 
 @dataclass
+class FollowerBestResponseResult:
+    """Follower-optimal LT plan for one (product, period).
+
+    The follower observes post-delivery, post-shock store inventories and
+    minimises LT shipping cost + shortage penalty on residual unmet need +
+    holding cost on remaining surplus (units that could not be moved away).
+    """
+    product: Any
+    period: Any
+    flows: Dict[Tuple[Any, Any], float]  # (donor, receiver) -> qty shipped
+    lt_cost: float                       # total LT shipping + fixed cost
+    shortage_reduction: float            # units of need covered by LT
+    remaining_need: float                # uncovered need after follower LT
+    remaining_surplus: float             # unused surplus after follower LT
+    shortage_penalty: float              # penalty on remaining_need
+    holding_cost: float                  # holding cost on remaining_surplus
+    total_cost: float                    # lt_cost + shortage_penalty + holding_cost
+    n_arcs_used: int
+    solver_used: str = "greedy"          # "greedy" | "lp"
+
+
+@dataclass
 class CGSolution:
     status: str
     objective: float
@@ -1024,6 +1046,13 @@ class CGSolution:
     iterations_run: int = 0
     efficiency_metrics: Dict[str, float] = field(default_factory=dict)
     branch_summary: Dict[str, Any] = field(default_factory=dict)
+    # Stackelberg follower best-response computed after CG converges.
+    # Keys: (product, period); Values: FollowerBestResponseResult.
+    follower_solution: Optional[Dict[Tuple[Any, Any], "FollowerBestResponseResult"]] = None
+    # Per-pattern system-cost delta recorded during follower-aware pricing.
+    stackelberg_column_scores: List[Dict[str, Any]] = field(default_factory=list)
+    # Post-convergence check: were there unselected patterns that would still improve cost?
+    stackelberg_validation: Optional[Dict[str, Any]] = None
 
     def summary(self) -> Dict:
         payload = {
@@ -2689,6 +2718,291 @@ def format_pattern_detail(pat):
     )
 
 
+# ============================================================================
+# FOLLOWER BEST-RESPONSE SOLVER
+# ============================================================================
+
+class FollowerBestResponseSolver:
+    """Solves the store's optimal lateral transshipment for a given post-shock inventory state.
+
+    For a specific (product, period) the solver decides store-to-store
+    transfers to minimise:
+
+        Σ_{i,j} [ship_cost[i,j,p] * q[i,j] + fixed[i,j] * 1{q[i,j]>0}]
+        + Σ_j  shortage_cost[j,p] * max(0, need[j] - Σ_i q[i,j])
+        + Σ_i  holding_cost[i,p] * max(0, surplus[i] - Σ_j q[i,j])
+
+    subject to:
+        Σ_j q[i,j] ≤ surplus[i]              (donor capacity)
+        Σ_i q[i,j] ≤ need[j]                 (receiver capacity)
+        q[i,j] ≥ min_lateral_qty  if arc used (minimum shipment MOQ)
+        q[i,j] ≥ 0
+
+    Used by the follower-aware LT pricing step to score CG candidate columns
+    by total system cost impact before admitting them to the RMP.
+
+    Implemented as an O(n²) greedy heuristic (default) — fast enough for
+    scoring hundreds of candidate columns per CG iteration — or as an LP
+    relaxation via Gurobi (drops fixed charges; used for final validation).
+
+    The greedy prioritises arcs by *net unit benefit*:
+        net_benefit = shortage_cost[j,p] - ship_cost[i,j,p]
+    An arc is activated only when:
+        net_benefit > 0  AND
+        effective quantity ≥ min_lateral_qty  AND
+        fixed-cost break-even is satisfied.
+    """
+
+    def __init__(
+        self,
+        data: "IRPData",
+        min_lateral_qty: float = 5.0,
+        use_exact_lp: bool = False,
+    ) -> None:
+        self.data = data
+        self.min_lateral_qty = max(0.0, float(min_lateral_qty))
+        self.use_exact_lp = use_exact_lp
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def solve_for_product_period(
+        self,
+        p: Any,
+        t: Any,
+        need: Dict[Any, float],
+        surplus: Dict[Any, float],
+    ) -> "FollowerBestResponseResult":
+        """Solve follower best-response for one (product, period).
+
+        `need` and `surplus` are keyed as (store, product, period).
+        """
+        d = self.data
+        donors = [s for s in d.stores if surplus.get((s, p, t), 0.0) > 1e-9]
+        receivers = [s for s in d.stores if need.get((s, p, t), 0.0) > 1e-9]
+        if not donors or not receivers:
+            _sp = sum(d.shortage_cost.get((s, p), 0.0) * max(0.0, need.get((s, p, t), 0.0)) for s in d.stores)
+            _hc = sum(d.holding_cost_store.get((s, p), 0.0) * max(0.0, float(surplus.get((s, p, t), 0.0))) for s in d.stores)
+            return FollowerBestResponseResult(
+                product=p, period=t, flows={},
+                lt_cost=0.0, shortage_reduction=0.0,
+                remaining_need=sum(max(0.0, need.get((s, p, t), 0.0)) for s in d.stores),
+                remaining_surplus=sum(max(0.0, float(surplus.get((s, p, t), 0.0))) for s in d.stores),
+                shortage_penalty=_sp,
+                holding_cost=_hc,
+                total_cost=_sp + _hc,
+                n_arcs_used=0,
+                solver_used="greedy_empty",
+            )
+
+        # Build arc table: (donor, receiver, avail_surplus, avail_need,
+        #                    ship_cost, fixed_cost, shortage_benefit, net_unit_benefit)
+        arcs = []
+        for i in donors:
+            s_i = float(surplus.get((i, p, t), 0.0))
+            if s_i <= 1e-9:
+                continue
+            for j in receivers:
+                if i == j:
+                    continue
+                n_j = float(need.get((j, p, t), 0.0))
+                if n_j <= 1e-9:
+                    continue
+                ship = float(d.ship_cost_lt.get((i, j, p), 0.0))
+                fixed = float(d.fixed_dispatch_lt.get((i, j), 0.0))
+                spen = float(d.shortage_cost.get((j, p), 0.0))
+                net_unit = spen - ship  # benefit per unit
+                arcs.append((i, j, s_i, n_j, ship, fixed, spen, net_unit))
+
+        if not arcs:
+            return self._empty_result(p, t, need, surplus)
+
+        if self.use_exact_lp:
+            return self._solve_lp(p, t, need, surplus, arcs)
+        return self._solve_greedy(p, t, need, surplus, arcs)
+
+    def solve_all_active(
+        self,
+        need: Dict[Any, float],
+        surplus: Dict[Any, float],
+        active_product_periods: Optional[Set[Any]] = None,
+    ) -> Dict[Tuple[Any, Any], "FollowerBestResponseResult"]:
+        """Solve follower best-response for every active (product, period).
+
+        Returns a dict keyed (product, period) → FollowerBestResponseResult.
+        """
+        results: Dict[Tuple[Any, Any], FollowerBestResponseResult] = {}
+        d = self.data
+        pts = active_product_periods or {(p, t) for p in d.products for t in d.periods}
+        for p, t in pts:
+            results[(p, t)] = self.solve_for_product_period(p, t, need, surplus)
+        return results
+
+    # ------------------------------------------------------------------
+    # Internal solvers
+    # ------------------------------------------------------------------
+
+    def _solve_greedy(
+        self,
+        p: Any,
+        t: Any,
+        need: Dict[Any, float],
+        surplus: Dict[Any, float],
+        arcs: List[tuple],
+    ) -> "FollowerBestResponseResult":
+        """Greedy arc-by-arc assignment sorted by net unit benefit."""
+        d = self.data
+        min_qty = self.min_lateral_qty
+        # Mutable residuals
+        rem_need = {s: max(0.0, float(need.get((s, p, t), 0.0))) for s in d.stores}
+        rem_surplus = {s: max(0.0, float(surplus.get((s, p, t), 0.0))) for s in d.stores}
+
+        # Sort arcs: prefer high net_unit_benefit; break ties by descending qty_cap
+        arcs_sorted = sorted(
+            arcs,
+            key=lambda a: (a[7], min(a[2], a[3])),  # net_unit, then qty cap
+            reverse=True,
+        )
+
+        flows: Dict[Tuple[Any, Any], float] = {}
+        lt_cost = 0.0
+        shortage_reduction = 0.0
+
+        for i, j, _, _, ship, fixed, spen, net_unit in arcs_sorted:
+            avail_s = rem_surplus[i]
+            avail_n = rem_need[j]
+            qty = min(avail_s, avail_n)
+            if qty < min_qty:
+                continue
+            # Check fixed-cost break-even: fixed < net_unit * qty
+            if fixed > 0 and net_unit * qty <= fixed:
+                continue
+            # Only ship if economically beneficial (saves more shortage cost than it costs)
+            if net_unit <= 0:
+                continue
+            flows[(i, j)] = qty
+            lt_cost += ship * qty + fixed
+            shortage_reduction += qty
+            rem_surplus[i] = max(0.0, avail_s - qty)
+            rem_need[j] = max(0.0, avail_n - qty)
+
+        remaining_need = sum(max(0.0, rem_need[s]) for s in d.stores)
+        remaining_surplus = sum(max(0.0, rem_surplus[s]) for s in d.stores)
+        shortage_penalty = sum(
+            float(d.shortage_cost.get((s, p), 0.0)) * max(0.0, rem_need[s])
+            for s in d.stores
+        )
+        holding_cost = sum(
+            float(d.holding_cost_store.get((s, p), 0.0)) * max(0.0, rem_surplus[s])
+            for s in d.stores
+        )
+        return FollowerBestResponseResult(
+            product=p, period=t,
+            flows=flows,
+            lt_cost=lt_cost,
+            shortage_reduction=shortage_reduction,
+            remaining_need=remaining_need,
+            remaining_surplus=remaining_surplus,
+            shortage_penalty=shortage_penalty,
+            holding_cost=holding_cost,
+            total_cost=lt_cost + shortage_penalty + holding_cost,
+            n_arcs_used=len(flows),
+            solver_used="greedy",
+        )
+
+    def _solve_lp(
+        self,
+        p: Any,
+        t: Any,
+        need: Dict[Any, float],
+        surplus: Dict[Any, float],
+        arcs: List[tuple],
+    ) -> "FollowerBestResponseResult":
+        """LP relaxation via Gurobi (fixed charges dropped, used for final validation)."""
+        d = self.data
+        pairs = [(a[0], a[1]) for a in arcs]
+        arc_map = {(a[0], a[1]): a for a in arcs}
+
+        mdl = gp.Model("FollowerLP", env=get_gurobi_env())
+        mdl.Params.OutputFlag = 0
+        q = mdl.addVars(pairs, lb=0.0, name="q")
+        resid = mdl.addVars(
+            [s for s in d.stores if need.get((s, p, t), 0.0) > 1e-9],
+            lb=0.0, name="resid",
+        )
+
+        # Donor capacity
+        for i in {a[0] for a in arcs}:
+            out = [q[i, j] for (ii, j) in pairs if ii == i]
+            if out:
+                mdl.addConstr(gp.quicksum(out) <= float(surplus.get((i, p, t), 0.0)))
+        # Receiver coverage
+        for j in {a[1] for a in arcs}:
+            inn = [q[i, j] for (i, jj) in pairs if jj == j]
+            n_j = float(need.get((j, p, t), 0.0))
+            if inn:
+                mdl.addConstr(gp.quicksum(inn) + resid[j] >= n_j)
+                mdl.addConstr(gp.quicksum(inn) <= n_j)
+            else:
+                resid[j].LB = n_j
+        # Objective: shipping cost + shortage penalty on residual need
+        ship_obj = gp.quicksum(float(arc_map[k][4]) * q[k] for k in pairs)
+        pen_obj = gp.quicksum(
+            float(d.shortage_cost.get((j, p), 0.0)) * resid[j]
+            for j in resid
+        )
+        mdl.setObjective(ship_obj + pen_obj, GRB.MINIMIZE)
+        mdl.optimize()
+
+        flows: Dict[Tuple[Any, Any], float] = {}
+        lt_cost = 0.0
+        shortage_reduction = 0.0
+        if mdl.Status == GRB.OPTIMAL:
+            for k in pairs:
+                val = float(q[k].X)
+                if val > 1e-9:
+                    flows[k] = val
+                    lt_cost += float(arc_map[k][4]) * val
+                    shortage_reduction += val
+        remaining_need = sum(max(0.0, float(resid[j].X)) for j in resid) if mdl.Status == GRB.OPTIMAL else sum(
+            max(0.0, need.get((s, p, t), 0.0)) for s in d.stores
+        )
+        remaining_surplus = sum(
+            max(0.0, float(surplus.get((s, p, t), 0.0)) - sum(flows.get((s, jj), 0.0) for jj in d.stores))
+            for s in d.stores
+        )
+        shortage_penalty = sum(
+            float(d.shortage_cost.get((s, p), 0.0)) * max(0.0, need.get((s, p, t), 0.0) - sum(flows.get((ii, s), 0.0) for ii in d.stores))
+            for s in d.stores
+        )
+        holding_cost = sum(
+            float(d.holding_cost_store.get((s, p), 0.0)) * max(0.0, float(surplus.get((s, p, t), 0.0)) - sum(flows.get((s, jj), 0.0) for jj in d.stores))
+            for s in d.stores
+        )
+        return FollowerBestResponseResult(
+            product=p, period=t, flows=flows,
+            lt_cost=lt_cost, shortage_reduction=shortage_reduction,
+            remaining_need=remaining_need, remaining_surplus=remaining_surplus,
+            shortage_penalty=shortage_penalty, holding_cost=holding_cost,
+            total_cost=lt_cost + shortage_penalty + holding_cost,
+            n_arcs_used=len(flows), solver_used="lp",
+        )
+
+    def _empty_result(self, p, t, need, surplus) -> "FollowerBestResponseResult":
+        d = self.data
+        pen = sum(d.shortage_cost.get((s, p), 0.0) * max(0.0, need.get((s, p, t), 0.0)) for s in d.stores)
+        hc = sum(d.holding_cost_store.get((s, p), 0.0) * max(0.0, float(surplus.get((s, p, t), 0.0))) for s in d.stores)
+        return FollowerBestResponseResult(
+            product=p, period=t, flows={},
+            lt_cost=0.0, shortage_reduction=0.0,
+            remaining_need=sum(max(0.0, need.get((s, p, t), 0.0)) for s in d.stores),
+            remaining_surplus=sum(max(0.0, float(surplus.get((s, p, t), 0.0))) for s in d.stores),
+            shortage_penalty=pen, holding_cost=hc, total_cost=pen + hc,
+            n_arcs_used=0, solver_used="greedy_empty",
+        )
+
+
 def apply_hidden_local_reallocation_demand_shocks(
     data: IRPData,
     baseline_solution: Optional[FullIRPTSolution] = None,
@@ -2873,6 +3187,19 @@ class LateralTransshipmentCG:
         exact_full_mode: bool = False,
         exact_pricing_pool_size: int = 3,
         exact_pricing_time_limit: Optional[int] = 30,
+        # ── Follower-aware LT column pricing ──────────────────────────────
+        # When stackelberg_aware_scoring=True the pricing step scores every
+        # candidate pattern by total system cost after follower best-response
+        # (LT cost + shortage penalty + holding cost on remaining surplus).
+        # A column is admitted only when its combined cost delta is strictly
+        # negative. Returning no column signals follower-aware convergence.
+        stackelberg_aware_scoring: bool = False,
+        # Use exact LP for the follower's subproblem (Gurobi, slower but
+        # tighter). Default: greedy heuristic (fast, no extra Gurobi calls).
+        stackelberg_exact_follower: bool = False,
+        # Minimum LT shipment size enforced inside the follower solver.
+        # None → read IRP_LT_MIN_UNITS (default 5).
+        stackelberg_min_lateral_qty: Optional[float] = None,
         source_instance: Optional[str] = None,
     ):
         self.data = data
@@ -2953,6 +3280,14 @@ class LateralTransshipmentCG:
             self.runtime_gnn_mode = False
             self.use_gnn = False
             self.heuristic_top_k_mode = False
+        # Follower-aware system-level column scoring (enabled when stackelberg_aware_scoring=True).
+        self.stackelberg_aware_scoring = bool(stackelberg_aware_scoring)
+        self.stackelberg_exact_follower = bool(stackelberg_exact_follower)
+        self._stackelberg_min_lateral_qty_override: Optional[float] = (
+            float(stackelberg_min_lateral_qty) if stackelberg_min_lateral_qty is not None else None
+        )
+        # Per-iteration Stackelberg evaluation log (pattern_id, delta, ...)
+        self.stackelberg_column_score_log: List[Dict[str, Any]] = []
         self._gnn_loaded = False
         self._gnn_unavailable_reason: Optional[str] = None
         self._gnn_model = None
@@ -4659,6 +4994,218 @@ class LateralTransshipmentCG:
             return sol, mdl
         return sol
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Follower-aware column scoring helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _get_stackelberg_min_lateral_qty(self) -> float:
+        """Return the minimum LT shipment size for follower best-response."""
+        if self._stackelberg_min_lateral_qty_override is not None:
+            return self._stackelberg_min_lateral_qty_override
+        try:
+            return float(os.environ.get("IRP_LT_MIN_UNITS", "5"))
+        except ValueError:
+            return 5.0
+
+    def _build_stackelberg_follower_solver(self) -> FollowerBestResponseSolver:
+        return FollowerBestResponseSolver(
+            data=self.data,
+            min_lateral_qty=self._get_stackelberg_min_lateral_qty(),
+            use_exact_lp=self.stackelberg_exact_follower,
+        )
+
+    def _score_patterns_by_follower_response(
+        self,
+        patterns: List[LTPattern],
+        need: Dict[Tuple, float],
+        surplus: Dict[Tuple, float],
+        follower: FollowerBestResponseSolver,
+        rc_tol: float = -1e-6,
+    ) -> List[Tuple[LTPattern, float]]:
+        """Score each candidate pattern by total system cost delta after follower.
+
+        For each pattern c targeting (product p, period t):
+          1. Compute baseline follower cost for (p, t) without c.
+          2. Apply c's flows to produce updated need/surplus.
+          3. Re-run follower on updated state to get residual follower cost.
+          4. delta = c.column_cost + residual_follower.total_cost
+                     - baseline_follower.total_cost
+             Negative delta → pattern reduces total system cost → good column.
+
+        The baseline is cached per (p, t) so each (p, t) pair is solved at most
+        once per call regardless of how many patterns share the same (p, t).
+
+        Returns list of (pattern, delta) pairs, sorted ascending by delta.
+        """
+        # Step 1: cache baseline follower response per active (p, t)
+        active_pts: Set[Tuple] = {(pat.product, pat.period) for pat in patterns}
+        baseline_cache: Dict[Tuple, FollowerBestResponseResult] = {}
+        for p, t in active_pts:
+            baseline_cache[(p, t)] = follower.solve_for_product_period(p, t, need, surplus)
+
+        scored: List[Tuple[LTPattern, float]] = []
+        for pat in patterns:
+            p, t = pat.product, pat.period
+            baseline = baseline_cache.get((p, t))
+            if baseline is None:
+                # Safety: treat as pure RC-based — only accept if negative RC
+                rc = float(pat.metadata.get("reduced_cost", 0.0) or 0.0)
+                scored.append((pat, rc))
+                continue
+
+            # Step 2: apply pattern flows → updated need/surplus
+            upd_need = dict(need)
+            upd_surplus = dict(surplus)
+            for (i, j), qty in pat.pattern_flows.items():
+                key_j = (j, p, t)
+                key_i = (i, p, t)
+                upd_need[key_j] = max(0.0, upd_need.get(key_j, 0.0) - qty)
+                upd_surplus[key_i] = max(0.0, upd_surplus.get(key_i, 0.0) - qty)
+
+            # Step 3: residual follower after this pattern is activated
+            residual = follower.solve_for_product_period(p, t, upd_need, upd_surplus)
+
+            # Step 4: total system cost delta
+            delta = pat.column_cost + residual.total_cost - baseline.total_cost
+
+            pat.metadata["stackelberg_delta"] = round(delta, 6)
+            pat.metadata["stackelberg_baseline_follower_cost"] = round(baseline.total_cost, 6)
+            pat.metadata["stackelberg_residual_follower_cost"] = round(residual.total_cost, 6)
+            pat.metadata["stackelberg_follower_shortage_reduction"] = round(
+                baseline.shortage_reduction - residual.shortage_reduction, 6
+            )
+            scored.append((pat, delta))
+
+            self.stackelberg_column_score_log.append({
+                "episode": self.current_episode,
+                "pattern_id": pat.pattern_id,
+                "product": p,
+                "period": t,
+                "column_cost": pat.column_cost,
+                "baseline_follower_cost": baseline.total_cost,
+                "residual_follower_cost": residual.total_cost,
+                "delta": delta,
+                "rc": float(pat.metadata.get("reduced_cost", 0.0) or 0.0),
+            })
+
+        scored.sort(key=lambda x: x[1])
+        return scored
+
+    def _pricing_step_stackelberg_aware(
+        self,
+        master_solution: CGSolution,
+        rc_tol: float = -1e-6,
+    ) -> List[LTPattern]:
+        """Follower-aware LT column pricing step.
+
+        Generates candidate columns via the classical path (feature pruning +
+        bilateral pair scoring), then scores each column by its total system
+        cost impact after the follower's best-response (LT cost + shortage
+        penalty + holding cost).  Only columns with strictly negative system-
+        cost delta are admitted to the RMP.
+
+        Returning an empty list when no column improves total system cost
+        signals convergence to the CG loop — this is the correct stopping
+        criterion for follower-aware column selection: the leader has no
+        further column that the follower's recourse cannot neutralise.
+
+        The column score is state-dependent: the same pattern has different
+        value at different (product, period, inventory, shock) states because
+        the follower's best-response changes with every CG iteration.
+        """
+        need, surplus = self._build_need_and_surplus_proxies(master_solution=master_solution)
+        active_product_periods = self._compute_active_product_periods(need, surplus)
+
+        # Generate all candidate patterns via the classical path (pruning + bilateral game)
+        raw_patterns = self._candidate_patterns_from_duals(
+            need=need,
+            surplus=surplus,
+            active_product_periods=active_product_periods,
+            dual_need=master_solution.dual_need,
+            dual_surplus=master_solution.dual_surplus,
+            rc_tol=rc_tol,
+            episode=self.current_episode,
+        )
+
+        if not raw_patterns:
+            return []
+
+        # Score by system-level follower response
+        follower = self._build_stackelberg_follower_solver()
+        scored = self._score_patterns_by_follower_response(
+            raw_patterns, need, surplus, follower, rc_tol=rc_tol,
+        )
+
+        # Primary selection: patterns that reduce total system cost
+        selected = [pat for pat, delta in scored if delta < 0]
+
+        # Optionally cap to top-k (reuse heuristic_top_k if mode is on)
+        if self.heuristic_top_k_mode and len(selected) > self.heuristic_top_k:
+            selected = selected[: self.heuristic_top_k]
+
+        # Update pricing summary
+        self._last_pricing_summary.update({
+            "active_product_period_count": len(active_product_periods),
+            "patterns_kept_after_gnn": len(selected),
+            "stackelberg_aware_scoring": True,
+            "stackelberg_total_scored": len(scored),
+            "stackelberg_negative_delta": sum(1 for _, d in scored if d < 0),
+            "collect_teacher_mode": False,
+            "runtime_gnn_mode": False,
+        })
+        return selected
+
+    def _compute_final_follower_solution(
+        self,
+        cg_solution: CGSolution,
+    ) -> Dict[Tuple, FollowerBestResponseResult]:
+        """After CG converges, compute the follower's best-response on the
+        final need/surplus state (reflecting all selected columns).
+
+        This is the authoritative follower plan: it shows what the stores
+        would do given the leader's final column selection and accounts for
+        the minimum-shipment MOQ constraint.
+
+        Uses the LP solver when stackelberg_exact_follower=True, otherwise
+        the greedy heuristic.
+        """
+        need, surplus = self._build_need_and_surplus_proxies(master_solution=cg_solution)
+        active_pts = self._compute_active_product_periods(need, surplus)
+        follower = self._build_stackelberg_follower_solver()
+        return follower.solve_all_active(need, surplus, active_pts)
+
+    def _validate_no_better_column_after_follower(
+        self,
+        cg_solution: CGSolution,
+        follower_solution: Dict[Tuple, FollowerBestResponseResult],
+        tolerance: float = 1e-4,
+    ) -> Dict[str, Any]:
+        """Optional validation: check no unselected column would give a better
+        total system cost after follower response.
+
+        Returns a dict with:
+          - 'passed': True if CG is Stackelberg-optimal
+          - 'n_patterns_checked': number of unselected patterns examined
+          - 'n_improving': number of patterns that would improve total cost
+          - 'best_improving_delta': the most negative delta found (None if passed)
+        """
+        need, surplus = self._build_need_and_surplus_proxies(master_solution=cg_solution)
+        follower = self._build_stackelberg_follower_solver()
+        selected_ids = set(cg_solution.selected_patterns)
+        candidates = [p for p in self.patterns if p.pattern_id not in selected_ids]
+
+        scored = self._score_patterns_by_follower_response(
+            candidates, need, surplus, follower
+        )
+        improving = [(pat, d) for pat, d in scored if d < -tolerance]
+        return {
+            "passed": len(improving) == 0,
+            "n_patterns_checked": len(candidates),
+            "n_improving": len(improving),
+            "best_improving_delta": improving[0][1] if improving else None,
+            "best_improving_pattern": improving[0][0].pattern_id if improving else None,
+        }
+
     def pricing_step(self, master_solution: CGSolution, rc_tol: float = -1e-6) -> List[LTPattern]:
         need, surplus = self._build_need_and_surplus_proxies(master_solution=master_solution)
         active_product_periods = self._compute_active_product_periods(need, surplus)
@@ -4678,6 +5225,10 @@ class LateralTransshipmentCG:
             self._last_pricing_summary["collect_teacher_mode"] = False
             self._last_pricing_summary["runtime_gnn_mode"] = False
             return selected_patterns
+        if self.stackelberg_aware_scoring:
+            # Follower-aware mode: admit only columns that reduce total system
+            # cost (LT + shortage + holding) after the follower's best-response.
+            return self._pricing_step_stackelberg_aware(master_solution, rc_tol=rc_tol)
         new_patterns = self._candidate_patterns_from_duals(
             need=need,
             surplus=surplus,
@@ -4848,6 +5399,12 @@ class LateralTransshipmentCG:
                 else:
                     print(f"[CG] No negative reduced-cost columns found. LP optimal. Stop. [stopping_mode={stopping_mode}]")
                 self._print_cg_episode_history()
+                best_sol.stackelberg_column_scores = list(self.stackelberg_column_score_log)
+                if self.stackelberg_aware_scoring:
+                    best_sol.follower_solution = self._compute_final_follower_solution(best_sol)
+                    best_sol.stackelberg_validation = self._validate_no_better_column_after_follower(
+                        best_sol, best_sol.follower_solution
+                    )
                 return best_sol
             if added == 0 and stopping_mode == "fixed_budget":
                 # Log the would-be-convergence event but continue until max_iter
@@ -4891,6 +5448,12 @@ class LateralTransshipmentCG:
                 print(f"[CG] Improvement {improvement:.2e} <= tol {improvement_tol:.2e}. Converged. [stopping_mode=hybrid]")
                 self._print_cg_episode_history()
                 sol.efficiency_metrics = dict(rmp_metrics_total)
+                sol.stackelberg_column_scores = list(self.stackelberg_column_score_log)
+                if self.stackelberg_aware_scoring:
+                    sol.follower_solution = self._compute_final_follower_solution(sol)
+                    sol.stackelberg_validation = self._validate_no_better_column_after_follower(
+                        sol, sol.follower_solution
+                    )
                 return sol
             # In "convergence" and "fixed_budget" modes we do NOT stop on
             # improvement_tol — the only convergence signal is added==0 (handled
@@ -4902,6 +5465,12 @@ class LateralTransshipmentCG:
 
         self._print_cg_episode_history()
         best_sol.efficiency_metrics = dict(rmp_metrics_total)
+        best_sol.stackelberg_column_scores = list(self.stackelberg_column_score_log)
+        if self.stackelberg_aware_scoring:
+            best_sol.follower_solution = self._compute_final_follower_solution(best_sol)
+            best_sol.stackelberg_validation = self._validate_no_better_column_after_follower(
+                best_sol, best_sol.follower_solution
+            )
         return best_sol
 
     @staticmethod
@@ -6288,6 +6857,9 @@ class IRPResearchPipeline:
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
+        stackelberg_aware_scoring: bool = False,
+        stackelberg_exact_follower: bool = False,
+        stackelberg_min_lateral_qty: Optional[float] = None,
     ) -> Dict:
         pipeline_started_at = time.perf_counter()
         print("=" * 80)
@@ -6421,6 +6993,9 @@ class IRPResearchPipeline:
             heuristic_top_k_mode=heuristic_top_k_mode,
             heuristic_top_k=heuristic_top_k,
             exact_full_mode=exact_full_mode,
+            stackelberg_aware_scoring=stackelberg_aware_scoring,
+            stackelberg_exact_follower=stackelberg_exact_follower,
+            stackelberg_min_lateral_qty=stackelberg_min_lateral_qty,
         )
         if use_branch_and_price:
             cg_sol = cg_engine.run_branch_and_price(
@@ -6478,6 +7053,11 @@ class IRPResearchPipeline:
                 "and LT recourse costs after hidden realized-demand shocks."
             ),
             "pipeline_runtime_seconds": pipeline_runtime_seconds,
+            "lt_plan_source": (
+                "cg_selected_patterns_with_follower_filter"
+                if stackelberg_aware_scoring else "cg_selected_patterns"
+            ),
+            "follower_aware_validation": cg_sol.stackelberg_validation,
             "baseline_efficiency_metrics": baseline_sol.efficiency_metrics,
             "cg_rmp_efficiency_metrics": cg_sol.efficiency_metrics,
         }
@@ -6519,6 +7099,13 @@ class IRPResearchPipeline:
             "teacher_dataset_rows": cg_engine.teacher_dataset_rows,
             "alns_history": list(getattr(baseline_sol, "alns_history", []) or []),
             "gnn_scoring_failures": int(getattr(cg_engine, "_gnn_scoring_failures", 0)),
+            "lt_plan_source": (
+                "cg_selected_patterns_with_follower_filter"
+                if stackelberg_aware_scoring else "cg_selected_patterns"
+            ),
+            "stackelberg_follower_plan": cg_sol.follower_solution,
+            "stackelberg_column_scores": cg_sol.stackelberg_column_scores,
+            "stackelberg_validation": cg_sol.stackelberg_validation,
         }
 
 

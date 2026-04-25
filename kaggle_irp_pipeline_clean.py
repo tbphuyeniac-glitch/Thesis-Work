@@ -391,6 +391,8 @@ def run_phase(irp: Any, data: Any, *, use_gnn: bool, collect_teacher: bool,
         demand_shock_non_dispatch_multiplier=1.8,
         demand_shock_seed=DEMAND_SHOCK_SEED,
         diagnostic_verbosity="summary",
+        stackelberg_aware_scoring=True,
+        stackelberg_exact_follower=False,
     )
 
 
