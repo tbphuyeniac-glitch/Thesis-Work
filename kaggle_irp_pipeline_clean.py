@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,7 +36,7 @@ except Exception:  # pragma: no cover — outside notebook
 
 REPO_URL  = "https://github.com/tbphuyeniac-glitch/Thesis-Work.git"
 REPO_ROOT = Path("/kaggle/working/Thesis-Work")
-REFRESH_WORKING_REPO = False  # set True once after updating the repo to force a fresh clone
+REFRESH_WORKING_REPO = True   # force a fresh clone for a clean end-to-end run
 
 # ── Data files (relative to REPO_ROOT) ───────────────────
 TRAIN_DATA_FILE = "1BISCR501V_90100140_20260323-150407111_filtered_sites.csv"
@@ -50,24 +51,31 @@ RESULTS_DIR     = Path("/kaggle/working/Results")
 # ── Master reproducibility seed ──────────────────────────
 MASTER_SEED = 42
 
-# ── Scope limits for Kaggle runtime control ──────────────
-# Keep the run bounded enough for Kaggle while preserving every stage.
-STORE_LIMIT: Optional[int] = 4
-SKU_LIMIT:   Optional[int] = 2
-TRAIN_START_DATE: Optional[str] = "2025-08-01"
-TRAIN_END_DATE:   Optional[str] = "2025-08-14"
-TEST_START_DATE:  Optional[str] = "2025-02-01"
-TEST_END_DATE:    Optional[str] = "2025-02-14"
+# ── Full-dataset run scope ───────────────────────────────
+# Remove store / SKU / date slicing so Phase 1 and Phase 2 run on the full
+# provided CSVs. This is the "full model with full dataset" configuration.
+STORE_LIMIT: Optional[int] = None
+SKU_LIMIT:   Optional[int] = None
+TRAIN_START_DATE: Optional[str] = None
+TRAIN_END_DATE:   Optional[str] = None
+TEST_START_DATE:  Optional[str] = None
+TEST_END_DATE:    Optional[str] = None
+
+# Teacher-data scenario generation still needs a bounded canonical date window
+# so BASE_SPECS can be constructed deterministically even when Phase 1/2 run on
+# the full dataset without date slicing. Prefer inferring it from TRAIN_DATA_PATH
+# when the CSV already exists; otherwise fall back to a safe hard-coded window so
+# config evaluation does not crash before prepare_working_repo() clones the repo.
+DEFAULT_TEACHER_START_DATE = "2025-08-01"
+DEFAULT_TEACHER_END_DATE   = "2025-08-14"
 
 # ── Solver / GNN ─────────────────────────────────────────
-CG_ITERATIONS    = 10
-CG_STOPPING_MODE = "convergence"   # stop when no new negative-RC columns enter the pool; CG_ITERATIONS is only a safety cap
-BP_MAX_NODES     = 6
-BP_MAX_DEPTH     = 3
-# First-run recommendation: 60–100 epochs to validate the pipeline end-to-end
-# without burning Kaggle GPU quota.  Bump to 500 only after Phase 1 + Phase 2
-# produce sensible numbers.
-GNN_TRAIN_EPOCHS = 20
+# CG always stops on convergence; CG_ITERATIONS is only the safety cap.
+CG_ITERATIONS    = 100
+CG_STOPPING_MODE = "convergence"
+BP_MAX_NODES     = 20
+BP_MAX_DEPTH     = 8
+GNN_TRAIN_EPOCHS = 100
 LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 
 
@@ -76,26 +84,125 @@ LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 # multi-instance diversity (required for instance-level train/valid/test split).
 # Set False for a fast single-run smoke test.
 MULTI_SCENARIO_MODE   = True
-SCENARIOS_PER_BASE    = 2       # scenarios per base dataset
-CG_ITERATIONS_TEACHER = 5       # CG iters per scenario run (keep low for speed)
-TIME_LIMIT_TEACHER    = 180     # seconds per scenario run
+# Use more base topologies and more shock realizations per base so the teacher
+# dataset has enough distinct source_instance values for GNN training.
+SCENARIOS_PER_BASE    = 5       # scenarios per base dataset
+CG_ITERATIONS_TEACHER = 10      # more complete teacher rows per scenario
+TIME_LIMIT_TEACHER    = 300     # seconds per scenario run
+
+
+def infer_date_range_from_csv(
+    csv_path: Path,
+    fallback_start: str = DEFAULT_TEACHER_START_DATE,
+    fallback_end: str = DEFAULT_TEACHER_END_DATE,
+) -> Tuple[str, str]:
+    """Infer YYYY-MM-DD start/end dates from the raw demand CSV PERIOD column.
+
+    Safe by design:
+    - if the repo/data file is not present yet, return the fallback window
+    - if PERIOD is missing or unparsable, return the fallback window
+    """
+    try:
+        if not csv_path.exists():
+            print(f"[Teacher base window] CSV not available yet, using fallback: {fallback_start} -> {fallback_end}")
+            return fallback_start, fallback_end
+
+        period_only = pd.read_csv(csv_path, usecols=["PERIOD"])
+        if "PERIOD" not in period_only.columns or period_only.empty:
+            print(f"[Teacher base window] PERIOD column unavailable/empty, using fallback: {fallback_start} -> {fallback_end}")
+            return fallback_start, fallback_end
+
+        parsed = pd.to_datetime(
+            period_only["PERIOD"].astype(str).str.strip(),
+            format="%Y%m%d",
+            errors="coerce",
+        ).dropna()
+        if parsed.empty:
+            print(f"[Teacher base window] PERIOD values unparsable, using fallback: {fallback_start} -> {fallback_end}")
+            return fallback_start, fallback_end
+
+        start_date = parsed.min().strftime("%Y-%m-%d")
+        end_date = parsed.max().strftime("%Y-%m-%d")
+        print(f"[Teacher base window] Inferred from TRAIN_DATA_PATH: {start_date} -> {end_date}")
+        return start_date, end_date
+    except Exception as exc:
+        print(
+            "[Teacher base window] Could not infer date range from "
+            f"{csv_path} ({exc}); using fallback: {fallback_start} -> {fallback_end}"
+        )
+        return fallback_start, fallback_end
+
+
+def build_normalized_base_specs(
+    start_date: Optional[str],
+    end_date: Optional[str],
+    target_count: int = 30,
+) -> List[str]:
+    """Build a reproducible set of base-dataset specs from the raw demand CSV.
+
+    Each base is a normalized slice of the same source dataset defined by:
+    - a store_limit
+    - a sku_limit
+    - a date window inside the master train window
+    """
+    resolved_start = start_date or DEFAULT_TEACHER_START_DATE
+    resolved_end = end_date or DEFAULT_TEACHER_END_DATE
+    start_dt = datetime.strptime(resolved_start, "%Y-%m-%d")
+    end_dt = datetime.strptime(resolved_end, "%Y-%m-%d")
+    horizon_days = max(1, (end_dt - start_dt).days + 1)
+
+    # Five topology scales × three SKU granularities × two time windows = 30 bases.
+    store_limits = [4, 5, 6, 7, 8]
+    sku_limits = [2, 3, 4]
+
+    full_window = (start_dt, end_dt)
+    normalized_days = max(7, horizon_days - 4)
+    normalized_start = start_dt + timedelta(days=min(2, max(0, horizon_days - normalized_days)))
+    normalized_end = min(end_dt, normalized_start + timedelta(days=normalized_days - 1))
+    date_windows = [full_window, (normalized_start, normalized_end)]
+
+    specs: List[str] = []
+    base_idx = 0
+    for store_limit in store_limits:
+        for sku_limit in sku_limits:
+            for window_start, window_end in date_windows:
+                base_idx += 1
+                specs.append(
+                    f"base_{base_idx:02d}:{store_limit}:{sku_limit}:"
+                    f"{window_start.strftime('%Y-%m-%d')}:"
+                    f"{window_end.strftime('%Y-%m-%d')}"
+                )
+
+    if len(specs) != target_count:
+        raise ValueError(
+            f"Expected exactly {target_count} normalized base specs, got {len(specs)}"
+        )
+    return specs
+
 # Base specs: "name:store_limit:sku_limit[:start_date[:end_date]]"
-# Vary store/SKU limits to produce topologically distinct instances.
-BASE_SPECS = [
-    "base_a:4:2:2025-08-01:2025-08-14",
-    "base_b:5:2:2025-08-01:2025-08-14",
-    "base_c:6:2:2025-08-01:2025-08-14",
-]
+# Build 30 normalized slices from the original demand dataset so the GNN sees
+# more source_instance diversity during teacher generation.
+TEACHER_START_DATE, TEACHER_END_DATE = infer_date_range_from_csv(TRAIN_DATA_PATH)
+
+BASE_SPECS = build_normalized_base_specs(
+    start_date=TEACHER_START_DATE,
+    end_date=TEACHER_END_DATE,
+    target_count=30,
+)
 TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 
 # ── Optional stages ───────────────────────────────────────
-# Only enable RUN_BENCHMARK after Phase 1 + Phase 2 results look correct.
-# Benchmark runs 4 CG variants (A0 / A / B / C) — adds significant wall-clock
-# time but produces the canonical thesis comparison table.
+# This notebook is configured for a single end-to-end run:
+# teacher generation -> GNN train/reuse -> Phase 1 -> Phase 2 -> A0/A/B/C benchmark.
 RUN_PHASE_2          = True
+# Phase 3 is intentionally disabled for this Kaggle pipeline.
+# Keep it off unless you explicitly want checkpoint fine-tuning on test data.
 RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
-RUN_BENCHMARK        = True     # keep on so A0/A/B/C benchmark is produced in one Kaggle run
+RUN_BENCHMARK        = True
+# Reuse an existing trained checkpoint whenever one is already present so later
+# notebook runs do not pay the GNN training cost again.
+REUSE_EXISTING_CHECKPOINT = True
 BENCHMARK_N_REPEATS  = 1        # Kaggle runtime budget: one repeat per A0/A/B/C variant
 HEURISTIC_TOP_K      = 10
 DEMAND_SHOCK_SEED    = 42
@@ -655,11 +762,13 @@ train_cmd = [
     "--objective",    "pairwise_rank",
     "--auto-resume",
 ]
-# Skip retraining if a previous run finished and a best-checkpoint exists; the
-# BiGAT trainer itself auto-resumes from last_model.pt when a partial run
-# exists, so mid-epoch kernel deaths don't cost epochs either.
-if RUN_STATE.is_done("gnn_training") and checkpoint.exists():
-    print(f"[gnn_training] already done — reusing {checkpoint}")
+# Skip retraining if a reusable checkpoint already exists. `run_state` is still
+# honored when present, but the checkpoint file itself is the stronger signal:
+# it lets later Kaggle runs reuse the model even if run_state.json is missing.
+if checkpoint.exists() and REUSE_EXISTING_CHECKPOINT:
+    print(f"[gnn_training] checkpoint already exists — reusing {checkpoint}")
+    if RUN_STATE.is_done("gnn_training"):
+        print("[gnn_training] run_state confirms prior training completion.")
     rc_train = 0
 else:
     RUN_STATE.mark_start("gnn_training", epochs=GNN_TRAIN_EPOCHS)
@@ -834,11 +943,10 @@ elif RUN_PHASE_2:
 
 
 # =========================================================
-# 10) Phase 3 — online learning (optional fine-tune)
+# 10) Phase 3 — online learning (disabled in this notebook)
 # =========================================================
-# GNN scores columns AND collects new teacher rows simultaneously.
-# Fine-tunes the checkpoint in-place (resume_checkpoint=True).
-# Keep OFF by default; enable after Phase 2 is validated.
+# This notebook keeps Phase 3 off so the checkpoint is not fine-tuned on
+# test-data runs. Re-enable only if you explicitly want online learning.
 
 _p3_summary_json = RESULTS_DIR / "thesis_summary" / "phase3_online_learning_summary.json"
 if RUN_ONLINE_LEARNING and checkpoint.exists() and RUN_STATE.is_done("phase3") and _p3_summary_json.exists():
@@ -893,6 +1001,8 @@ elif RUN_ONLINE_LEARNING and checkpoint.exists():
 
 elif RUN_ONLINE_LEARNING:
     print("[Phase 3 skipped] checkpoint not found — run and validate Phase 2 first.")
+else:
+    print("\n[Phase 3 disabled] RUN_ONLINE_LEARNING=False — online learning is not executed.")
 
 
 # =========================================================
