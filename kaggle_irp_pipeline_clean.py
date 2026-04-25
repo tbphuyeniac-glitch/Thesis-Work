@@ -90,7 +90,8 @@ TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 
 # ── Optional stages ───────────────────────────────────────
 # Only enable RUN_BENCHMARK after Phase 1 + Phase 2 results look correct.
-# Benchmark runs 3 CG variants — adds significant wall-clock time.
+# Benchmark runs 4 CG variants (A0 / A / B / C) — adds significant wall-clock
+# time but produces the canonical thesis comparison table.
 RUN_PHASE_2          = True
 RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
@@ -98,6 +99,21 @@ RUN_BENCHMARK        = True     # keep on so A0/A/B/C benchmark is produced in o
 BENCHMARK_N_REPEATS  = 1        # Kaggle runtime budget: one repeat per A0/A/B/C variant
 HEURISTIC_TOP_K      = 10
 DEMAND_SHOCK_SEED    = 42
+
+# Output integerization knobs (LP-relaxed CG → integer operational plan).
+# The CG LP produces fractional λ values and therefore fractional implied
+# shipment quantities. For thesis-grade reporting these are aggregated per
+# (period, sku, from, to) arc and then:
+#   - rounded to integer when IRP_INTEGER_FINAL_OUTPUTS=1 (default ON)
+#   - dropped if rounded qty < IRP_LT_MIN_UNITS (default 5, i.e. 5-unit MOQ)
+LT_MIN_UNITS         = 5        # minimum units per LT shipment arc (MOQ); eliminates LP artefact tiny moves
+INTEGER_FINAL_OUTPUTS = True    # round lt_qty / inventory / shortage in final CSVs
+
+# Benchmark fairness: when True, every variant (A0/A/B/C) runs on the
+# bit-identical realized-demand realization (same shock seed reused across
+# all repeats), so benchmark_comparison.csv compares algorithms only — not
+# different demand worlds. Recommended for online-inference test runs.
+BENCHMARK_FIXED_SHOCK = True
 
 
 # =========================================================
@@ -368,7 +384,7 @@ def run_phase(irp: Any, data: Any, *, use_gnn: bool, collect_teacher: bool,
         use_branch_and_price=True,
         bp_max_nodes=BP_MAX_NODES,
         bp_max_depth=BP_MAX_DEPTH,
-        lt_activation_threshold=0.0,
+        lt_activation_threshold=10.0,
         demand_shock_probability=0.85,
         demand_shock_reallocation_fraction=0.60,
         demand_shock_reallocations_per_product_period=3,
@@ -395,6 +411,7 @@ print(f"  train_window={TRAIN_START_DATE}..{TRAIN_END_DATE}")
 print(f"  test_window ={TEST_START_DATE}..{TEST_END_DATE}")
 print(f"  cg_iterations={CG_ITERATIONS}  bp_nodes={BP_MAX_NODES}  bp_depth={BP_MAX_DEPTH}")
 print(f"  gnn_epochs={GNN_TRAIN_EPOCHS}  scenarios_per_base={SCENARIOS_PER_BASE}  benchmark_repeats={BENCHMARK_N_REPEATS}")
+print(f"  lt_min_units={LT_MIN_UNITS}  integer_outputs={INTEGER_FINAL_OUTPUTS}  benchmark_fixed_shock={BENCHMARK_FIXED_SHOCK}")
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # Propagate to all subprocesses (scenario generator, GNN trainer, graph
@@ -408,6 +425,11 @@ os.environ["IRP_CG_STOPPING_MODE"] = CG_STOPPING_MODE
 os.environ.setdefault("IRP_QUIET", "1")
 os.environ.setdefault("IRP_CG_PARTIAL_DIR", str(RESULTS_DIR / "cg_partials"))
 os.environ.setdefault("IRP_TRAINING_AUTO_RESUME", "1")
+# Integer/threshold knobs for final operational outputs (LT plan).
+os.environ["IRP_INTEGER_FINAL_OUTPUTS"] = "1" if INTEGER_FINAL_OUTPUTS else "0"
+os.environ["IRP_LT_MIN_UNITS"] = str(LT_MIN_UNITS)
+# Benchmark fairness: same demand-shock realization across all variants/repeats.
+os.environ["IRP_BENCHMARK_FIXED_SHOCK"] = "1" if BENCHMARK_FIXED_SHOCK else "0"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -917,7 +939,7 @@ if RUN_BENCHMARK:
                 demand_shock_reallocation_fraction=0.60,
                 demand_shock_reallocations_per_product_period=3,
                 demand_shock_non_dispatch_multiplier=1.8,
-                lt_activation_threshold=0.0,
+                lt_activation_threshold=10.0,
                 heuristic_top_k=HEURISTIC_TOP_K,
                 enforce_integer_flows=False,
                 n_repeats=BENCHMARK_N_REPEATS,
@@ -995,7 +1017,7 @@ import datetime as _dt
 # Three runtime categories — never mixed:
 #   1. offline GNN test: model forward-pass only (GNN/04_test.py)
 #   2. online inference : end-to-end Phase 2 CG solve with GNN embedded
-#   3. external benchmark: wall time of run_three_way_benchmark across repeats
+#   3. external benchmark: wall time of A0/A/B/C 4-way benchmark across repeats
 runtime_breakdown: Dict[str, Any] = {
     "offline_gnn_test_subprocess_wall_seconds": offline_gnn_test_wall_seconds,
     "online_inference_phase2_wall_seconds":     online_inference_wall_seconds,
@@ -1157,6 +1179,9 @@ run_manifest = {
     ),
     "benchmark_n_repeats": BENCHMARK_N_REPEATS if RUN_BENCHMARK else 0,
     "benchmark_data_source": "TEST_DATA_PATH" if RUN_BENCHMARK else None,
+    "benchmark_fixed_shock": BENCHMARK_FIXED_SHOCK if RUN_BENCHMARK else None,
+    "lt_min_units": LT_MIN_UNITS,
+    "integer_final_outputs": INTEGER_FINAL_OUTPUTS,
     "runtime_breakdown": runtime_breakdown,
     "artifacts_by_stage": artifacts_by_phase,
 }
@@ -1171,7 +1196,8 @@ print(f"  CG stopping mode  : {CG_STOPPING_MODE}")
 print(f"  Phases run        : {[s['phase'] for s in phase_summaries]}")
 if benchmark_df is not None and not benchmark_df.empty:
     print(f"  Benchmark variants: {sorted(set(benchmark_df['variant']))}  "
-          f"(repeats per variant: {BENCHMARK_N_REPEATS}, source=TEST_DATA_PATH)")
+          f"(repeats per variant: {BENCHMARK_N_REPEATS}, source=TEST_DATA_PATH, "
+          f"fixed_shock={BENCHMARK_FIXED_SHOCK})")
 print(f"  GNN checkpoint    : {checkpoint}  (exists={checkpoint.exists()})")
 print("\n  Runtime (seconds):")
 for _k, _v in runtime_breakdown.items():

@@ -112,12 +112,14 @@ def main() -> int:
         initial_patterns=initial_patterns,
         lt_activation_threshold=0.0,
         max_pairs_per_pattern=4,
-        # A0: every heuristic off.
+        # A0: every heuristic off; pool search returns up to 3 columns/subproblem.
         use_gnn=False,
         collect_teacher_mode=False,
         runtime_gnn_mode=False,
         heuristic_top_k_mode=False,
         exact_full_mode=True,
+        exact_pricing_pool_size=3,
+        exact_pricing_time_limit=15,
     )
     cg_sol = cg_engine.run_column_generation(max_iter=3, msg=False, stopping_mode="convergence")
 

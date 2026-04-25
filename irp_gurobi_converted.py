@@ -2871,6 +2871,8 @@ class LateralTransshipmentCG:
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
+        exact_pricing_pool_size: int = 3,
+        exact_pricing_time_limit: Optional[int] = 30,
         source_instance: Optional[str] = None,
     ):
         self.data = data
@@ -2934,10 +2936,17 @@ class LateralTransshipmentCG:
         # before they enter RMP. Active only when use_gnn=False and collect_teacher_mode=False.
         self.heuristic_top_k_mode = bool(heuristic_top_k_mode)
         self.heuristic_top_k = max(1, int(heuristic_top_k))
-        # Run-A0 (benchmark) — exact CG pricing via one Gurobi MIP per active
+        # Run-A0 (benchmark) — exact CG pricing via Gurobi MIP per active
         # (product, period), with no feature pruning, Stackelberg game, GNN, or
-        # top-k ranking anywhere in the path.
+        # top-k ranking anywhere in the path. Pool search returns up to
+        # exact_pricing_pool_size distinct negative-RC columns per subproblem
+        # per iteration (PoolSearchMode=2), matching the multi-column generation
+        # rate of classical CG for a fair runtime comparison.
         self.exact_full_mode = bool(exact_full_mode)
+        self.exact_pricing_pool_size = max(1, int(exact_pricing_pool_size))
+        self.exact_pricing_time_limit = (
+            int(exact_pricing_time_limit) if exact_pricing_time_limit is not None else None
+        )
         if self.exact_full_mode:
             # Exact mode overrides all heuristic filters unconditionally.
             self.collect_teacher_mode = False
@@ -4273,21 +4282,23 @@ class LateralTransshipmentCG:
     ) -> List[LTPattern]:
         """Exact CG pricing subproblem solved by Gurobi for one (product, period).
 
-        Enumerates all donor-receiver pairs with strictly positive movable qty
-        and solves the MIP
+        Solves the fixed-charge MIP
 
             min  sum_{i,j} [f_ij * y_ij + (c_ij - dual_need_j - dual_surplus_i) * q_ij]
-            s.t. sum_j q_ij <= surplus_i                      (donor capacity)
-                 sum_i q_ij <= need_j                         (receiver capacity)
-                 q_ij <= min(surplus_i, need_j) * y_ij        (fixed-charge activation)
-                 sum_{i,j} y_ij <= max_pairs_per_pattern      (pattern shape cap)
+            s.t. sum_j q_ij <= surplus_i            (donor capacity)
+                 sum_i q_ij <= need_j               (receiver capacity)
+                 q_ij <= min(surplus_i, need_j) * y_ij  (fixed-charge)
+                 sum y_ij <= max_pairs_per_pattern
                  y_ij in {0,1}, q_ij >= 0
 
-        The objective is the reduced cost of the resulting column. Returns the
-        single exact optimal column when its reduced cost is strictly below
-        `rc_tol`. NO heuristic filter (pruning / Stackelberg / GNN / top-k) is
-        applied anywhere in this path — that is the whole point of the A0
-        "CG_full_exact" benchmark.
+        Uses Gurobi PoolSearchMode=2 (systematic K-best search) to return up to
+        `exact_pricing_pool_size` distinct negative-RC columns per subproblem per
+        iteration. This gives A0 a comparable multi-column generation rate to the
+        classical CG (which generates many columns per iteration via enumerate-
+        and-filter), making the runtime comparison fair.
+
+        NO heuristic filter (pruning / Stackelberg / GNN / top-k) is applied
+        anywhere in this path.
         """
         d = self.data
         donors = [s for s in d.stores if float(surplus.get((s, p, t), 0.0)) > 1e-9]
@@ -4298,6 +4309,13 @@ class LateralTransshipmentCG:
 
         mdl = gp.Model(f"ExactPricing_{p}_T{t}", env=get_gurobi_env())
         mdl.Params.OutputFlag = 0
+        # Request K-best pool: PoolSearchMode=2 systematically finds up to
+        # PoolSolutions solutions ordered by objective value.
+        pool_size = self.exact_pricing_pool_size
+        mdl.Params.PoolSearchMode = 2
+        mdl.Params.PoolSolutions = pool_size
+        if self.exact_pricing_time_limit is not None:
+            mdl.Params.TimeLimit = float(self.exact_pricing_time_limit)
 
         q = mdl.addVars(pairs, lb=0.0, vtype=GRB.CONTINUOUS, name="q")
         y = mdl.addVars(pairs, lb=0.0, ub=1.0, vtype=GRB.BINARY, name="y")
@@ -4305,7 +4323,6 @@ class LateralTransshipmentCG:
         for (i, j) in pairs:
             qty_cap = min(float(surplus[(i, p, t)]), float(need[(j, p, t)]))
             if qty_cap <= 1e-9:
-                # Should not happen (filtered above), but keep safe.
                 mdl.addConstr(q[(i, j)] == 0.0)
                 mdl.addConstr(y[(i, j)] == 0.0)
                 continue
@@ -4329,57 +4346,60 @@ class LateralTransshipmentCG:
                 gp.quicksum(y[key] for key in pairs) <= int(self.max_pairs_per_pattern)
             )
 
-        mdl.setObjective(
-            gp.quicksum(
-                float(d.fixed_dispatch_lt[(i, j)]) * y[(i, j)]
-                + (
-                    float(d.ship_cost_lt[(i, j, p)])
-                    - float(dual_need.get((j, p, t), 0.0))
-                    - float(dual_surplus.get((i, p, t), 0.0))
-                ) * q[(i, j)]
-                for (i, j) in pairs
-            ),
-            GRB.MINIMIZE,
+        obj_expr = gp.quicksum(
+            float(d.fixed_dispatch_lt[(i, j)]) * y[(i, j)]
+            + (
+                float(d.ship_cost_lt[(i, j, p)])
+                - float(dual_need.get((j, p, t), 0.0))
+                - float(dual_surplus.get((i, p, t), 0.0))
+            ) * q[(i, j)]
+            for (i, j) in pairs
         )
-
+        mdl.setObjective(obj_expr, GRB.MINIMIZE)
         mdl.optimize()
 
-        if mdl.Status != GRB.OPTIMAL or mdl.SolCount == 0:
+        if mdl.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT) or mdl.SolCount == 0:
             return []
 
-        sol_obj = float(mdl.ObjVal)
-        if sol_obj >= rc_tol:
-            return []
-        flows: Dict[Tuple[Store, Store], float] = {}
-        pattern_cost = 0.0
-        for (i, j) in pairs:
-            q_val = float(q[(i, j)].X)
-            y_val = float(y[(i, j)].X)
-            if q_val > 1e-9 and y_val > 0.5:
-                flows[(i, j)] = q_val
-                pattern_cost += float(d.fixed_dispatch_lt[(i, j)]) + float(
-                    d.ship_cost_lt[(i, j, p)]
-                ) * q_val
-        if not flows:
-            return []
-        return [
-            LTPattern(
-                pattern_id=f"EXACT_E{episode}_{p}_T{t}",
-                period=t,
-                product=p,
-                pattern_flows=flows,
-                column_cost=round(pattern_cost, 6),
-                metadata={
-                    "source": "exact_pricing_gurobi",
-                    "reduced_cost": round(sol_obj, 6),
-                    "pruning_used": False,
-                    "stackelberg_used": False,
-                    "gnn_used": False,
-                    "heuristic_top_k_used": False,
-                    "feature_name": "exact_full",
-                },
+        # Extract all pool solutions with negative reduced cost.
+        results: List[LTPattern] = []
+        for sol_idx in range(mdl.SolCount):
+            mdl.Params.SolutionNumber = sol_idx
+            sol_obj = float(mdl.PoolObjVal)
+            if sol_obj >= rc_tol:
+                break  # pool is ordered ascending; no need to check further
+            flows: Dict[Tuple[Store, Store], float] = {}
+            pattern_cost = 0.0
+            for (i, j) in pairs:
+                q_val = float(q[(i, j)].Xn)
+                y_val = float(y[(i, j)].Xn)
+                if q_val > 1e-9 and y_val > 0.5:
+                    flows[(i, j)] = q_val
+                    pattern_cost += float(d.fixed_dispatch_lt[(i, j)]) + float(
+                        d.ship_cost_lt[(i, j, p)]
+                    ) * q_val
+            if not flows:
+                continue
+            results.append(
+                LTPattern(
+                    pattern_id=f"EXACT_E{episode}_{p}_T{t}_P{sol_idx}",
+                    period=t,
+                    product=p,
+                    pattern_flows=flows,
+                    column_cost=round(pattern_cost, 6),
+                    metadata={
+                        "source": "exact_pricing_gurobi",
+                        "reduced_cost": round(sol_obj, 6),
+                        "pruning_used": False,
+                        "stackelberg_used": False,
+                        "gnn_used": False,
+                        "heuristic_top_k_used": False,
+                        "feature_name": "exact_full",
+                        "exact_pool_index": sol_idx,
+                    },
+                )
             )
-        ]
+        return results
 
     def _candidate_patterns_exact_full(
         self,
@@ -5466,9 +5486,31 @@ def build_lt_plan_df_from_solution(
 
 
 def build_lt_plan_df_from_cg(cg_solution: CGSolution, patterns: List[LTPattern], data: IRPData) -> pd.DataFrame:
+    """Aggregate the LP-relaxed CG solution into an integer LT plan.
+
+    Two post-processing steps are always applied to the raw fractional flows
+    Σ_p λ_p · pattern_flows[i,j]:
+
+      1. **Aggregate by (period, sku, from, to)** so multiple patterns that
+         touch the same arc collapse into one shipment row.
+      2. **Round + threshold**: each aggregated qty is rounded to integer
+         (default ON via IRP_INTEGER_FINAL_OUTPUTS) and dropped if it falls
+         below `IRP_LT_MIN_UNITS` (default 5). This MOQ filter eliminates LP
+         relaxation artefacts — fractional λ values that aggregate to 1-2 units
+         after rounding — while keeping all economically meaningful shipments.
+         Set IRP_LT_MIN_UNITS=1 to disable the filter.
+    """
     pattern_by_id = {pat.pattern_id: pat for pat in patterns}
-    rows = []
-    enforce_integer = os.environ.get("IRP_ENFORCE_INTEGER", "0").lower() not in {"0", "false", "no"}
+    integer_outputs = _integer_final_outputs_enabled()
+    try:
+        min_units = float(os.environ.get("IRP_LT_MIN_UNITS", "5"))
+    except ValueError:
+        min_units = 1.0
+    if min_units < 0:
+        min_units = 0.0
+
+    # Step 1 — aggregate fractional flows per arc.
+    agg: Dict[Tuple[int, str, int, int], Dict[str, Any]] = {}
     for pat_id in sorted(cg_solution.selected_patterns):
         pat = pattern_by_id.get(pat_id)
         if pat is None:
@@ -5477,27 +5519,46 @@ def build_lt_plan_df_from_cg(cg_solution: CGSolution, patterns: List[LTPattern],
         if lam <= 1e-9:
             continue
         for i, j in sorted(pat.pattern_flows):
-            qty = float(pat.pattern_flows[(i, j)]) * lam
-            if enforce_integer:
-                qty = float(math.floor(qty + 1e-9))
-            if qty <= 1e-9:
+            raw_qty = float(pat.pattern_flows[(i, j)]) * lam
+            if raw_qty <= 1e-9:
                 continue
+            key = (pat.period, pat.product, i, j)
             unit_cost = float(data.ship_cost_lt.get((i, j, pat.product), data.transship_unit_cost.get((i, j), 0.0)))
-            fixed_cost = float(data.fixed_dispatch_lt.get((i, j), 0.0)) * lam
-            rows.append({
-                "source": "CG_LT",
-                "period": pat.period,
-                "vehicle": "",
-                "from_store": i,
-                "to_store": j,
-                "sku": pat.product,
-                "lt_qty": round(qty, 6),
-                "lt_unit_cost": round(unit_cost, 6),
-                "lt_fixed_cost": round(fixed_cost, 6),
-                "lt_total_cost": round(unit_cost * qty + fixed_cost, 6),
-                "pattern_id": pat.pattern_id,
-                "lambda_value": round(lam, 6),
+            fixed_share = float(data.fixed_dispatch_lt.get((i, j), 0.0)) * lam
+            cell = agg.setdefault(key, {
+                "qty": 0.0, "unit_cost": unit_cost, "fixed_cost": 0.0,
+                "pattern_ids": [], "lambda_total": 0.0,
             })
+            cell["qty"] += raw_qty
+            cell["fixed_cost"] += fixed_share
+            cell["pattern_ids"].append(pat.pattern_id)
+            cell["lambda_total"] += lam
+
+    # Step 2 — round + threshold.
+    rows: List[Dict[str, Any]] = []
+    for (period, sku, i, j), cell in agg.items():
+        qty = cell["qty"]
+        if integer_outputs:
+            qty = float(round(qty))
+        if qty < min_units:
+            continue
+        unit_cost = cell["unit_cost"]
+        # Fixed cost: only paid if at least one unit ships on this arc/period.
+        fixed_cost = cell["fixed_cost"] if qty > 0 else 0.0
+        rows.append({
+            "source": "CG_LT",
+            "period": period,
+            "vehicle": "",
+            "from_store": i,
+            "to_store": j,
+            "sku": sku,
+            "lt_qty": int(qty) if integer_outputs else round(qty, 6),
+            "lt_unit_cost": round(unit_cost, 6),
+            "lt_fixed_cost": round(fixed_cost, 6),
+            "lt_total_cost": round(unit_cost * qty + fixed_cost, 6),
+            "pattern_id": ",".join(str(pid) for pid in cell["pattern_ids"]),
+            "lambda_value": round(min(1.0, cell["lambda_total"]), 6),
+        })
     return pd.DataFrame(rows, columns=LT_PLAN_COLUMNS)
 
 
@@ -6217,7 +6278,7 @@ class IRPResearchPipeline:
         use_branch_and_price: bool = True,
         bp_max_nodes: int = 15,
         bp_max_depth: int = 6,
-        lt_activation_threshold: float = 0.0,
+        lt_activation_threshold: float = 10.0,
         demand_shock_probability: float = 0.85,
         demand_shock_reallocation_fraction: float = 0.60,
         demand_shock_reallocations_per_product_period: int = 3,
@@ -7190,9 +7251,19 @@ def run_three_way_benchmark(
         # Same seed sequence is reused across variants so variant differences
         # aren't confounded by different demand realizations.
         n_repeats = max(1, int(n_repeats))
-        seeds = [int(demand_shock_seed) + 10007 * r for r in range(n_repeats)]
+        # IRP_BENCHMARK_FIXED_SHOCK=1 pins the SAME demand-shock seed across
+        # every repeat (and therefore every variant), guaranteeing the
+        # benchmark_comparison.csv compares algorithms on bit-identical
+        # realized-demand instances. Used for online-inference test runs.
+        fixed_shock = os.environ.get("IRP_BENCHMARK_FIXED_SHOCK", "0").lower() not in {"0", "false", "no", ""}
+        if fixed_shock:
+            seeds = [int(demand_shock_seed)] * n_repeats
+            print(f"\n[Benchmark] FIXED SHOCK MODE — single seed {demand_shock_seed} "
+                  f"reused across all {n_repeats} repeats")
+        else:
+            seeds = [int(demand_shock_seed) + 10007 * r for r in range(n_repeats)]
         print(f"\n[Benchmark] {len(variants)} variants × {n_repeats} repeats — "
-              f"seeds={seeds}  stopping_mode=convergence")
+              f"seeds={seeds}  stopping_mode=convergence  fixed_shock={fixed_shock}")
         rows: List[Dict[str, Any]] = []
         for variant_name, variant_kwargs in variants:
             for repeat_idx, seed in enumerate(seeds):
@@ -7522,7 +7593,7 @@ if __name__ == "__main__":
     # Online learning uses fewer epochs (1-3) to avoid overfitting to a single run.
     _default_epochs = str(int(os.environ.get("IRP_ONLINE_LEARNING_EPOCHS", "2"))) if _online_learning else "5"
     gnn_train_epochs = int(os.environ.get("IRP_GNN_TRAIN_EPOCHS", _default_epochs))
-    lt_activation_threshold = float(os.environ.get("IRP_LT_ACTIVATION_THRESHOLD", "0.0"))
+    lt_activation_threshold = float(os.environ.get("IRP_LT_ACTIVATION_THRESHOLD", "10.0"))
     demand_shock_probability = float(os.environ.get("IRP_DEMAND_SHOCK_PROBABILITY", "0.85"))
     demand_shock_reallocation_fraction = float(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATION_FRACTION", "0.60"))
     demand_shock_reallocations_per_product_period = int(os.environ.get("IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD", "3"))
