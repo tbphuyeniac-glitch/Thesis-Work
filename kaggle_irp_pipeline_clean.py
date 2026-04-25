@@ -18,7 +18,7 @@ import pprint
 import shutil
 import subprocess
 import sys
-import time
+import time 
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -712,6 +712,18 @@ else:
     save_phase_outputs(p1_results, "phase1_offline_baseline")
     print(f"  saved: {teacher_pkl.name}  ({teacher_pkl.stat().st_size / 1024:.0f} KB)")
 
+    # Single-run mode ran a full ALNS+CG+B&P pipeline above — identical to what
+    # section 8 would run with collect_teacher=False.  Mark Phase 1 complete now
+    # so section 8 skips the redundant re-solve (avoids ~2× ALNS+CG runtime).
+    _p1_dedup_path = RESULTS_DIR / "thesis_summary" / "phase1_offline_baseline_summary.json"
+    _p1_dedup_path.parent.mkdir(parents=True, exist_ok=True)
+    run_infrastructure.write_json_atomic(
+        _p1_dedup_path,
+        phase_summary(p1_results, "phase1_offline_baseline"),
+    )
+    RUN_STATE.mark_done("phase1")
+    print(f"  [Phase 1] marked done (single-run dedup) — section 8 will reuse this result")
+
 
 # =========================================================
 # 7) Build teacher graphs → train BiGAT → offline test
@@ -882,7 +894,16 @@ if RUN_STATE.is_done("phase1") and _p1_summary_json.exists():
     with open(_p1_summary_json) as _f:
         p1_summary = json.load(_f)
     phase_summaries.append(p1_summary)
-    print(f"[phase1] already done — reused summary from {_p1_summary_json}")
+    _p1_skip_reason = (
+        "single-run dedup: section 6 already ran the full ALNS+CG+B&P pipeline"
+        if not MULTI_SCENARIO_MODE
+        else "prior run: artifacts already on disk"
+    )
+    print(f"[phase1] skipped ({_p1_skip_reason})")
+    print(f"  summary loaded from: {_p1_summary_json}")
+    print(f"  cost_with_lt_M={p1_summary.get('cost_with_lt_M', 'n/a'):.4f}  "
+          f"lt_saving_M={p1_summary.get('lt_saving_M', 'n/a'):.4f}  "
+          f"runtime_sec={p1_summary.get('runtime_sec', 'n/a'):.1f}s")
 else:
     RUN_STATE.mark_start("phase1")
     _, p1_data, _, p1_val_target, p1_meta = build_data(
@@ -905,8 +926,14 @@ else:
         if ratio < 0.1:
             print("  *** LT near-free vs shortage — consider LT_COST_MULTIPLIER ≥ 5 for thesis ***")
 
-    # validation_target is no longer dumped to disk — it is merged into each
-    # phase's Results/<phase>/validation_comparison.csv inside save_phase_artifacts.
+    # Multi-scenario mode: teacher rows already collected by scenario generator
+    # (150 diverse sub-instances, CG_ITERATIONS_TEACHER each).  Phase 1 here runs
+    # the single canonical full-dataset instance at full depth (CG_ITERATIONS +
+    # B&P) with collect_teacher=False — no overlap with teacher gen, no redundant
+    # teacher export overhead.  This is the thesis benchmark reference solution.
+    print(f"[phase1] Running canonical benchmark solve  "
+          f"(MULTI_SCENARIO_MODE={MULTI_SCENARIO_MODE}, collect_teacher=False, "
+          f"cg_iterations={CG_ITERATIONS}, bp_nodes={BP_MAX_NODES})")
     p1_results = run_phase(irp, p1_data, use_gnn=False, collect_teacher=False)
 
     p1_summary = phase_summary(p1_results, "phase1_offline_baseline")
