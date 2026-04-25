@@ -63,9 +63,7 @@ TEST_END_DATE:    Optional[str] = None
 
 # Teacher-data scenario generation still needs a bounded canonical date window
 # so BASE_SPECS can be constructed deterministically even when Phase 1/2 run on
-# the full dataset without date slicing. Prefer inferring it from TRAIN_DATA_PATH
-# when the CSV already exists; otherwise fall back to a safe hard-coded window so
-# config evaluation does not crash before prepare_working_repo() clones the repo.
+# the full dataset without date slicing.
 DEFAULT_TEACHER_START_DATE = "2025-08-01"
 DEFAULT_TEACHER_END_DATE   = "2025-08-14"
 
@@ -179,16 +177,11 @@ def build_normalized_base_specs(
         )
     return specs
 
-# Base specs: "name:store_limit:sku_limit[:start_date[:end_date]]"
-# Build 30 normalized slices from the original demand dataset so the GNN sees
-# more source_instance diversity during teacher generation.
-TEACHER_START_DATE, TEACHER_END_DATE = infer_date_range_from_csv(TRAIN_DATA_PATH)
-
-BASE_SPECS = build_normalized_base_specs(
-    start_date=TEACHER_START_DATE,
-    end_date=TEACHER_END_DATE,
-    target_count=30,
-)
+# Base specs are resolved after prepare_working_repo() so TRAIN_DATA_PATH
+# definitely exists before we infer the teacher date window.
+TEACHER_START_DATE: Optional[str] = None
+TEACHER_END_DATE: Optional[str] = None
+BASE_SPECS: List[str] = []
 TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 
 # ── Optional stages ───────────────────────────────────────
@@ -200,10 +193,11 @@ RUN_PHASE_2          = True
 RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
 RUN_BENCHMARK        = True
-# Reuse an existing trained checkpoint whenever one is already present so later
-# notebook runs do not pay the GNN training cost again.
-REUSE_EXISTING_CHECKPOINT = True
-BENCHMARK_N_REPEATS  = 1        # Kaggle runtime budget: one repeat per A0/A/B/C variant
+# Final clean run: wipe old Results/ before any artifacts or logs are written.
+CLEAR_RESULTS_DIR    = True
+# Final clean run: always train from scratch inside this run.
+REUSE_EXISTING_CHECKPOINT = False
+BENCHMARK_N_REPEATS  = 3        # thesis comparison: run 3 repeats per A0/A/B/C variant
 HEURISTIC_TOP_K      = 10
 DEMAND_SHOCK_SEED    = 42
 
@@ -514,13 +508,29 @@ require_path(REPO_ROOT,       "REPO_ROOT")
 require_path(TRAIN_DATA_PATH, "TRAIN_DATA_PATH")
 require_path(TEST_DATA_PATH,  "TEST_DATA_PATH")
 require_path(DIST_PATH,       "DIST_PATH", fatal=False)
+
+# Resolve teacher generation window only after the repo clone / refresh step,
+# so TRAIN_DATA_PATH is guaranteed to exist for a final clean run.
+TEACHER_START_DATE, TEACHER_END_DATE = infer_date_range_from_csv(TRAIN_DATA_PATH)
+BASE_SPECS = build_normalized_base_specs(
+    start_date=TEACHER_START_DATE,
+    end_date=TEACHER_END_DATE,
+    target_count=30,
+)
+
 print("[Run scope]")
 print(f"  store_limit={STORE_LIMIT}  sku_limit={SKU_LIMIT}")
 print(f"  train_window={TRAIN_START_DATE}..{TRAIN_END_DATE}")
 print(f"  test_window ={TEST_START_DATE}..{TEST_END_DATE}")
+print(f"  teacher_window={TEACHER_START_DATE}..{TEACHER_END_DATE}  base_specs={len(BASE_SPECS)}")
 print(f"  cg_iterations={CG_ITERATIONS}  bp_nodes={BP_MAX_NODES}  bp_depth={BP_MAX_DEPTH}")
 print(f"  gnn_epochs={GNN_TRAIN_EPOCHS}  scenarios_per_base={SCENARIOS_PER_BASE}  benchmark_repeats={BENCHMARK_N_REPEATS}")
 print(f"  lt_min_units={LT_MIN_UNITS}  integer_outputs={INTEGER_FINAL_OUTPUTS}  benchmark_fixed_shock={BENCHMARK_FIXED_SHOCK}")
+print(f"  clear_results_dir={CLEAR_RESULTS_DIR}  reuse_existing_checkpoint={REUSE_EXISTING_CHECKPOINT}")
+
+if CLEAR_RESULTS_DIR and RESULTS_DIR.exists():
+    print(f"[Clean run] Removing old Results directory: {RESULTS_DIR}")
+    shutil.rmtree(RESULTS_DIR)
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # Propagate to all subprocesses (scenario generator, GNN trainer, graph
@@ -750,6 +760,11 @@ if not valid_samples:
         "No validation graph samples built. Need ≥ 2 distinct source_instance values. "
         "Increase BASE_SPECS or SCENARIOS_PER_BASE."
     )
+if not test_samples:
+    raise RuntimeError(
+        "No held-out test graph samples built. Final run requires a non-empty test split. "
+        "Increase BASE_SPECS / SCENARIOS_PER_BASE or inspect source_instance diversity."
+    )
 
 # -- 7b: Train BiGAT -----------------------------------------------------------
 print(f"\n[Step 7b] Training BiGAT  epochs={GNN_TRAIN_EPOCHS}, objective=pairwise_rank...")
@@ -801,7 +816,7 @@ print(f"  history rows      : {len(gnn_history)}")
 # gnn/offline_test/test_runtime_seconds.json. The subprocess wall time below
 # bounds that with Python startup + I/O overhead.
 offline_gnn_test_wall_seconds: Optional[float] = None
-if test_samples and checkpoint.exists():
+if checkpoint.exists():
     print(f"\n[Step 7c] Offline test on {len(test_samples)} held-out samples...")
     test_cmd = [
         sys.executable, "GNN/04_test.py",
