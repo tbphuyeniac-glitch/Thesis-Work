@@ -1,0 +1,2 @@
+pattern_id,product,period,reduced_cost,passed_to_rmp,constraint_state_hash,source_instance,base_dataset_id,scenario_id
+fake_gamma_store__seed239081664_SKU_COOKIE_1,SKU_COOKIE,1,-1.0,True,fake_gamma_store__seed239081664,tiny_base__gamma_store__seed239081664,tiny_base,gamma_store__seed239081664

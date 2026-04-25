@@ -1,0 +1,15 @@
+{
+  "source_instance": "tiny_base__gamma_store__seed239081664",
+  "base_dataset_id": "tiny_base",
+  "scenario_id": "gamma_store__seed239081664",
+  "shock_seed": 239081664,
+  "shock_profile": "gamma_store",
+  "n_teacher_rows": 1,
+  "runtime_seconds": 0.0008168339845724404,
+  "cg_objective": 123.456,
+  "cg_iterations_run": 1,
+  "baseline_shared": true,
+  "lt_activation_threshold": 10.0,
+  "n_initial_patterns_per_product_period": 5,
+  "branch_and_price_used": false
+}

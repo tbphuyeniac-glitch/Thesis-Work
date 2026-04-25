@@ -2,15 +2,35 @@ from __future__ import annotations
 
 """GNN/generate_teacher_scenarios.py — teacher-data scenario enumerator.
 
-Runs `irp_gurobi_converted.py` once per (base_dataset, scenario) combination
-and aggregates the exported teacher rows so the downstream GNN pipeline has
-enough diversity for a real instance-level train / valid / test split.
+Runs the IRP-LT pipeline once per (base_dataset, scenario) combination and
+aggregates the exported teacher rows so the downstream GNN pipeline has enough
+diversity for a real instance-level train / valid / test split.
 
 A "base dataset" is a filtered slice of the master retail CSV (by store /
 SKU / date). A "scenario" is one shock profile applied to a base. Together
 they form the unit of identity used for splitting:
 
     source_instance := "<base_dataset_id>__<scenario_id>"
+
+Architecture (v2 — shared ALNS baseline)
+-----------------------------------------
+Previously each scenario spawned a fresh subprocess that re-ran the full
+baseline ALNS → shock → CG chain independently.  With S=5 scenarios per
+base and B=30 bases, that meant 150 identical baseline ALNS solves.
+
+v2 replaces the per-scenario subprocess with an in-process loop:
+
+    for each unique base spec:
+        build IRPData once
+        solve ALNS baseline ONCE          ← single solve per base
+        for each scenario (shock seed):
+            data_copy = deepcopy(base_data)   ← O(ms) copy
+            apply shock to data_copy
+            run CG with collect_teacher_mode=True
+            collect teacher rows
+
+ALNS solves drop from B×S (150) to B (30). All other solver work is
+unchanged: CG runs one full execution per scenario as before.
 
 Output layout
 -------------
@@ -21,55 +41,46 @@ Output layout
             cg_teacher_dataset.csv    — raw per-run teacher rows
             run_metadata.json
 
-After this script finishes, call
-
-    python GNN/build_teacher_graph_dataset.py \
-        --teacher-csv Results/scenarios/aggregate_teacher_rows.csv \
-        --out-dir GNN/data/irplt_teacher
-
-to produce the final graph splits. build_teacher_graph_dataset.py's
-instance-level split will then correctly produce held-out test data because
-each scenario now carries a distinct source_instance.
-
-Split semantics (decided here, enforced by build_teacher_graph_dataset.py)
--------------------------------------------------------------------------
-This script writes a `base_dataset_split` field in the manifest that assigns
-each *base dataset* (not each scenario) to train / valid / test. All
-scenarios from the same base stay in the same split to prevent topology
-leakage (same store+SKU set seen in both train and test).
-
-If you pass --split-by scenario the assignment is per scenario instead
-(looser — allow the topology across splits but different shocks).
+Split semantics
+---------------
+split_by='base' (default): all scenarios from the same base stay in the same
+split — prevents topology leakage across train/valid/test.
 
 CLI
 ---
 --master-csv                Master retail CSV path.
---bases                     List of base-dataset specs, each "name:store_limit:sku_limit[:start:end]".
+--bases                     List of base-dataset specs "name:store_limit:sku_limit[:start:end]".
 --scenarios-per-base        Number of shock scenarios per base (default 10).
 --cg-iterations             CG iterations per run (default 5).
---time-limit                Per-run time limit seconds (default 300).
---shock-distributions       "normal,gamma,sku_spike" (default all three, rotated).
+--time-limit                Per-run time limit seconds for the ALNS baseline (default 300).
+--shock-distributions       Comma-separated shock profiles (default all three, rotated).
 --out-dir                   Output directory (default Results/scenarios).
 --split-by                  "base" (default) or "scenario".
 --train-ratio / --valid-ratio
-                            Base-dataset split ratios (default 0.60/0.20).
+                            Base-dataset split ratios (default 0.60 / 0.20).
 --master-seed               Reproducibility master seed.
---dry-run                   Print the plan and exit without running the pipeline.
+--dry-run                   Print the plan and exit without running.
+--continue-on-failure       Skip failing scenarios/bases instead of aborting.
 """
 
 import argparse
+import copy
 import csv
 import hashlib
+import importlib
 import json
 import os
 import random
-import shutil
-import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+
+# ---------------------------------------------------------------------------
+# CSV helpers
+# ---------------------------------------------------------------------------
 
 def _raise_csv_field_size_limit() -> int:
     limit = sys.maxsize
@@ -104,20 +115,47 @@ def write_csv_rows(path: Path, rows: List[Dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def _write_typed_rows_to_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Like write_csv_rows but accepts mixed-type values (converts to str)."""
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames: List[str] = []
+    seen: set = set()
+    for row in rows:
+        for k in row:
+            if k not in seen:
+                fieldnames.append(k)
+                seen.add(k)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: ("" if v is None else str(v)) for k, v in row.items()})
+
+
+def _rows_to_str_dicts(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Convert mixed-type teacher row dicts to all-string dicts for CSV aggregation."""
+    return [{k: ("" if v is None else str(v)) for k, v in row.items()} for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Scenario / split construction (unchanged from v1)
+# ---------------------------------------------------------------------------
+
 def parse_base_spec(spec: str) -> Dict[str, str]:
     parts = spec.split(":")
     if len(parts) < 3:
         raise ValueError(
             f"base spec must be 'name:store_limit:sku_limit[:start_date[:end_date]]', got {spec!r}"
         )
-    base: Dict[str, str] = {
+    return {
         "base_dataset_id": parts[0].strip() or "base",
         "store_limit": parts[1].strip() or "10",
         "sku_limit": parts[2].strip() or "5",
         "start_date": parts[3].strip() if len(parts) >= 4 else "None",
         "end_date": parts[4].strip() if len(parts) >= 5 else "None",
     }
-    return base
 
 
 def build_scenarios(
@@ -126,16 +164,13 @@ def build_scenarios(
     shock_distributions: List[str],
     master_seed: int,
 ) -> List[Dict[str, str]]:
-    """Return list of scenario dicts. Each scenario = one pipeline run."""
+    """Return list of scenario dicts. Each scenario = one CG teacher run."""
     rng = random.Random(master_seed)
     scenarios: List[Dict[str, str]] = []
     for base in bases:
         for scenario_idx in range(scenarios_per_base):
             shock_profile = shock_distributions[scenario_idx % len(shock_distributions)]
             seed = rng.randrange(1, 2**31 - 1)
-            # Shock parameters differ per profile. These map to existing env
-            # knobs consumed by the main pipeline — keeping the generator
-            # contract minimal.
             if shock_profile == "normal_global":
                 shock_params = {
                     "IRP_DEMAND_SHOCK_PROBABILITY": "0.85",
@@ -180,12 +215,7 @@ def assign_split(
     valid_ratio: float,
     seed: int,
 ) -> Dict[str, str]:
-    """Return mapping scenario_key -> 'train' / 'valid' / 'test'.
-
-    When split_by='base', all scenarios from the same base_dataset_id land
-    in the same split. When split_by='scenario', each scenario is assigned
-    independently.
-    """
+    """Return mapping source_instance -> 'train' / 'valid' / 'test'."""
     rng = random.Random(seed)
     if split_by == "base":
         bases = sorted({scen["base_dataset_id"] for scen in scenarios})
@@ -227,76 +257,214 @@ def assign_split(
     }
 
 
-def run_pipeline(
+# ---------------------------------------------------------------------------
+# In-process IRP helpers (v2 — replaces subprocess run_pipeline)
+# ---------------------------------------------------------------------------
+
+def _load_irp_module(project_root: Path) -> Any:
+    """Import irp_gurobi_converted from the project root (once per process)."""
+    root_str = str(project_root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+    return importlib.import_module("irp_gurobi_converted")
+
+
+def _build_base_instance(
+    irp: Any,
+    master_csv: str,
+    base: Dict[str, str],
+    time_limit: int,
+) -> Tuple[Any, Any]:
+    """Build IRPData and solve ALNS baseline for one base spec.
+
+    The returned (base_data, baseline_sol) are read-only from the caller's
+    perspective: each scenario must deepcopy(base_data) before applying a
+    shock so the original stays clean for the next scenario.
+
+    baseline_sol is shared across all scenarios of this base — it is computed
+    from the original (unshocked) demand and does not depend on the shock seed.
+    """
+    store_limit = int(base["store_limit"])
+    sku_limit = int(base["sku_limit"])
+    start_date = base.get("start_date") if base.get("start_date") not in (None, "None") else None
+    end_date = base.get("end_date") if base.get("end_date") not in (None, "None") else None
+    lt_cost_multiplier = float(os.environ.get("IRP_LT_COST_MULTIPLIER", "1.0"))
+
+    mapper = irp.DatasetToIRPValidationMapper(
+        excel_path=master_csv,
+        sheet_name=None,
+        store_limit=store_limit,
+        sku_limit=sku_limit,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    data, _, _, _ = mapper.build_irp_data(
+        wh_inventory_multiplier=0.8,
+        store_capacity_multiplier=1.2,
+        shortage_cost_rate=0.25,
+        holding_cost_rate=0.01,
+        cw_ship_cost_flat=1.0,
+        lt_ship_cost_flat=0.6,
+        fixed_dispatch_cw=8.0,
+        fixed_dispatch_lt=2.0,
+        vehicle_count=2,
+        vehicle_capacity=500.0,
+        vehicle_fixed_cost=50.0,
+        alpha=1.0,
+        cw_replenishment_factor=0.2,
+        cw_capacity_factor=2.0,
+        store_initial_inventory_multiplier=0.2,
+        lt_cost_multiplier=lt_cost_multiplier,
+    )
+    data.dataset_id = base["base_dataset_id"]
+    data.scenario_id = "baseline"
+
+    t0 = time.perf_counter()
+    baseline_sol = irp.BaselineALNSModel(data).solve(
+        msg=False,
+        time_limit=time_limit,
+        enforce_integer_flows=False,
+        add_valid_16_20=True,
+        allow_lateral_transshipment=False,
+        cw_dispatch_cycle=5,
+    )
+    elapsed = time.perf_counter() - t0
+    print(
+        f"  [baseline] {base['base_dataset_id']:24s}  "
+        f"obj={float(baseline_sol.objective):.2f}  "
+        f"stores={len(data.stores)}  skus={len(data.products)}  "
+        f"t={elapsed:.1f}s"
+    )
+    return data, baseline_sol
+
+
+def _run_scenario_inprocess(
+    irp: Any,
+    base_data: Any,
+    baseline_sol: Any,
     scenario: Dict[str, str],
-    project_root: Path,
     run_dir: Path,
     cg_iterations: int,
-    time_limit: int,
-    master_csv: str,
-    pipeline_script: str,
-) -> Tuple[bool, Path, float]:
-    """Invoke the main pipeline once for one scenario. Returns (ok, csv_path, runtime)."""
-    run_dir.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    # Each scenario gets its own isolated Results tree inside run_dir/. This
-    # prevents the top-level Results/ from being clobbered by the last run
-    # and lets us cleanly pull the single teacher CSV we care about afterwards.
-    base_env = {
-        "IRP_SOURCE_INSTANCE": scenario["source_instance"],
-        "IRP_DATASET_ID": scenario["base_dataset_id"],
-        "IRP_SCENARIO_ID": scenario["scenario_id"],
-        "IRP_DATASET_PATH": master_csv,
-        "IRP_STORE_LIMIT": str(scenario.get("store_limit", "10")),
-        "IRP_SKU_LIMIT": str(scenario.get("sku_limit", "5")),
-        "IRP_DEMAND_SHOCK_SEED": str(scenario["shock_seed"]),
-        "IRP_CG_ITERATIONS": str(cg_iterations),
-        "IRP_TIME_LIMIT": str(time_limit),
-        "IRP_COLLECT_TEACHER_MODE": "1",
-        "IRP_RUNTIME_GNN_MODE": "0",
-        "IRP_CLEAN_RESULTS": "0",  # never delete prior runs' aggregates
-        "IRP_RESULTS_DIR": str(run_dir),
-        "IRP_PHASE_LABEL": "scenario",
-        # Skip the Phase-2 GNN redeploy during scenario enumeration; we only
-        # want teacher rows here, not a second CG pass per scenario.
-        "IRP_DEPLOY_GNN_AFTER_TRAINING": "0",
-        "IRP_TRAIN_GNN_AFTER_TEACHER": "0",
-        "IRP_BUILD_TEACHER_GRAPHS": "0",
-    }
-    if scenario.get("start_date") not in (None, "None"):
-        base_env["IRP_START_DATE"] = scenario["start_date"]
-    if scenario.get("end_date") not in (None, "None"):
-        base_env["IRP_END_DATE"] = scenario["end_date"]
-    env.update(base_env)
-    env.update({
-        k: v for k, v in scenario.items()
-        if k.startswith("IRP_DEMAND_SHOCK_")
-    })
-    t0 = time.perf_counter()
-    print(f"\n[generate] running scenario source_instance={scenario['source_instance']}")
-    try:
-        subprocess.run(
-            [sys.executable, pipeline_script],
-            cwd=str(project_root), env=env, check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        runtime = time.perf_counter() - t0
-        print(f"[generate] scenario {scenario['source_instance']} FAILED after {runtime:.1f}s: {exc}")
-        return False, run_dir / "cg_teacher_dataset.csv", runtime
-    runtime = time.perf_counter() - t0
-    # New layout: each run writes to run_dir/teacher/teacher_rows.csv (set via
-    # IRP_RESULTS_DIR above). Copy the teacher rows to run_dir root under the
-    # canonical per-run name so aggregation doesn't have to know the layout.
-    candidates = [
-        run_dir / "teacher" / "teacher_rows.csv",
-        run_dir / "cg_teacher_dataset.csv",  # legacy — pre-refactor runs
-    ]
-    dst_csv = run_dir / "cg_teacher_dataset.csv"
-    src_csv = next((p for p in candidates if p.exists()), None)
-    if src_csv and src_csv != dst_csv:
-        shutil.copy2(src_csv, dst_csv)
-    return True, dst_csv, runtime
+) -> Tuple[bool, List[Dict[str, Any]], float]:
+    """Run CG teacher collection for one scenario, fully in-process.
 
+    Steps:
+      1. deepcopy(base_data) — isolates this scenario from others
+      2. apply_hidden_local_reallocation_demand_shocks on the copy
+      3. run LateralTransshipmentCG with collect_teacher_mode=True
+      4. tag every teacher row with source_instance
+      5. write per-run CSV + metadata for resume detection
+
+    Returns (ok, teacher_rows_as_dicts, runtime_seconds).
+    baseline_sol is shared (read-only) across all scenarios of the same base.
+
+    Design decisions vs the old subprocess path (__main__ defaults):
+    - lt_activation_threshold=10.0  matches Phase 2 inference conditions so
+      the GNN trains on the same pair distribution it prices at runtime.
+    - n_initial_patterns_per_product_period=5  matches __main__ default.
+    - use_branch_and_price=False  intentionally omitted: B&P was ON by default
+      in the old path (IRP_USE_BRANCH_AND_PRICE=1) but added up to 15×CG-iter
+      of extra work per scenario.  With 150 scenarios the runtime cost outweighs
+      the marginal gain from B&P-node pricing examples; root CG rows at the
+      correct threshold already cover the inference distribution.
+    """
+    source_instance = scenario["source_instance"]
+    shock_seed = int(scenario["shock_seed"])
+    # Match the production lt_activation_threshold so teacher rows cover the
+    # same pair distribution the GNN will encounter during Phase 2 pricing.
+    lt_activation_threshold = float(
+        os.environ.get("IRP_LT_ACTIVATION_THRESHOLD", "10.0")
+    )
+    t0 = time.perf_counter()
+    try:
+        # Isolate this scenario — shock modifies demand in-place.
+        data = copy.deepcopy(base_data)
+        data.dataset_id = scenario["base_dataset_id"]
+        data.scenario_id = scenario["scenario_id"]
+
+        irp.apply_hidden_local_reallocation_demand_shocks(
+            data,
+            baseline_solution=baseline_sol,
+            shock_probability=float(scenario.get("IRP_DEMAND_SHOCK_PROBABILITY", 0.85)),
+            max_reallocation_fraction=float(scenario.get("IRP_DEMAND_SHOCK_REALLOCATION_FRACTION", 0.60)),
+            reallocations_per_product_period=int(scenario.get("IRP_DEMAND_SHOCK_REALLOCATIONS_PER_PRODUCT_PERIOD", 3)),
+            non_dispatch_shock_multiplier=float(scenario.get("IRP_DEMAND_SHOCK_NON_DISPATCH_MULTIPLIER", 1.8)),
+            cw_dispatch_cycle=5,
+            seed=shock_seed,
+        )
+
+        initial_patterns = irp.generate_random_lt_patterns(
+            data,
+            baseline_solution=baseline_sol,
+            n_patterns_per_product_period=5,
+            max_pairs_in_pattern=3,
+            lt_activation_threshold=lt_activation_threshold,
+            seed=shock_seed,
+        )
+
+        cg_engine = irp.LateralTransshipmentCG(
+            data=data,
+            baseline_solution=baseline_sol,
+            initial_patterns=initial_patterns,
+            lt_activation_threshold=lt_activation_threshold,
+            max_pairs_per_pattern=3,
+            use_gnn=False,
+            collect_teacher_mode=True,
+            runtime_gnn_mode=False,
+            heuristic_top_k_mode=False,
+            exact_full_mode=False,
+        )
+        cg_sol = cg_engine.run_column_generation(
+            max_iter=cg_iterations,
+            msg=False,
+            stopping_mode="convergence",
+        )
+
+        rows: List[Dict[str, Any]] = list(cg_engine.teacher_dataset_rows or [])
+        # Tag every row with the source_instance so downstream dedup and
+        # graph splitting work correctly (old path did this via IRP_SOURCE_INSTANCE env var).
+        for row in rows:
+            row["source_instance"] = source_instance
+            row.setdefault("base_dataset_id", scenario["base_dataset_id"])
+            row.setdefault("scenario_id", scenario["scenario_id"])
+
+        runtime = time.perf_counter() - t0
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_typed_rows_to_csv(run_dir / "cg_teacher_dataset.csv", rows)
+        with open(run_dir / "run_metadata.json", "w") as mf:
+            json.dump({
+                "source_instance": source_instance,
+                "base_dataset_id": scenario["base_dataset_id"],
+                "scenario_id": scenario["scenario_id"],
+                "shock_seed": shock_seed,
+                "shock_profile": scenario.get("shock_profile", ""),
+                "n_teacher_rows": len(rows),
+                "runtime_seconds": runtime,
+                "cg_objective": float(cg_sol.objective) if cg_sol else None,
+                "cg_iterations_run": int(getattr(cg_sol, "iterations_run", 0)),
+                "baseline_shared": True,
+                "lt_activation_threshold": lt_activation_threshold,
+                "n_initial_patterns_per_product_period": 5,
+                "branch_and_price_used": False,
+            }, mf, indent=2)
+
+        print(
+            f"  [scenario] {source_instance:<56s}  "
+            f"rows={len(rows):4d}  obj={float(cg_sol.objective):.2f}  "
+            f"t={runtime:.1f}s"
+        )
+        return True, rows, runtime
+
+    except Exception as exc:
+        runtime = time.perf_counter() - t0
+        print(f"  [scenario] {source_instance} FAILED after {runtime:.1f}s: {exc}")
+        traceback.print_exc()
+        return False, [], runtime
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     default_bases = [
@@ -304,27 +472,33 @@ def main() -> None:
         "base_b:15:4:None:None",
         "base_c:8:6:None:None",
     ]
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--master-csv",
-        default=str(Path(__file__).resolve().parents[1] / "1BISCR501V_90100140_20260323-150407111_filtered_sites.csv"),
-        help="Master retail CSV path.",
+        default=str(
+            Path(__file__).resolve().parents[1]
+            / "1BISCR501V_90100140_20260323-150407111_filtered_sites.csv"
+        ),
     )
-    parser.add_argument("--bases", nargs="+", default=default_bases,
-                        help="Base specs 'name:store_limit:sku_limit[:start:end]'")
+    parser.add_argument("--bases", nargs="+", default=default_bases)
     parser.add_argument("--scenarios-per-base", type=int, default=10)
     parser.add_argument("--cg-iterations", type=int, default=5)
-    parser.add_argument("--time-limit", type=int, default=300)
+    parser.add_argument("--time-limit", type=int, default=300,
+                        help="ALNS baseline time limit per base spec (seconds).")
     parser.add_argument("--shock-distributions", default="normal_global,gamma_store,sku_spike")
     parser.add_argument("--out-dir", default="Results/scenarios")
     parser.add_argument("--split-by", choices=["base", "scenario"], default="base")
     parser.add_argument("--train-ratio", type=float, default=0.60)
     parser.add_argument("--valid-ratio", type=float, default=0.20)
     parser.add_argument("--master-seed", type=int, default=20260423)
-    parser.add_argument("--pipeline-script", default="irp_gurobi_converted.py")
+    # --pipeline-script is no longer used (in-process replaced subprocess) but
+    # kept for CLI backwards-compatibility so existing invocations don't break.
+    parser.add_argument("--pipeline-script", default="irp_gurobi_converted.py",
+                        help="[DEPRECATED] Ignored. Scenarios now run in-process.")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--continue-on-failure", action="store_true",
-                        help="If set, skip failing scenarios instead of aborting.")
+    parser.add_argument("--continue-on-failure", action="store_true")
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parents[1]
@@ -346,25 +520,33 @@ def main() -> None:
         seed=args.master_seed,
     )
 
-    manifest = {
+    manifest: Dict[str, Any] = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "master_csv": args.master_csv,
         "master_seed": args.master_seed,
         "split_by": args.split_by,
-        "split_ratios": {"train": args.train_ratio, "valid": args.valid_ratio,
-                          "test": round(1.0 - args.train_ratio - args.valid_ratio, 4)},
+        "split_ratios": {
+            "train": args.train_ratio,
+            "valid": args.valid_ratio,
+            "test": round(1.0 - args.train_ratio - args.valid_ratio, 4),
+        },
         "bases": bases,
         "scenarios": [],
         "split_assignment": split_assignment,
         "run_directory": str(out_dir),
         "aggregate_csv": str(out_dir / "aggregate_teacher_rows.csv"),
+        "baseline_shared_per_base": True,
         "build_teacher_graph_command": (
             f"python GNN/build_teacher_graph_dataset.py "
             f"--teacher-csv {out_dir / 'aggregate_teacher_rows.csv'} "
             f"--out-dir GNN/data/irplt_teacher"
         ),
     }
-    print(f"[generate] bases={len(bases)} scenarios={len(scenarios)} split_by={args.split_by}")
+
+    n_bases = len(bases)
+    n_scenarios = len(scenarios)
+    print(f"[generate] bases={n_bases}  scenarios={n_scenarios}  split_by={args.split_by}")
+    print(f"[generate] ALNS solves: {n_bases} (shared baseline, was {n_scenarios})")
     for scen in scenarios:
         print(f"  {scen['source_instance']:<60s} → {split_assignment[scen['source_instance']]}")
 
@@ -372,26 +554,66 @@ def main() -> None:
         manifest_path = out_dir / "scenarios_manifest.json"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
-        print(f"\n[generate] dry-run wrote plan to {manifest_path}")
+        print(f"\n[generate] dry-run — wrote plan to {manifest_path}")
         return
 
+    # ------------------------------------------------------------------
+    # Load irp module once — shared across all in-process scenario runs.
+    # ------------------------------------------------------------------
+    print(f"\n[generate] importing irp_gurobi_converted from {project_root}")
+    try:
+        irp = _load_irp_module(project_root)
+    except Exception as exc:
+        print(f"[generate] FATAL: could not import irp_gurobi_converted: {exc}")
+        raise
+
+    # ------------------------------------------------------------------
+    # Resume state: load existing aggregate rows and track done sources.
+    # ------------------------------------------------------------------
     aggregate_rows: List[Dict[str, str]] = []
     aggregate_csv = out_dir / "aggregate_teacher_rows.csv"
     if aggregate_csv.exists():
         aggregate_rows = read_csv_rows(aggregate_csv)
         print(f"[generate] resuming — aggregate already has {len(aggregate_rows)} rows")
-    # Dedup key: every row carries source_instance (written by the teacher
-    # export). A scenario is "already in aggregate" if its source_instance
-    # appears there, so a rerun can skip it entirely without re-appending.
     done_sources = {row.get("source_instance", "") for row in aggregate_rows if row.get("source_instance")}
-    # Drop any legacy aggregate rows missing source_instance — we cannot
-    # safely resume around them, so strip them to keep dedup clean.
     aggregate_rows = [row for row in aggregate_rows if row.get("source_instance") in done_sources]
 
+    # ------------------------------------------------------------------
+    # Phase 1: solve ALNS baseline ONCE per base spec.
+    # Skip bases whose scenarios are all already done.
+    # ------------------------------------------------------------------
+    print(f"\n[generate] Phase 1 — ALNS baseline  ({n_bases} base spec(s))")
+    base_cache: Dict[str, Tuple[Optional[Any], Optional[Any]]] = {}
+    for base in bases:
+        base_id = base["base_dataset_id"]
+        if base_id in base_cache:
+            continue
+        base_scenarios = [s for s in scenarios if s["base_dataset_id"] == base_id]
+        pending = [s for s in base_scenarios if s["source_instance"] not in done_sources]
+        if not pending:
+            print(f"  [baseline] {base_id}: all {len(base_scenarios)} scenario(s) done — skip ALNS")
+            base_cache[base_id] = (None, None)
+            continue
+        print(
+            f"  [baseline] {base_id}: {len(pending)}/{len(base_scenarios)} pending — "
+            f"solving ALNS baseline..."
+        )
+        try:
+            base_data, baseline_sol = _build_base_instance(irp, args.master_csv, base, args.time_limit)
+            base_cache[base_id] = (base_data, baseline_sol)
+        except Exception as exc:
+            print(f"  [baseline] {base_id} FAILED: {exc}")
+            traceback.print_exc()
+            base_cache[base_id] = (None, None)
+            if not args.continue_on_failure:
+                print("[generate] aborting — pass --continue-on-failure to skip failed bases.")
+                return
+
+    # ------------------------------------------------------------------
+    # Phase 2: fan out scenarios in-process, reusing cached baselines.
+    # ------------------------------------------------------------------
+    print(f"\n[generate] Phase 2 — CG teacher collection  ({n_scenarios} scenario(s))")
     for idx, scenario in enumerate(scenarios, start=1):
-        # Include base + scenario id in the run-dir name so a quick `ls`
-        # of Results/scenarios/ tells you which scenario is which without
-        # having to crack open the manifest.
         safe_id = (
             f"{scenario['base_dataset_id']}__{scenario['scenario_id']}"
         ).replace("/", "-").replace(" ", "_")
@@ -413,12 +635,14 @@ def main() -> None:
                     aggregate_rows.extend(existing)
                     done_sources.add(source_instance)
                     write_csv_rows(aggregate_csv, aggregate_rows)
-            print(f"[generate] skip idx={idx} source_instance={source_instance} (already done)")
+            print(f"[generate] skip idx={idx} {source_instance} (already done)")
             manifest["scenarios"].append({
                 **scenario,
                 "run_idx": idx,
                 "run_dir": str(run_dir),
-                "teacher_rows_written": sum(1 for row in aggregate_rows if row.get("source_instance") == source_instance),
+                "teacher_rows_written": sum(
+                    1 for r in aggregate_rows if r.get("source_instance") == source_instance
+                ),
                 "runtime_seconds": 0.0,
                 "ok": True,
                 "resumed": True,
@@ -429,23 +653,41 @@ def main() -> None:
                 json.dump(manifest, f, indent=2)
             continue
 
-        ok, csv_path, runtime = run_pipeline(
-            scenario=scenario,
-            project_root=project_root,
-            run_dir=run_dir,
-            cg_iterations=args.cg_iterations,
-            time_limit=args.time_limit,
-            master_csv=args.master_csv,
-            pipeline_script=args.pipeline_script,
+        base_data, baseline_sol = base_cache.get(scenario["base_dataset_id"], (None, None))
+        if base_data is None:
+            print(
+                f"[generate] skip idx={idx} {source_instance}: "
+                f"baseline unavailable (base failed or all done)"
+            )
+            manifest["scenarios"].append({
+                **scenario,
+                "run_idx": idx,
+                "run_dir": str(run_dir),
+                "teacher_rows_written": 0,
+                "runtime_seconds": 0.0,
+                "ok": False,
+                "resumed": False,
+                "error": "baseline_not_available",
+                "split": split_assignment[source_instance],
+            })
+            manifest_path = out_dir / "scenarios_manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+            if not args.continue_on_failure:
+                print("[generate] aborting — pass --continue-on-failure to skip failed scenarios.")
+                return
+            continue
+
+        ok, rows, runtime = _run_scenario_inprocess(
+            irp, base_data, baseline_sol, scenario, run_dir, args.cg_iterations,
         )
-        rows = read_csv_rows(csv_path) if ok else []
-        # Guard against any stray rows carrying a different source_instance
-        # (shouldn't happen, but keeps dedup invariants honest).
-        rows = [row for row in rows if row.get("source_instance", source_instance) == source_instance]
-        if ok and rows:
-            aggregate_rows.extend(rows)
+
+        str_rows = _rows_to_str_dicts(rows)
+        if ok and str_rows:
+            aggregate_rows.extend(str_rows)
             done_sources.add(source_instance)
             write_csv_rows(aggregate_csv, aggregate_rows)
+
         manifest["scenarios"].append({
             **scenario,
             "run_idx": idx,
@@ -463,7 +705,9 @@ def main() -> None:
             print("[generate] aborting — pass --continue-on-failure to skip failed scenarios.")
             return
 
-    # Quick sanity hash of the aggregate so we can detect silent corruption.
+    # ------------------------------------------------------------------
+    # Final manifest + integrity hash
+    # ------------------------------------------------------------------
     sha = hashlib.sha1()
     with open(aggregate_csv, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -473,7 +717,11 @@ def main() -> None:
     manifest_path = out_dir / "scenarios_manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
-    print(f"\n[generate] done. {len(aggregate_rows)} teacher rows aggregated.")
+
+    n_done = sum(1 for s in manifest["scenarios"] if s.get("ok"))
+    print(f"\n[generate] done.  {len(aggregate_rows)} teacher rows  "
+          f"({n_done}/{n_scenarios} scenarios OK)")
+    print(f"[generate] ALNS baseline solves: {n_bases}  (saved ~{n_scenarios - n_bases} re-solves)")
     print(f"[generate] next step: {manifest['build_teacher_graph_command']}")
 
 
