@@ -3151,6 +3151,184 @@ def build_post_shock_lt_diagnostics(
     }
 
 
+# ============================================================================
+# ADAPTIVE FEATURE PRUNER
+#
+# Inspired by Bianchessi, Gschwind & Irnich (2024), "Resource-Window Reduction
+# by Reduced Costs in Path-Based Formulations for Routing and Scheduling
+# Problems" (INFORMS J. Comp.). The paper tightens vertex/arc resource windows
+# using the reduced costs of paths visiting them: a value v is eliminated
+# whenever LB(π) + min_{p has v} c̃_p(π) > UB. We adapt the same idea to the
+# four bilateral-pair features used in our LT pricing step:
+#   {shortage_ratio, surplus_ratio, time_urgency, negative_reduced_cost}.
+#
+# Each iteration we:
+#   1) Score every (donor, receiver) pair with a reduced-cost proxy.
+#   2) Pick "surviving" pairs by the bound rule when LB/UB are available, else
+#      fall back to a quantile of the current iteration's RC distribution.
+#   3) Set [L_k, U_k] for each feature k = [min, max] over surviving pairs
+#      (with a small epsilon buffer to avoid over-tightening).
+#   4) In subsequent iterations, prune candidates whose feature values fall
+#      outside [L_k, U_k]. Safeguards keep the best-RC candidate, refuse
+#      wipeouts, and warm-start without pruning until enough data is seen.
+# ============================================================================
+
+class AdaptiveFeaturePruner:
+    """Adaptive admissible windows for the four LT pricing features.
+
+    Maintains windows [L_k, U_k] per feature and per phase. Windows are
+    tightened from the reduced-cost distribution of each pricing iteration's
+    surviving candidates — never from a fixed numeric threshold.
+    """
+
+    DEFAULT_FEATURES: Tuple[str, ...] = (
+        "shortage_ratio",
+        "surplus_ratio",
+        "time_urgency",
+        "negative_reduced_cost",
+    )
+
+    def __init__(
+        self,
+        feature_names: Optional[Tuple[str, ...]] = None,
+        epsilon: float = 0.05,
+        warmup_min_candidates: int = 8,
+        rc_fallback_quantile: float = 0.5,
+        max_pruned_fraction: float = 0.95,
+        keep_best_rc: bool = True,
+    ):
+        self.feature_names: Tuple[str, ...] = tuple(feature_names or self.DEFAULT_FEATURES)
+        self.epsilon = float(epsilon)
+        self.warmup_min_candidates = int(warmup_min_candidates)
+        self.rc_fallback_quantile = float(rc_fallback_quantile)
+        self.max_pruned_fraction = float(max_pruned_fraction)
+        self.keep_best_rc = bool(keep_best_rc)
+        # Per-phase windows; default phase "lt" is created lazily.
+        self._windows: Dict[str, Dict[str, Tuple[float, float]]] = {}
+        # Audit log of every iteration the pruner saw.
+        self.history: List[Dict[str, Any]] = []
+
+    # ---- Window access -----------------------------------------------------
+    def current_windows(self, phase: str = "lt") -> Dict[str, Tuple[float, float]]:
+        """Return current admissible windows; full open ranges if no update yet."""
+        return self._windows.get(phase, {
+            name: (-math.inf, math.inf) for name in self.feature_names
+        })
+
+    def is_admissible(
+        self,
+        feature_values: Dict[str, float],
+        phase: str = "lt",
+    ) -> bool:
+        windows = self.current_windows(phase)
+        for name in self.feature_names:
+            lo, hi = windows.get(name, (-math.inf, math.inf))
+            v = float(feature_values.get(name, 0.0))
+            if v < lo or v > hi:
+                return False
+        return True
+
+    # ---- Update -----------------------------------------------------------
+    def update(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        iteration: int = 0,
+        phase: str = "lt",
+        lb: Optional[float] = None,
+        ub: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Recompute admissible windows from the surviving candidates.
+
+        candidates: list of dicts, each with keys 'reduced_cost' and 'feature_values'.
+        Survivors are picked by LB+rc<=UB when both bounds are available, else by
+        the bottom rc_fallback_quantile of the iteration's RC distribution.
+        """
+        n_total = len(candidates)
+        record: Dict[str, Any] = {
+            "iteration": int(iteration),
+            "phase": str(phase),
+            "n_candidates": n_total,
+            "lb_used": None if lb is None else float(lb),
+            "ub_used": None if ub is None else float(ub),
+            "mode": "warmup",
+            "n_survivors": 0,
+            "windows": {},
+            "skipped_reason": None,
+        }
+
+        if n_total < self.warmup_min_candidates:
+            record["skipped_reason"] = "warmup_insufficient_candidates"
+            self.history.append(record)
+            return record
+
+        rcs = [float(c.get("reduced_cost", 0.0)) for c in candidates]
+
+        # Bound-based rule when LB and UB are both finite and consistent.
+        survivors: List[Dict[str, Any]] = []
+        if lb is not None and ub is not None and math.isfinite(lb) and math.isfinite(ub) and ub >= lb:
+            gap = ub - lb
+            survivors = [c for c, rc in zip(candidates, rcs) if rc <= gap]
+            record["mode"] = "bound_based"
+        if not survivors:
+            # Fallback: use the lower quantile of the RC distribution.
+            sorted_rcs = sorted(rcs)
+            cutoff_idx = max(0, int(math.ceil(self.rc_fallback_quantile * n_total)) - 1)
+            cutoff_idx = min(cutoff_idx, n_total - 1)
+            cutoff_rc = sorted_rcs[cutoff_idx]
+            survivors = [c for c, rc in zip(candidates, rcs) if rc <= cutoff_rc]
+            record["mode"] = "rc_quantile_fallback"
+            record["fallback_quantile"] = self.rc_fallback_quantile
+            record["fallback_cutoff_rc"] = float(cutoff_rc)
+
+        # Always keep best-RC candidate so windows include at least one improving column.
+        if self.keep_best_rc and candidates:
+            best = min(candidates, key=lambda c: float(c.get("reduced_cost", 0.0)))
+            if best not in survivors:
+                survivors.append(best)
+
+        if not survivors:
+            record["skipped_reason"] = "no_survivors_after_filter"
+            self.history.append(record)
+            return record
+
+        # Compute new windows: [min - eps, max + eps] over surviving features.
+        proposed: Dict[str, Tuple[float, float]] = {}
+        for name in self.feature_names:
+            vals = [float(c["feature_values"].get(name, 0.0)) for c in survivors]
+            lo = min(vals)
+            hi = max(vals)
+            span = max(hi - lo, 1e-9)
+            proposed[name] = (lo - self.epsilon * span, hi + self.epsilon * span)
+
+        # Wipe-out check: how many of the *current* candidates would the new
+        # windows reject? If too aggressive, refuse this update.
+        n_kept = sum(
+            1 for c in candidates
+            if all(
+                proposed[name][0] <= float(c["feature_values"].get(name, 0.0)) <= proposed[name][1]
+                for name in self.feature_names
+            )
+        )
+        pruned_fraction = 1.0 - (n_kept / float(n_total))
+        if pruned_fraction > self.max_pruned_fraction:
+            record["skipped_reason"] = (
+                f"would_prune_fraction={pruned_fraction:.3f}>cap={self.max_pruned_fraction}"
+            )
+            self.history.append(record)
+            return record
+
+        self._windows[phase] = proposed
+        record["n_survivors"] = len(survivors)
+        record["windows"] = {
+            name: (round(lo, 6), round(hi, 6)) for name, (lo, hi) in proposed.items()
+        }
+        record["n_kept_after_window"] = int(n_kept)
+        record["pruned_fraction"] = round(pruned_fraction, 6)
+        self.history.append(record)
+        return record
+
+
 class LateralTransshipmentCG:
     def __init__(
         self,
@@ -3200,6 +3378,13 @@ class LateralTransshipmentCG:
         # Minimum LT shipment size enforced inside the follower solver.
         # None → read IRP_LT_MIN_UNITS (default 5).
         stackelberg_min_lateral_qty: Optional[float] = None,
+        # ── Adaptive feature pruning ──────────────────────────────────────
+        # When True, replace the static `feature_ranges` admissibility test
+        # with iteration-by-iteration adaptive windows derived from the
+        # surviving candidates' reduced-cost distribution. Inspired by
+        # Bianchessi et al. (2024) resource-window reduction. Default reads
+        # IRP_ADAPTIVE_PRUNING (default "1" = enabled).
+        adaptive_pruning_enabled: Optional[bool] = None,
         source_instance: Optional[str] = None,
     ):
         self.data = data
@@ -3288,6 +3473,21 @@ class LateralTransshipmentCG:
         )
         # Per-iteration Stackelberg evaluation log (pattern_id, delta, ...)
         self.stackelberg_column_score_log: List[Dict[str, Any]] = []
+        # ── Adaptive feature pruning (Bianchessi-inspired) ────────────────
+        if adaptive_pruning_enabled is None:
+            adaptive_pruning_enabled = os.environ.get(
+                "IRP_ADAPTIVE_PRUNING", "1"
+            ).lower() not in {"0", "false", "no", ""}
+        self.adaptive_pruning_enabled = bool(adaptive_pruning_enabled)
+        self.adaptive_pruner: Optional[AdaptiveFeaturePruner] = (
+            AdaptiveFeaturePruner() if self.adaptive_pruning_enabled else None
+        )
+        # Best LT-cost UB seen across pricing iterations (initialized lazily).
+        self._adaptive_pruning_lb: Optional[float] = None
+        self._adaptive_pruning_ub: Optional[float] = None
+        # Buffer of candidate dicts collected within a single CG iteration —
+        # flushed to the pruner once per iteration, not once per (p, t) call.
+        self._adaptive_pending_candidates: List[Dict[str, Any]] = []
         self._gnn_loaded = False
         self._gnn_unavailable_reason: Optional[str] = None
         self._gnn_model = None
@@ -4214,6 +4414,25 @@ class LateralTransshipmentCG:
         self._last_candidate_pair_count = len(feature_values)
         pruned: Dict[str, List[Dict[str, Any]]] = {feature: [] for feature in self.feature_ranges.keys()}
 
+        # Collect every viable candidate first so the adaptive pruner sees the
+        # full reduced-cost distribution at the end of this (p, t) call.
+        adaptive_candidates: List[Dict[str, Any]] = []
+
+        # Choose admissibility check: adaptive windows when the pruner is on,
+        # otherwise the static feature_ranges fall-through (fixed thresholds).
+        use_adaptive = bool(self.adaptive_pruning_enabled and self.adaptive_pruner is not None)
+        if use_adaptive:
+            adaptive_windows = self.adaptive_pruner.current_windows(phase="lt")
+            best_rc_pair: Optional[Tuple[Store, Store]] = None
+            best_rc_value = math.inf
+
+        def _is_admissible_under_windows(fvals_local: Dict[str, float]) -> bool:
+            for fname, (lo, hi) in adaptive_windows.items():
+                v = float(fvals_local.get(fname, 0.0))
+                if v < lo or v > hi:
+                    return False
+            return True
+
         for (i, j), fvals in feature_values.items():
             donor_surplus = surplus[(i, p, t)]
             recv_need = need[(j, p, t)]
@@ -4238,9 +4457,27 @@ class LateralTransshipmentCG:
                 "feature_values": fvals,
             }
 
+            adaptive_candidates.append({
+                "pair": (i, j),
+                "reduced_cost": reduced_cost_proxy,
+                "feature_values": dict(fvals),
+            })
+            if use_adaptive and reduced_cost_proxy < best_rc_value:
+                best_rc_value = reduced_cost_proxy
+                best_rc_pair = (i, j)
+
             for feature_name, bounds in self.feature_ranges.items():
                 fval = fvals[feature_name]
-                if bounds["min"] <= fval <= bounds["max"]:
+                # Adaptive admission: window from pruner. Static fallback:
+                # the (effectively open) bounds in self.feature_ranges.
+                if use_adaptive:
+                    admit = _is_admissible_under_windows(fvals)
+                    # Safeguard: always keep best-RC pair so CG can progress.
+                    if not admit and (i, j) == best_rc_pair:
+                        admit = True
+                else:
+                    admit = bounds["min"] <= fval <= bounds["max"]
+                if admit:
                     feature_bonus = 0.05 * fval
                     payload_copy = dict(payload)
                     payload_copy["feature_name"] = feature_name
@@ -4277,6 +4514,13 @@ class LateralTransshipmentCG:
         for feature_name, rows in pruned.items():
             rows.sort(key=lambda x: x["feature_score"], reverse=True)
             pruned[feature_name] = rows[:self.top_pairs_per_feature]
+
+        # Adaptive pruning: buffer this (p, t)'s candidates. The accumulated
+        # batch is flushed to the pruner once per CG iteration (in
+        # _candidate_patterns_from_duals) so windows tighten on the full
+        # iteration's distribution, not the tiny per-(p, t) slice.
+        if self.adaptive_pruning_enabled and self.adaptive_pruner is not None:
+            self._adaptive_pending_candidates.extend(adaptive_candidates)
         return pruned
 
     @staticmethod
@@ -4805,6 +5049,11 @@ class LateralTransshipmentCG:
         pairs_accepted_stackelberg = 0
         pairs_recovered_stackelberg_fallback = 0
 
+        # Reset the adaptive-pruning buffer so the iteration sees only this
+        # call's candidates.
+        if self.adaptive_pruning_enabled and self.adaptive_pruner is not None:
+            self._adaptive_pending_candidates = []
+
         for p, t in sorted(active_product_periods):
             pruned_pairs_by_feature = self._prune_pairs_by_feature(
                 p=p,
@@ -4847,6 +5096,50 @@ class LateralTransshipmentCG:
                 episode=episode,
             )
             new_patterns.extend(feature_patterns)
+
+        # Flush per-iteration adaptive-pruning update with the full pooled
+        # candidate distribution from every (p, t).
+        if (
+            self.adaptive_pruning_enabled
+            and self.adaptive_pruner is not None
+            and self._adaptive_pending_candidates
+        ):
+            update_record = self.adaptive_pruner.update(
+                self._adaptive_pending_candidates,
+                iteration=int(episode or self.current_episode or 0),
+                phase="lt",
+                lb=self._adaptive_pruning_lb,
+                ub=self._adaptive_pruning_ub,
+            )
+            if self._log_candidate_pairs:
+                self.column_pool_diagnostics.append({
+                    "episode": episode,
+                    "stage": "adaptive_pruning_update",
+                    "product": "",
+                    "period": "",
+                    "feature_name": "_adaptive_windows",
+                    "donor_store": "",
+                    "receiver_store": "",
+                    "qty_cap": 0.0,
+                    "reduced_cost_proxy": None,
+                    "stackelberg_accepted": None,
+                    "acceptance_score": None,
+                    "compensation": None,
+                    "pattern_id": "",
+                    "pattern_reduced_cost": None,
+                    "gnn_score": None,
+                    "gnn_combined_score": None,
+                    "gnn_selected": None,
+                    "gnn_selected_by_fallback": None,
+                    "adaptive_k_star": None,
+                    "duplicate_id_reject": False,
+                    "duplicate_signature_reject": False,
+                    "empty_flow_reject": False,
+                    "added_to_pool": False,
+                    "signature": json.dumps(update_record, default=str),
+                })
+            self._adaptive_pending_candidates = []
+
         patterns_built_before_dedup = len(new_patterns)
         new_patterns = self._deduplicate_priced_patterns(new_patterns, episode=episode)
         patterns_after_dedup = len(new_patterns)
@@ -5209,6 +5502,13 @@ class LateralTransshipmentCG:
     def pricing_step(self, master_solution: CGSolution, rc_tol: float = -1e-6) -> List[LTPattern]:
         need, surplus = self._build_need_and_surplus_proxies(master_solution=master_solution)
         active_product_periods = self._compute_active_product_periods(need, surplus)
+        # Make LB/UB visible to the adaptive pruner. LB = current RMP LP value
+        # (this iteration's lower bound on the LP relaxation). UB is left None
+        # unless an integer incumbent has been recorded — the pruner falls back
+        # to its RC-quantile rule in that case.
+        self._adaptive_pruning_lb = float(master_solution.objective) if math.isfinite(
+            float(master_solution.objective)
+        ) else None
         if self.exact_full_mode:
             # A0 benchmark: exact Gurobi pricing, no pruning / Stackelberg / GNN / top-k.
             selected_patterns = self._candidate_patterns_exact_full(
