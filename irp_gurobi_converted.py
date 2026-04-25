@@ -3498,6 +3498,18 @@ class LateralTransshipmentCG:
         self._gnn_adaptive_select_indices = None
         self.gnn_selection_history: List[Dict[str, Any]] = []
         self.teacher_dataset_rows: List[Dict[str, Any]] = []
+        # Per-engine teacher export diagnostics. The graph builder reads these
+        # via results["teacher_export_diagnostics"] so the GNN training pipeline
+        # can fail loudly if too many batches were dropped for missing constraint
+        # features (silent skips were the failure mode that motivated this).
+        self.teacher_export_diagnostics: Dict[str, int] = {
+            "batches_total": 0,
+            "batches_with_constraint_features": 0,
+            "batches_skipped_no_constraint_features": 0,
+            "batches_skipped_no_column_features": 0,
+            "batches_skipped_no_edges": 0,
+            "rows_written": 0,
+        }
         self.cg_history: List[Dict[str, Any]] = []
         self.cg_history_all_nodes: List[Dict[str, Any]] = []
         self.branch_history: List[Dict[str, Any]] = []
@@ -3773,17 +3785,39 @@ class LateralTransshipmentCG:
         constraint_features = raw_graph.get("constraint_features") if raw_graph else None
         edge_index = raw_graph.get("edge_index_col_to_con") if raw_graph else None
         edge_attr = raw_graph.get("edge_attr_col_to_con") if raw_graph else None
+
+        # ------------------------------------------------------------------
+        # Validate the batch BEFORE writing any rows.  Earlier code wrote rows
+        # with empty constraint_features_json whenever raw_graph was missing or
+        # the graph builder returned a degenerate graph; the graph builder then
+        # silently dropped those groups via `propagate_constraint_features_json`
+        # finding no non-empty value to fill in.  We now refuse to write a batch
+        # that lacks constraint features (or column features, or edges) and
+        # increment the corresponding skip counter so downstream tooling can
+        # detect when teacher coverage degraded.
+        # ------------------------------------------------------------------
+        self.teacher_export_diagnostics["batches_total"] += 1
+        if constraint_features is None or len(constraint_features) == 0:
+            self.teacher_export_diagnostics["batches_skipped_no_constraint_features"] += 1
+            return
+        if column_features is None or len(column_features) == 0:
+            self.teacher_export_diagnostics["batches_skipped_no_column_features"] += 1
+            return
+        if edge_index is None or edge_attr is None or len(edge_attr) == 0:
+            self.teacher_export_diagnostics["batches_skipped_no_edges"] += 1
+            return
+        self.teacher_export_diagnostics["batches_with_constraint_features"] += 1
+
         edge_constraint_ids_by_col: Dict[int, List[int]] = {idx: [] for idx in range(len(patterns))}
         edge_attrs_by_col: Dict[int, List[List[float]]] = {idx: [] for idx in range(len(patterns))}
-        if edge_index is not None and edge_attr is not None:
-            col_indices = edge_index[0].tolist()
-            con_indices = edge_index[1].tolist()
-            edge_attrs = edge_attr.tolist()
-            for edge_pos, col_idx in enumerate(col_indices):
-                col_idx = int(col_idx)
-                edge_constraint_ids_by_col.setdefault(col_idx, []).append(int(con_indices[edge_pos]))
-                edge_attrs_by_col.setdefault(col_idx, []).append([float(value) for value in edge_attrs[edge_pos]])
-        constraint_features_json = json.dumps(constraint_features.tolist()) if constraint_features is not None else ""
+        col_indices = edge_index[0].tolist()
+        con_indices = edge_index[1].tolist()
+        edge_attrs = edge_attr.tolist()
+        for edge_pos, col_idx in enumerate(col_indices):
+            col_idx = int(col_idx)
+            edge_constraint_ids_by_col.setdefault(col_idx, []).append(int(con_indices[edge_pos]))
+            edge_attrs_by_col.setdefault(col_idx, []).append([float(value) for value in edge_attrs[edge_pos]])
+        constraint_features_json = json.dumps(constraint_features.tolist())
         # `constraint_features_json` is identical for every pattern exported by this
         # batch (same branch node / episode / product / period / RMP state), but it
         # can be ~20 KB per row. Write it only on the first row of the batch and leave
@@ -7485,11 +7519,15 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
         "seed": run_context.get("seed", ""),
         "benchmark_mode": run_context.get("benchmark_mode", ""),
         "rmp_objective": float(cg_sol.objective) if cg_sol is not None else float("nan"),
-        "realized_cost_no_lt": float(realized_no_lt.get("total_cost", float("nan"))),
-        "realized_cost_with_lt": float(realized_with_lt.get("total_cost", float("nan"))),
-        "final_objective_or_total_cost": float(realized_with_lt.get("total_cost", float("nan"))),
-        "lt_cost_with_lt": float(realized_with_lt.get("lateral_transshipment_cost", 0.0)),
-        "shortage_cost_with_lt": float(realized_with_lt.get("shortage_cost", 0.0)),
+        # build_realized_operating_cost_breakdown returns these exact keys —
+        # earlier code read total_cost / lateral_transshipment_cost / shortage_cost
+        # which never existed in the breakdown dict, producing NaN/0 in every
+        # benchmark CSV row.
+        "realized_cost_no_lt": float(realized_no_lt.get("total_realized_operating_cost", float("nan"))),
+        "realized_cost_with_lt": float(realized_with_lt.get("total_realized_operating_cost", float("nan"))),
+        "final_objective_or_total_cost": float(realized_with_lt.get("total_realized_operating_cost", float("nan"))),
+        "lt_cost_with_lt": float(realized_with_lt.get("lateral_transshipment_cost_realized", 0.0)),
+        "shortage_cost_with_lt": float(realized_with_lt.get("shortage_cost_realized", 0.0)),
         "cg_iterations": int(len(cg_history)),
         "stopping_reason": stopping_reason,
         "total_runtime_seconds": float(runtime_seconds),
