@@ -63,6 +63,7 @@ pip install pandas openpyxl gurobipy torch
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Iterable, Set, Any
+import copy
 import datetime
 import hashlib
 import importlib
@@ -677,6 +678,7 @@ def run_teacher_graph_and_gnn_training(
     checkpoint_path: str = DEFAULT_GNN_CHECKPOINT,
     training_history_csv_path: Optional[str] = None,
     run_offline_test: bool = True,
+    max_skip_ratio: float = 0.30,
 ) -> List[Dict[str, Any]]:
     """Build teacher graph samples and train the BiGAT scorer.
 
@@ -705,6 +707,8 @@ def run_teacher_graph_and_gnn_training(
                 "--out-dir",
                 "GNN/data/irplt_teacher",
                 "--overwrite",
+                "--max-skip-ratio",
+                str(float(max_skip_ratio)),
             ],
             cwd=str(Path(__file__).resolve().parent),
             check=True,
@@ -3874,6 +3878,7 @@ class LateralTransshipmentCG:
                 "cg_objective_after_reopt": None,
                 "cg_objective_improvement": None,
             })
+        self.teacher_export_diagnostics["rows_written"] += len(patterns)
 
     def _annotate_teacher_rows_after_reopt(self, episode: int, sol: CGSolution, improvement: float) -> None:
         selected_by_gnn_in_rmp = 0
@@ -7159,15 +7164,30 @@ class IRPResearchPipeline:
     def __init__(self, data: IRPData):
         self.data = data
 
-    def run(
+    # ------------------------------------------------------------------
+    # LT-recourse-only entrypoint.
+    #
+    # The benchmark (run_three_way_benchmark) calls this once per variant
+    # so all 4 variants share a single ALNS baseline + a single demand-shock
+    # state.  run() below is now a thin wrapper that solves baseline +
+    # applies shock once, then delegates here.
+    #
+    # CONTRACT:
+    #   - self.data must already carry the post-shock realized demand.
+    #   - baseline_sol must already be solved.
+    #   - This helper attaches realized_inventory_after_lt to baseline_sol;
+    #     callers that share one baseline across variants MUST deepcopy it
+    #     before calling this helper for each variant.
+    # ------------------------------------------------------------------
+    def run_lt_recourse_from_baseline(
         self,
+        baseline_sol,
+        *,
+        shock_summary: Optional[Dict[str, Any]] = None,
         use_random_initial_patterns: bool = True,
         n_initial_patterns_per_product_period: int = 5,
         cg_iterations: int = 15,
         msg: bool = True,
-        time_limit: Optional[int] = None,
-        enforce_integer_flows: bool = False,
-        cw_dispatch_cycle: Optional[int] = 5,
         use_gnn: bool = False,
         collect_teacher_mode: bool = True,
         runtime_gnn_mode: Optional[bool] = None,
@@ -7182,11 +7202,6 @@ class IRPResearchPipeline:
         bp_max_nodes: int = 15,
         bp_max_depth: int = 6,
         lt_activation_threshold: float = 10.0,
-        demand_shock_probability: float = 0.85,
-        demand_shock_reallocation_fraction: float = 0.60,
-        demand_shock_reallocations_per_product_period: int = 3,
-        demand_shock_non_dispatch_multiplier: float = 1.8,
-        demand_shock_seed: int = 20260418,
         diagnostic_verbosity: str = "summary",
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
@@ -7194,51 +7209,10 @@ class IRPResearchPipeline:
         stackelberg_aware_scoring: bool = False,
         stackelberg_exact_follower: bool = False,
         stackelberg_min_lateral_qty: Optional[float] = None,
-    ) -> Dict:
-        pipeline_started_at = time.perf_counter()
-        print("=" * 80)
-        print("STEP 1 - Solve baseline IRPT  (ALNS, DC->stores->DC, no LT)")
-        print("=" * 80)
-        # --- DEPRECATED GUROBI BASELINE (kept commented for reference; ALNS replaces it) ---
-        # baseline_sol = AchamrahFullIRPTModel(self.data).solve(
-        #     msg=msg,
-        #     time_limit=time_limit,
-        #     enforce_integer_flows=enforce_integer_flows,
-        #     add_valid_16_20=True,
-        #     allow_lateral_transshipment=False,
-        #     cw_dispatch_cycle=cw_dispatch_cycle,
-        # )
-        baseline_sol = BaselineALNSModel(self.data).solve(
-            msg=msg,
-            time_limit=time_limit,
-            enforce_integer_flows=enforce_integer_flows,
-            add_valid_16_20=True,
-            allow_lateral_transshipment=False,
-            cw_dispatch_cycle=cw_dispatch_cycle,
-        )
-        if _is_quiet():
-            _summary = baseline_sol.summary()
-            print(f"[Baseline Summary] obj={_summary.get('objective'):.4f} keys={len(_summary)}" if isinstance(_summary, dict) else "[Baseline Summary] printed")
-        else:
-            pprint.pprint(baseline_sol.summary())
-        print_efficiency_metrics("Baseline Solver Efficiency", baseline_sol.efficiency_metrics)
+    ) -> Dict[str, Any]:
+        recourse_started_at = time.perf_counter()
         baseline_cost_breakdown = build_full_irpt_cost_breakdown(self.data, baseline_sol)
-        print_cost_breakdown("Baseline Full IRPT Cost Breakdown", baseline_cost_breakdown)
         baseline_routes = extract_routes_from_solution(baseline_sol, warehouse=self.data.warehouse)
-
-        print("\n" + "=" * 80)
-        print("STEP 1B - Apply hidden realized-demand shock after DC shipment")
-        print("=" * 80)
-        shock_summary = apply_hidden_local_reallocation_demand_shocks(
-            self.data,
-            baseline_solution=baseline_sol,
-            shock_probability=demand_shock_probability,
-            max_reallocation_fraction=demand_shock_reallocation_fraction,
-            reallocations_per_product_period=demand_shock_reallocations_per_product_period,
-            non_dispatch_shock_multiplier=demand_shock_non_dispatch_multiplier,
-            cw_dispatch_cycle=cw_dispatch_cycle,
-            seed=demand_shock_seed,
-        )
         post_shock_summary = build_post_shock_inventory_state(self.data, baseline_sol)
         post_shock_lt_diagnostics = build_post_shock_lt_diagnostics(
             self.data,
@@ -7247,18 +7221,6 @@ class IRPResearchPipeline:
         )
         forecast_fulfillment_df = build_forecast_fulfillment_df(self.data, baseline_sol)
         demand_fulfillment_df = build_post_shock_fulfillment_df(self.data)
-        if _is_quiet():
-            print(f"[Hidden Demand Shock Summary] keys={len(shock_summary) if isinstance(shock_summary, dict) else 'n/a'}")
-            print(f"[Post-Shock Inventory State Summary] keys={len(post_shock_summary) if isinstance(post_shock_summary, dict) else 'n/a'}")
-            print(f"[Post-Shock LT Diagnostics] keys={len(post_shock_lt_diagnostics) if isinstance(post_shock_lt_diagnostics, dict) else 'n/a'}")
-        else:
-            print("[Hidden Demand Shock Summary]")
-            pprint.pprint(shock_summary)
-            print("[Post-Shock Inventory State Summary]")
-            pprint.pprint(post_shock_summary)
-            print("[Post-Shock LT Diagnostics]")
-            pprint.pprint(post_shock_lt_diagnostics)
-            print_post_shock_fulfillment(demand_fulfillment_df)
 
         initial_patterns = []
         if use_random_initial_patterns:
@@ -7361,17 +7323,15 @@ class IRPResearchPipeline:
         print_cost_breakdown("Realized Operating Cost Without LT", realized_no_lt_cost_breakdown)
         print_cost_breakdown("Realized Operating Cost With CG LT", realized_with_lt_cost_breakdown)
 
-        # Expose the inventory trajectory that produced the "with LT" realized cost
-        # so downstream validation compares against the actual shelf state (baseline
-        # forecast + post-shock reallocation + LT recourse), not just the forecast
-        # inv_store. build_predicted_inventory_df automatically picks this up.
+        # Attaches to baseline_sol — caller controls whether this is the shared
+        # baseline (deepcopy required) or a private copy.
         baseline_sol.realized_inventory_after_lt = compute_realized_inventory_after_lt(
             self.data,
             baseline_sol,
             lt_plan_df=lt_plan_df,
         )
 
-        pipeline_runtime_seconds = time.perf_counter() - pipeline_started_at
+        recourse_runtime_seconds = time.perf_counter() - recourse_started_at
         comparison = {
             "forecast_dc_plan_objective": baseline_sol.objective,
             "realized_operating_cost_without_lt": realized_no_lt_cost_breakdown["total_realized_operating_cost"],
@@ -7386,7 +7346,8 @@ class IRPResearchPipeline:
                 "shipment/routing/vehicle costs fixed, then evaluates store holding, shortage, "
                 "and LT recourse costs after hidden realized-demand shocks."
             ),
-            "pipeline_runtime_seconds": pipeline_runtime_seconds,
+            "pipeline_runtime_seconds": recourse_runtime_seconds,
+            "lt_recourse_runtime_seconds": recourse_runtime_seconds,
             "lt_plan_source": (
                 "cg_selected_patterns_with_follower_filter"
                 if stackelberg_aware_scoring else "cg_selected_patterns"
@@ -7404,7 +7365,7 @@ class IRPResearchPipeline:
                 f"realized_no_lt={comparison['realized_operating_cost_without_lt']:.4f} "
                 f"realized_with_lt={comparison['realized_operating_cost_with_cg_lt']:.4f} "
                 f"delta={comparison['realized_cost_delta_without_minus_with_lt']:.4f} "
-                f"runtime={pipeline_runtime_seconds:.2f}s"
+                f"runtime={recourse_runtime_seconds:.2f}s"
             )
         else:
             pprint.pprint(comparison)
@@ -7418,7 +7379,7 @@ class IRPResearchPipeline:
             "baseline_cost_breakdown": baseline_cost_breakdown,
             "realized_no_lt_cost_breakdown": realized_no_lt_cost_breakdown,
             "realized_with_lt_cost_breakdown": realized_with_lt_cost_breakdown,
-            "demand_shock_summary": shock_summary,
+            "demand_shock_summary": shock_summary or {},
             "post_shock_summary": post_shock_summary,
             "post_shock_lt_diagnostics": post_shock_lt_diagnostics,
             "cg_solution": cg_sol,
@@ -7431,6 +7392,7 @@ class IRPResearchPipeline:
             "cg_episode_diagnostics": cg_engine.cg_episode_diagnostics,
             "column_pool_diagnostics": cg_engine.column_pool_diagnostics,
             "teacher_dataset_rows": cg_engine.teacher_dataset_rows,
+            "teacher_export_diagnostics": dict(cg_engine.teacher_export_diagnostics),
             "alns_history": list(getattr(baseline_sol, "alns_history", []) or []),
             "gnn_scoring_failures": int(getattr(cg_engine, "_gnn_scoring_failures", 0)),
             "lt_plan_source": (
@@ -7441,6 +7403,129 @@ class IRPResearchPipeline:
             "stackelberg_column_scores": cg_sol.stackelberg_column_scores,
             "stackelberg_validation": cg_sol.stackelberg_validation,
         }
+
+    def run(
+        self,
+        use_random_initial_patterns: bool = True,
+        n_initial_patterns_per_product_period: int = 5,
+        cg_iterations: int = 15,
+        msg: bool = True,
+        time_limit: Optional[int] = None,
+        enforce_integer_flows: bool = False,
+        cw_dispatch_cycle: Optional[int] = 5,
+        use_gnn: bool = False,
+        collect_teacher_mode: bool = True,
+        runtime_gnn_mode: Optional[bool] = None,
+        gnn_checkpoint: str = DEFAULT_GNN_CHECKPOINT,
+        use_classical_fallback: bool = True,
+        gnn_selection_mode: str = "cumulative_mass",
+        gnn_mass_threshold: float = 0.55,
+        gnn_relative_threshold: float = 0.85,
+        gnn_max_keep: Optional[int] = 150,
+        gnn_max_keep_fraction: float = 0.30,
+        use_branch_and_price: bool = True,
+        bp_max_nodes: int = 15,
+        bp_max_depth: int = 6,
+        lt_activation_threshold: float = 10.0,
+        demand_shock_probability: float = 0.85,
+        demand_shock_reallocation_fraction: float = 0.60,
+        demand_shock_reallocations_per_product_period: int = 3,
+        demand_shock_non_dispatch_multiplier: float = 1.8,
+        demand_shock_seed: int = 20260418,
+        diagnostic_verbosity: str = "summary",
+        heuristic_top_k_mode: bool = False,
+        heuristic_top_k: int = 20,
+        exact_full_mode: bool = False,
+        stackelberg_aware_scoring: bool = False,
+        stackelberg_exact_follower: bool = False,
+        stackelberg_min_lateral_qty: Optional[float] = None,
+    ) -> Dict:
+        pipeline_started_at = time.perf_counter()
+        print("=" * 80)
+        print("STEP 1 - Solve baseline IRPT  (ALNS, DC->stores->DC, no LT)")
+        print("=" * 80)
+        # --- DEPRECATED GUROBI BASELINE (kept commented for reference; ALNS replaces it) ---
+        # baseline_sol = AchamrahFullIRPTModel(self.data).solve(
+        #     msg=msg,
+        #     time_limit=time_limit,
+        #     enforce_integer_flows=enforce_integer_flows,
+        #     add_valid_16_20=True,
+        #     allow_lateral_transshipment=False,
+        #     cw_dispatch_cycle=cw_dispatch_cycle,
+        # )
+        baseline_sol = BaselineALNSModel(self.data).solve(
+            msg=msg,
+            time_limit=time_limit,
+            enforce_integer_flows=enforce_integer_flows,
+            add_valid_16_20=True,
+            allow_lateral_transshipment=False,
+            cw_dispatch_cycle=cw_dispatch_cycle,
+        )
+        if _is_quiet():
+            _summary = baseline_sol.summary()
+            print(f"[Baseline Summary] obj={_summary.get('objective'):.4f} keys={len(_summary)}" if isinstance(_summary, dict) else "[Baseline Summary] printed")
+        else:
+            pprint.pprint(baseline_sol.summary())
+        print_efficiency_metrics("Baseline Solver Efficiency", baseline_sol.efficiency_metrics)
+        baseline_cost_breakdown = build_full_irpt_cost_breakdown(self.data, baseline_sol)
+        print_cost_breakdown("Baseline Full IRPT Cost Breakdown", baseline_cost_breakdown)
+        baseline_routes = extract_routes_from_solution(baseline_sol, warehouse=self.data.warehouse)
+
+        print("\n" + "=" * 80)
+        print("STEP 1B - Apply hidden realized-demand shock after DC shipment")
+        print("=" * 80)
+        shock_summary = apply_hidden_local_reallocation_demand_shocks(
+            self.data,
+            baseline_solution=baseline_sol,
+            shock_probability=demand_shock_probability,
+            max_reallocation_fraction=demand_shock_reallocation_fraction,
+            reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+            non_dispatch_shock_multiplier=demand_shock_non_dispatch_multiplier,
+            cw_dispatch_cycle=cw_dispatch_cycle,
+            seed=demand_shock_seed,
+        )
+        if _is_quiet():
+            print(f"[Hidden Demand Shock Summary] keys={len(shock_summary) if isinstance(shock_summary, dict) else 'n/a'}")
+        else:
+            print("[Hidden Demand Shock Summary]")
+            pprint.pprint(shock_summary)
+
+        # Steps 2-4 are factored out so the benchmark can share one ALNS
+        # baseline + one shock state across all 4 variants.
+        results = self.run_lt_recourse_from_baseline(
+            baseline_sol,
+            shock_summary=shock_summary,
+            use_random_initial_patterns=use_random_initial_patterns,
+            n_initial_patterns_per_product_period=n_initial_patterns_per_product_period,
+            cg_iterations=cg_iterations,
+            msg=msg,
+            use_gnn=use_gnn,
+            collect_teacher_mode=collect_teacher_mode,
+            runtime_gnn_mode=runtime_gnn_mode,
+            gnn_checkpoint=gnn_checkpoint,
+            use_classical_fallback=use_classical_fallback,
+            gnn_selection_mode=gnn_selection_mode,
+            gnn_mass_threshold=gnn_mass_threshold,
+            gnn_relative_threshold=gnn_relative_threshold,
+            gnn_max_keep=gnn_max_keep,
+            gnn_max_keep_fraction=gnn_max_keep_fraction,
+            use_branch_and_price=use_branch_and_price,
+            bp_max_nodes=bp_max_nodes,
+            bp_max_depth=bp_max_depth,
+            lt_activation_threshold=lt_activation_threshold,
+            diagnostic_verbosity=diagnostic_verbosity,
+            heuristic_top_k_mode=heuristic_top_k_mode,
+            heuristic_top_k=heuristic_top_k,
+            exact_full_mode=exact_full_mode,
+            stackelberg_aware_scoring=stackelberg_aware_scoring,
+            stackelberg_exact_follower=stackelberg_exact_follower,
+            stackelberg_min_lateral_qty=stackelberg_min_lateral_qty,
+        )
+        # Stamp end-to-end pipeline runtime (baseline + shock + LT recourse).
+        # The helper records lt_recourse_runtime_seconds (Steps 2+3+4 only).
+        full_runtime = time.perf_counter() - pipeline_started_at
+        results["comparison"]["pipeline_runtime_seconds"] = full_runtime
+        return results
 
 
 # ============================================================================
@@ -7530,7 +7615,23 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
         "shortage_cost_with_lt": float(realized_with_lt.get("shortage_cost_realized", 0.0)),
         "cg_iterations": int(len(cg_history)),
         "stopping_reason": stopping_reason,
-        "total_runtime_seconds": float(runtime_seconds),
+        # `total_runtime_seconds` is kept as end-to-end comparable runtime for
+        # backward compatibility with reports/charts: shared baseline + this
+        # variant's LT recourse runtime.
+        "total_runtime_seconds": float(
+            run_context.get("shared_baseline_runtime_seconds", baseline_runtime)
+            + float(runtime_seconds)
+        ),
+        # Explicit per-step breakdown so the comparison CSV can attribute
+        # runtime correctly when one baseline is shared across many variants.
+        "variant_runtime_seconds": float(runtime_seconds),
+        "shared_baseline_runtime_seconds": float(
+            run_context.get("shared_baseline_runtime_seconds", baseline_runtime)
+        ),
+        "total_runtime_with_shared_baseline_seconds": float(
+            run_context.get("shared_baseline_runtime_seconds", baseline_runtime)
+            + float(runtime_seconds)
+        ),
         "phase1_baseline_runtime_seconds": baseline_runtime,
         "phase2_cg_runtime_seconds": cg_runtime,
         "gnn_inference_runtime_seconds": gnn_inference_runtime,
@@ -8190,6 +8291,58 @@ def run_three_way_benchmark(
             seeds = [int(demand_shock_seed) + 10007 * r for r in range(n_repeats)]
         print(f"\n[Benchmark] {len(variants)} variants × {n_repeats} repeats — "
               f"seeds={seeds}  stopping_mode=convergence  fixed_shock={fixed_shock}")
+        # ----------------------------------------------------------------
+        # SHARED BASELINE — solve ALNS DC->stores ONCE for the whole benchmark.
+        # All 4 variants × n_repeats reuse this baseline_sol via deepcopy so
+        # they compare LT recourse algorithms only, not different baseline plans.
+        # ----------------------------------------------------------------
+        print("\n" + "#" * 80)
+        print(f"# BENCHMARK SHARED BASELINE — solving ALNS DC->stores once for all "
+              f"{len(variants)} variants × {n_repeats} repeats")
+        print("#" * 80)
+        baseline_t0 = time.perf_counter()
+        shared_baseline_sol = BaselineALNSModel(data).solve(
+            msg=False,
+            time_limit=time_limit,
+            enforce_integer_flows=enforce_integer_flows,
+            add_valid_16_20=True,
+            allow_lateral_transshipment=False,
+            cw_dispatch_cycle=5,
+        )
+        shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
+        print(f"[Benchmark] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s "
+              f"obj={float(shared_baseline_sol.objective):.2f}")
+
+        # ----------------------------------------------------------------
+        # SHARED SHOCK STATE — apply once per repeat (or once total if
+        # IRP_BENCHMARK_FIXED_SHOCK=1) so all variants in the same repeat
+        # face an identical post-shock realized-demand instance.
+        # ----------------------------------------------------------------
+        unique_seeds = [int(demand_shock_seed)] if fixed_shock else [int(s) for s in seeds]
+        shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
+        for repeat_idx, seed in enumerate(seeds):
+            effective_seed = unique_seeds[0] if fixed_shock else int(seed)
+            # Reuse the same shocked-data object across variants of this repeat
+            # — the LT recourse helper does not mutate self.data.
+            if fixed_shock and shock_states_by_repeat:
+                # Same underlying state reused across all repeats.
+                shock_states_by_repeat.append(shock_states_by_repeat[0])
+                continue
+            repeat_data = copy.deepcopy(data)
+            shock_summary = apply_hidden_local_reallocation_demand_shocks(
+                repeat_data,
+                baseline_solution=shared_baseline_sol,
+                shock_probability=demand_shock_probability,
+                max_reallocation_fraction=demand_shock_reallocation_fraction,
+                reallocations_per_product_period=demand_shock_reallocations_per_product_period,
+                non_dispatch_shock_multiplier=demand_shock_non_dispatch_multiplier,
+                cw_dispatch_cycle=5,
+                seed=effective_seed,
+            )
+            shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+            print(f"[Benchmark] shock state #{repeat_idx + 1} prepared "
+                  f"(seed={effective_seed}, fixed_shock={fixed_shock})")
+
         rows: List[Dict[str, Any]] = []
         for variant_name, variant_kwargs in variants:
             for repeat_idx, seed in enumerate(seeds):
@@ -8198,19 +8351,30 @@ def run_three_way_benchmark(
                     variant_run_kwargs.pop("use_branch_and_price", True)
                 )
                 run_label = f"{variant_name}__repeat{repeat_idx + 1}"
+                repeat_data, shock_summary, effective_seed = shock_states_by_repeat[repeat_idx]
                 print("\n" + "#" * 80)
-                print(f"# BENCHMARK VARIANT: {variant_name}  repeat {repeat_idx + 1}/{n_repeats}  seed={seed}")
-                print(f"# use_branch_and_price={variant_use_branch_and_price}")
+                print(f"# BENCHMARK VARIANT: {variant_name}  repeat {repeat_idx + 1}/{n_repeats}  "
+                      f"seed={effective_seed}")
+                print(f"# use_branch_and_price={variant_use_branch_and_price}  "
+                      f"shared_baseline_obj={float(shared_baseline_sol.objective):.2f}")
                 print("#" * 80)
                 t0 = time.perf_counter()
                 try:
-                    variant_results = IRPResearchPipeline(data).run(
+                    # Per-variant deepcopy: run_lt_recourse_from_baseline attaches
+                    # realized_inventory_after_lt to baseline_sol, so each variant
+                    # must work on its own copy of the shared baseline.
+                    variant_baseline = copy.deepcopy(shared_baseline_sol)
+                    # Use an isolated copy per variant. The canonical repeat
+                    # state stays identical for every A0/A/B/C comparison row.
+                    variant_data = copy.deepcopy(repeat_data)
+                    pipeline = IRPResearchPipeline(variant_data)
+                    variant_results = pipeline.run_lt_recourse_from_baseline(
+                        variant_baseline,
+                        shock_summary=shock_summary,
                         use_random_initial_patterns=True,
                         n_initial_patterns_per_product_period=5,
                         cg_iterations=cg_iterations,
                         msg=False,
-                        time_limit=time_limit,
-                        enforce_integer_flows=enforce_integer_flows,
                         gnn_checkpoint=gnn_checkpoint_path,
                         use_classical_fallback=False,
                         gnn_mass_threshold=0.55,
@@ -8220,45 +8384,50 @@ def run_three_way_benchmark(
                         bp_max_nodes=bp_max_nodes,
                         bp_max_depth=bp_max_depth,
                         lt_activation_threshold=lt_activation_threshold,
-                        demand_shock_probability=demand_shock_probability,
-                        demand_shock_reallocation_fraction=demand_shock_reallocation_fraction,
-                        demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
-                        demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
-                        demand_shock_seed=seed,
                         **variant_run_kwargs,
                     )
                 except Exception as exc:
                     print(f"[Benchmark] Variant {run_label} FAILED: {exc}")
+                    variant_runtime = time.perf_counter() - t0
                     rows.append({
                         "variant": variant_name, "run_label": run_label,
                         "repeat": repeat_idx + 1,
                         "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
-                        "seed": seed,
+                        "seed": effective_seed,
                         "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
                         "rmp_objective": float("nan"),
                         "realized_cost_no_lt": float("nan"), "realized_cost_with_lt": float("nan"),
                         "lt_cost_with_lt": float("nan"), "shortage_cost_with_lt": float("nan"),
-                        "cg_iterations": 0, "total_runtime_seconds": time.perf_counter() - t0,
+                        "cg_iterations": 0,
+                        "total_runtime_seconds":
+                            shared_baseline_runtime_seconds + variant_runtime,
+                        "variant_runtime_seconds": variant_runtime,
+                        "shared_baseline_runtime_seconds": shared_baseline_runtime_seconds,
+                        "total_runtime_with_shared_baseline_seconds":
+                            shared_baseline_runtime_seconds + variant_runtime,
                         "columns_generated": 0, "columns_added_to_rmp": 0,
                         "column_pool_utilization": 0.0, "error": str(exc),
                         "stopping_reason": "failed",
                     })
                     continue
-                runtime = time.perf_counter() - t0
+                variant_runtime = time.perf_counter() - t0
                 run_context = {
                     "run_label": run_label,
                     "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
                     "dataset_id": getattr(data, "dataset_id", "") or "",
-                    "scenario_id": str(seed),
-                    "seed": seed,
+                    "scenario_id": str(effective_seed),
+                    "seed": effective_seed,
                     "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
                     "fine_tune_runtime_seconds": 0.0,
+                    "shared_baseline_runtime_seconds": shared_baseline_runtime_seconds,
                 }
-                row = _collect_benchmark_metrics(variant_name, variant_results, runtime, run_context=run_context)
+                row = _collect_benchmark_metrics(variant_name, variant_results, variant_runtime, run_context=run_context)
                 row["repeat"] = repeat_idx + 1
                 rows.append(row)
                 print(f"[Benchmark] {run_label}: obj={row['rmp_objective']:.2f} "
-                      f"cost_with_lt={row['realized_cost_with_lt']:.2f} runtime={runtime:.1f}s "
+                      f"cost_with_lt={row['realized_cost_with_lt']:.2f} "
+                      f"variant_runtime={variant_runtime:.1f}s "
+                      f"(shared_baseline={shared_baseline_runtime_seconds:.1f}s) "
                       f"cols_gen={row['columns_generated']} cols_added={row['columns_added_to_rmp']}")
 
         per_run_df = pd.DataFrame(rows)
@@ -8280,6 +8449,9 @@ def run_three_way_benchmark(
             "rmp_objective", "realized_cost_no_lt", "realized_cost_with_lt",
             "lt_cost_with_lt", "shortage_cost_with_lt",
             "cg_iterations", "total_runtime_seconds",
+            "variant_runtime_seconds",
+            "shared_baseline_runtime_seconds",
+            "total_runtime_with_shared_baseline_seconds",
             "phase1_baseline_runtime_seconds", "phase2_cg_runtime_seconds",
             "gnn_inference_runtime_seconds",
             "columns_generated", "columns_selected_by_gnn", "columns_added_to_rmp",

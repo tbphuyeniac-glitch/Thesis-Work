@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover — outside notebook
 
 REPO_URL  = "https://github.com/tbphuyeniac-glitch/Thesis-Work.git"
 REPO_ROOT = Path("/kaggle/working/Thesis-Work")
-REFRESH_WORKING_REPO = False  # resume-friendly after Kaggle timeout/kernel death
+REFRESH_WORKING_REPO = False   # force a fresh clone for a clean end-to-end run
 
 # ── Data files (relative to REPO_ROOT) ───────────────────
 TRAIN_DATA_FILE = "1BISCR501V_90100140_20260323-150407111_filtered_sites.csv"
@@ -203,8 +203,7 @@ ONLINE_LEARNING_EPOCHS = 2
 RUN_BENCHMARK        = True
 # Final clean run: wipe old Results/ before any artifacts or logs are written.
 CLEAR_RESULTS_DIR    = False
-# Resume-friendly retry: reuse an existing checkpoint if the previous run got
-# through GNN training before the kernel died.
+# Final clean run: always train from scratch inside this run.
 REUSE_EXISTING_CHECKPOINT = True
 BENCHMARK_N_REPEATS  = 3       # small validation run only
 HEURISTIC_TOP_K      = 5

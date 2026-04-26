@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib
+import gzip
 import json
 import os
 import pprint
@@ -87,6 +88,11 @@ MULTI_SCENARIO_MODE   = True
 SCENARIOS_PER_BASE    = 5       # scenarios per base dataset
 CG_ITERATIONS_TEACHER = 10      # more complete teacher rows per scenario
 TIME_LIMIT_TEACHER    = 300     # seconds per scenario run
+# Validation gate: graph builder raises if more than this fraction of teacher
+# groups had to be dropped for missing constraint features.  Tighten on full
+# runs; relax (e.g. 0.5) for very small smoke instances where the GNN graph
+# builder can fail on degenerate batches.
+TEACHER_GRAPH_MAX_SKIP_RATIO = 0.30
 
 
 def infer_date_range_from_csv(
@@ -201,6 +207,25 @@ BENCHMARK_N_REPEATS  = 3        # thesis comparison: run 3 repeats per A0/A/B/C 
 HEURISTIC_TOP_K      = 10
 DEMAND_SHOCK_SEED    = 42
 
+# Resume mode for Kaggle timeout recovery. Set before running the notebook:
+#   import os
+#   os.environ["IRP_RESUME_EXISTING_RUN"] = "1"
+#
+# This preserves /kaggle/working/Results/run_state.json and existing artifacts,
+# then the stage checks below continue from the first incomplete phase.
+RESUME_EXISTING_RUN = os.environ.get("IRP_RESUME_EXISTING_RUN", "0").strip().lower() not in {"0", "false", "no", ""}
+# Optional compact Kaggle input bundle, e.g.
+#   /kaggle/input/my-resume-bundle/resume_bundle
+# Expected inside it:
+#   Results/run_state.json
+#   Results/scenarios/aggregate_teacher_rows.csv[.gz]
+#   Thesis-Work/GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt
+RESUME_BUNDLE_DIR = os.environ.get("IRP_RESUME_BUNDLE_DIR", "").strip()
+if RESUME_EXISTING_RUN:
+    REFRESH_WORKING_REPO = False
+    CLEAR_RESULTS_DIR = False
+    REUSE_EXISTING_CHECKPOINT = True
+
 # Output integerization knobs (LP-relaxed CG → integer operational plan).
 # The CG LP produces fractional λ values and therefore fractional implied
 # shipment quantities. For thesis-grade reporting these are aggregated per
@@ -228,6 +253,97 @@ def require_path(path: Path, label: str, fatal: bool = True) -> bool:
     if not exists and fatal:
         raise FileNotFoundError(f"Required path missing: {label} → {path}")
     return exists
+
+
+def _resolve_resume_bundle_dir() -> Optional[Path]:
+    """Find a compact previous-output bundle mounted under /kaggle/input."""
+    if RESUME_BUNDLE_DIR:
+        p = Path(RESUME_BUNDLE_DIR)
+        if not p.exists():
+            raise FileNotFoundError(f"IRP_RESUME_BUNDLE_DIR does not exist: {p}")
+        return p
+
+    input_root = Path("/kaggle/input")
+    if not RESUME_EXISTING_RUN or not input_root.exists():
+        return None
+
+    candidates = sorted(input_root.rglob("Results/run_state.json"))
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        print("[Resume restore] Multiple run_state.json candidates found under /kaggle/input:")
+        for c in candidates[:10]:
+            print(f"  - {c}")
+        print("  Using the first candidate. Set IRP_RESUME_BUNDLE_DIR to be explicit.")
+    return candidates[0].parent.parent
+
+
+def _gunzip_if_needed(src_gz: Path, dst_csv: Path) -> None:
+    if not src_gz.exists() or dst_csv.exists():
+        return
+    dst_csv.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(src_gz, "rb") as f_in, open(dst_csv, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    print(f"[Resume restore] decompressed {src_gz} -> {dst_csv}")
+
+
+def restore_previous_results_from_bundle() -> Optional[Path]:
+    """Restore /kaggle/working/Results from a compact Kaggle input bundle."""
+    bundle = _resolve_resume_bundle_dir()
+    if bundle is None:
+        if RESUME_EXISTING_RUN:
+            print("[Resume restore] No input bundle found; using existing /kaggle/working/Results if present.")
+        return None
+
+    src_results = bundle / "Results"
+    if not (src_results / "run_state.json").exists():
+        # Also support env pointing directly at the Results directory.
+        if (bundle / "run_state.json").exists():
+            src_results = bundle
+            bundle = src_results.parent
+        else:
+            raise FileNotFoundError(f"Resume bundle has no Results/run_state.json: {bundle}")
+
+    Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_results, RESULTS_DIR, dirs_exist_ok=True)
+    _gunzip_if_needed(
+        RESULTS_DIR / "scenarios" / "aggregate_teacher_rows.csv.gz",
+        RESULTS_DIR / "scenarios" / "aggregate_teacher_rows.csv",
+    )
+    print(f"[Resume restore] restored Results from {src_results} -> {RESULTS_DIR}")
+    return bundle
+
+
+def restore_previous_checkpoint_from_bundle(default_checkpoint: str) -> None:
+    """Restore GNN checkpoint files from a compact Kaggle input bundle."""
+    bundle = _resolve_resume_bundle_dir()
+    if bundle is None:
+        return
+    search_root = bundle.parent if (bundle / "run_state.json").exists() else bundle
+
+    checkpoint_dst = REPO_ROOT / default_checkpoint
+    dst_dir = checkpoint_dst.parent
+
+    candidate_dirs = [
+        search_root / "Thesis-Work" / "GNN" / "trained_models" / "irplt_teacher" / "bigat" / "pairwise_rank",
+        search_root / "GNN" / "trained_models" / "irplt_teacher" / "bigat" / "pairwise_rank",
+        search_root / "trained_models" / "irplt_teacher" / "bigat" / "pairwise_rank",
+    ]
+    src_dir = next((p for p in candidate_dirs if (p / "best_model.pt").exists()), None)
+    if src_dir is None:
+        matches = sorted(search_root.rglob("best_model.pt"))
+        src_dir = matches[0].parent if matches else None
+
+    if src_dir is None:
+        print(f"[Resume restore] No best_model.pt found in {search_root}; GNN may retrain if checkpoint is missing.")
+        return
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in ["best_model.pt", "last_model.pt", "training_history.json", "training_summary.json"]:
+        src = src_dir / name
+        if src.exists():
+            shutil.copy2(src, dst_dir / name)
+            print(f"[Resume restore] checkpoint artifact restored: {dst_dir / name}")
 
 
 def prepare_working_repo() -> None:
@@ -534,12 +650,15 @@ print(f"  teacher_window={TEACHER_START_DATE}..{TEACHER_END_DATE}  base_specs={l
 print(f"  cg_iterations={CG_ITERATIONS}  bp_nodes={BP_MAX_NODES}  bp_depth={BP_MAX_DEPTH}")
 print(f"  gnn_epochs={GNN_TRAIN_EPOCHS}  scenarios_per_base={SCENARIOS_PER_BASE}  benchmark_repeats={BENCHMARK_N_REPEATS}")
 print(f"  lt_min_units={LT_MIN_UNITS}  integer_outputs={INTEGER_FINAL_OUTPUTS}  benchmark_fixed_shock={BENCHMARK_FIXED_SHOCK}")
+print(f"  resume_existing_run={RESUME_EXISTING_RUN}  refresh_working_repo={REFRESH_WORKING_REPO}")
 print(f"  clear_results_dir={CLEAR_RESULTS_DIR}  reuse_existing_checkpoint={REUSE_EXISTING_CHECKPOINT}")
+print(f"  resume_bundle_dir={RESUME_BUNDLE_DIR or 'auto' if RESUME_EXISTING_RUN else 'none'}")
 
 if CLEAR_RESULTS_DIR and RESULTS_DIR.exists():
     print(f"[Clean run] Removing old Results directory: {RESULTS_DIR}")
     shutil.rmtree(RESULTS_DIR)
 
+restore_previous_results_from_bundle()
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 # Propagate to all subprocesses (scenario generator, GNN trainer, graph
 # builder, offline tester) so they write into the canonical RESULTS_DIR.
@@ -571,6 +690,8 @@ if not verify_gurobi():
 
 import irp_gurobi_converted as irp
 irp = importlib.reload(irp)
+if RESUME_EXISTING_RUN:
+    restore_previous_checkpoint_from_bundle(irp.DEFAULT_GNN_CHECKPOINT)
 
 # --- Kaggle robustness wiring -------------------------------------------------
 # RunLogger tees stdout/stderr into Results/run.log so a kernel crash still
@@ -698,6 +819,12 @@ else:
 
     teacher_df = pd.DataFrame(p1_results.get("teacher_dataset_rows", []))
     print(f"\n[Teacher rows collected: {len(teacher_df)}]")
+    # Surface the per-engine teacher_export_diagnostics so a Kaggle reviewer
+    # can detect when batches were dropped for missing graph features (root
+    # cause of the silent constraint_features_json gaps fixed in Item 1).
+    p1_export_diag = p1_results.get("teacher_export_diagnostics") or {}
+    if p1_export_diag:
+        print(f"[Teacher export diagnostics] {p1_export_diag}")
     if teacher_df.empty:
         raise RuntimeError(
             "No teacher rows generated. Increase CG_ITERATIONS_TEACHER or check CG convergence."
@@ -750,6 +877,7 @@ build_result = irp.run_teacher_graph_and_gnn_training(
     train_gnn=False,
     checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
     run_offline_test=False,
+    max_skip_ratio=TEACHER_GRAPH_MAX_SKIP_RATIO,
 )
 
 # Report split sizes
@@ -1037,6 +1165,7 @@ elif RUN_ONLINE_LEARNING and checkpoint.exists():
             checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
             training_history_csv_path=str(gnn_dir / "online_learning_history.csv"),
             run_offline_test=False,
+            max_skip_ratio=TEACHER_GRAPH_MAX_SKIP_RATIO,
         )
         print("[Online learning] checkpoint updated.")
     else:

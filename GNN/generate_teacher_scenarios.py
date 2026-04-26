@@ -345,6 +345,7 @@ def _run_scenario_inprocess(
     scenario: Dict[str, str],
     run_dir: Path,
     cg_iterations: int,
+    dataset_split: str = "",
 ) -> Tuple[bool, List[Dict[str, Any]], float]:
     """Run CG teacher collection for one scenario, fully in-process.
 
@@ -421,12 +422,20 @@ def _run_scenario_inprocess(
         )
 
         rows: List[Dict[str, Any]] = list(cg_engine.teacher_dataset_rows or [])
-        # Tag every row with the source_instance so downstream dedup and
-        # graph splitting work correctly (old path did this via IRP_SOURCE_INSTANCE env var).
+        # Tag every row with identity AND its dataset_split so the graph
+        # builder can honor the base-instance-level split decided here.  The
+        # graph builder asserts no base_dataset_id appears in more than one
+        # split — the dataset_split tag is what makes that decision durable.
         for row in rows:
             row["source_instance"] = source_instance
-            row.setdefault("base_dataset_id", scenario["base_dataset_id"])
-            row.setdefault("scenario_id", scenario["scenario_id"])
+            row["base_dataset_id"] = scenario["base_dataset_id"]
+            row["scenario_id"] = scenario["scenario_id"]
+            if dataset_split:
+                row["dataset_split"] = dataset_split
+
+        # Surface teacher_export_diagnostics from the engine so per-scenario
+        # metadata records how many batches were dropped for missing graph features.
+        export_diag = dict(getattr(cg_engine, "teacher_export_diagnostics", {}) or {})
 
         runtime = time.perf_counter() - t0
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -436,6 +445,7 @@ def _run_scenario_inprocess(
                 "source_instance": source_instance,
                 "base_dataset_id": scenario["base_dataset_id"],
                 "scenario_id": scenario["scenario_id"],
+                "dataset_split": dataset_split,
                 "shock_seed": shock_seed,
                 "shock_profile": scenario.get("shock_profile", ""),
                 "n_teacher_rows": len(rows),
@@ -446,6 +456,7 @@ def _run_scenario_inprocess(
                 "lt_activation_threshold": lt_activation_threshold,
                 "n_initial_patterns_per_product_period": 5,
                 "branch_and_price_used": False,
+                "teacher_export_diagnostics": export_diag,
             }, mf, indent=2)
 
         print(
@@ -631,6 +642,14 @@ def main() -> None:
                     row for row in read_csv_rows(per_run_csv)
                     if row.get("source_instance") == source_instance
                 ]
+                # Backfill dataset_split / base_dataset_id on resumed rows that
+                # predate this tagging.  Idempotent if already present.
+                resumed_split = split_assignment.get(source_instance, "")
+                for row in existing:
+                    if not str(row.get("dataset_split") or "").strip() and resumed_split:
+                        row["dataset_split"] = resumed_split
+                    if not str(row.get("base_dataset_id") or "").strip():
+                        row["base_dataset_id"] = scenario["base_dataset_id"]
                 if existing:
                     aggregate_rows.extend(existing)
                     done_sources.add(source_instance)
@@ -680,6 +699,7 @@ def main() -> None:
 
         ok, rows, runtime = _run_scenario_inprocess(
             irp, base_data, baseline_sol, scenario, run_dir, args.cg_iterations,
+            dataset_split=split_assignment.get(source_instance, ""),
         )
 
         str_rows = _rows_to_str_dicts(rows)
