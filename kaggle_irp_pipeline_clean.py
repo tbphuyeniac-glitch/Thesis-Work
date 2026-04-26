@@ -74,6 +74,7 @@ CG_ITERATIONS    = 100
 CG_STOPPING_MODE = "convergence"
 BP_MAX_NODES     = 20
 BP_MAX_DEPTH     = 8
+PHASE1_BASELINE_ALNS_TIME_LIMIT = int(os.environ.get("IRP_PHASE1_BASELINE_ALNS_TIME_LIMIT", "900"))
 GNN_TRAIN_EPOCHS = 100
 LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 
@@ -194,6 +195,14 @@ TEACHER_SCENARIO_OUT_DIR = str(RESULTS_DIR / "scenarios")
 # This notebook is configured for a single end-to-end run:
 # teacher generation -> GNN train/reuse -> Phase 1 -> Phase 2 -> A0/A/B/C benchmark.
 RUN_PHASE_2          = True
+# Phase 1 canonical solve is a reporting/reference artifact, not required for
+# teacher generation, GNN training, or Phase 2 inference. Keep it off by default
+# so full-dataset Kaggle training does not re-solve baseline+CG after the
+# scenario generator has already produced teacher data.
+RUN_PHASE1_CANONICAL_SOLVE = (
+    os.environ.get("IRP_RUN_PHASE1_CANONICAL_SOLVE", "0").lower()
+    not in {"0", "false", "no"}
+)
 # Phase 3 is intentionally disabled for this Kaggle pipeline.
 # Keep it off unless you explicitly want checkpoint fine-tuning on test data.
 RUN_ONLINE_LEARNING  = False
@@ -585,13 +594,14 @@ def build_data(irp: Any, data_path: Path,
 
 
 def run_phase(irp: Any, data: Any, *, use_gnn: bool, collect_teacher: bool,
-              heuristic_top_k_mode: bool = False) -> Dict[str, Any]:
+              heuristic_top_k_mode: bool = False,
+              baseline_time_limit: Optional[int] = None) -> Dict[str, Any]:
     return irp.IRPResearchPipeline(data).run(
         use_random_initial_patterns=True,
         n_initial_patterns_per_product_period=10,
         cg_iterations=CG_ITERATIONS,
         msg=False,
-        time_limit=None,
+        time_limit=baseline_time_limit,
         enforce_integer_flows=False,
         cw_dispatch_cycle=5,
         use_gnn=use_gnn,
@@ -648,6 +658,8 @@ print(f"  train_window={TRAIN_START_DATE}..{TRAIN_END_DATE}")
 print(f"  test_window ={TEST_START_DATE}..{TEST_END_DATE}")
 print(f"  teacher_window={TEACHER_START_DATE}..{TEACHER_END_DATE}  base_specs={len(BASE_SPECS)}")
 print(f"  cg_iterations={CG_ITERATIONS}  bp_nodes={BP_MAX_NODES}  bp_depth={BP_MAX_DEPTH}")
+print(f"  phase1_baseline_alns_time_limit={PHASE1_BASELINE_ALNS_TIME_LIMIT}s")
+print(f"  run_phase1_canonical_solve={RUN_PHASE1_CANONICAL_SOLVE}")
 print(f"  gnn_epochs={GNN_TRAIN_EPOCHS}  scenarios_per_base={SCENARIOS_PER_BASE}  benchmark_repeats={BENCHMARK_N_REPEATS}")
 print(f"  lt_min_units={LT_MIN_UNITS}  integer_outputs={INTEGER_FINAL_OUTPUTS}  benchmark_fixed_shock={BENCHMARK_FIXED_SHOCK}")
 print(f"  resume_existing_run={RESUME_EXISTING_RUN}  refresh_working_repo={REFRESH_WORKING_REPO}")
@@ -1018,9 +1030,17 @@ gnn_results: Optional[Dict[str, Any]] = None
 ol_results: Optional[Dict[str, Any]] = None
 
 _p1_summary_json = RESULTS_DIR / "thesis_summary" / "phase1_offline_baseline_summary.json"
-if RUN_STATE.is_done("phase1") and _p1_summary_json.exists():
+_existing_p1_summary: Optional[Dict[str, Any]] = None
+if _p1_summary_json.exists():
     with open(_p1_summary_json) as _f:
-        p1_summary = json.load(_f)
+        _existing_p1_summary = json.load(_f)
+
+if (
+    RUN_STATE.is_done("phase1")
+    and _existing_p1_summary is not None
+    and not bool(_existing_p1_summary.get("skipped", False))
+):
+    p1_summary = _existing_p1_summary
     phase_summaries.append(p1_summary)
     _p1_skip_reason = (
         "single-run dedup: section 6 already ran the full ALNS+CG+B&P pipeline"
@@ -1032,6 +1052,44 @@ if RUN_STATE.is_done("phase1") and _p1_summary_json.exists():
     print(f"  cost_with_lt_M={p1_summary.get('cost_with_lt_M', 'n/a'):.4f}  "
           f"lt_saving_M={p1_summary.get('lt_saving_M', 'n/a'):.4f}  "
           f"runtime_sec={p1_summary.get('runtime_sec', 'n/a'):.1f}s")
+elif not RUN_PHASE1_CANONICAL_SOLVE:
+    teacher_rows = 0
+    if teacher_csv_path is not None and Path(teacher_csv_path).exists():
+        try:
+            with open(teacher_csv_path, "r", encoding="utf-8") as _teacher_f:
+                teacher_rows = int(sum(1 for _ in _teacher_f) - 1)
+            teacher_rows = max(0, teacher_rows)
+        except Exception as _exc:
+            print(f"[phase1] could not count teacher rows in {teacher_csv_path}: {_exc}")
+
+    p1_summary = {
+        "phase": "phase1_offline_baseline",
+        "skipped": True,
+        "skip_reason": (
+            "canonical Phase 1 solve disabled; scenario generator already produced "
+            "teacher data for GNN training"
+        ),
+        "cost_no_lt_M": 0.0,
+        "cost_with_lt_M": 0.0,
+        "lt_saving_M": 0.0,
+        "shortage_no_lt": 0.0,
+        "shortage_with_lt": 0.0,
+        "lt_qty": 0.0,
+        "lt_cost": 0.0,
+        "teacher_rows": teacher_rows,
+        "gnn_failures": 0,
+        "runtime_sec": 0.0,
+        "forecast_objective": 0.0,
+        "cg_objective": 0.0,
+    }
+    _p1_summary_json.parent.mkdir(parents=True, exist_ok=True)
+    run_infrastructure.write_json_atomic(_p1_summary_json, p1_summary)
+    phase_summaries.append(p1_summary)
+    RUN_STATE.mark_done("phase1", skipped=True, skip_reason=p1_summary["skip_reason"])
+    print("[phase1] canonical solve skipped")
+    print(f"  reason            : {p1_summary['skip_reason']}")
+    print(f"  teacher_rows       : {teacher_rows}")
+    print(f"  summary written to : {_p1_summary_json}")
 else:
     RUN_STATE.mark_start("phase1")
     _, p1_data, _, p1_val_target, p1_meta = build_data(
@@ -1061,8 +1119,15 @@ else:
     # teacher export overhead.  This is the thesis benchmark reference solution.
     print(f"[phase1] Running canonical benchmark solve  "
           f"(MULTI_SCENARIO_MODE={MULTI_SCENARIO_MODE}, collect_teacher=False, "
-          f"cg_iterations={CG_ITERATIONS}, bp_nodes={BP_MAX_NODES})")
-    p1_results = run_phase(irp, p1_data, use_gnn=False, collect_teacher=False)
+          f"cg_iterations={CG_ITERATIONS}, bp_nodes={BP_MAX_NODES}, "
+          f"baseline_time_limit={PHASE1_BASELINE_ALNS_TIME_LIMIT}s)")
+    p1_results = run_phase(
+        irp,
+        p1_data,
+        use_gnn=False,
+        collect_teacher=False,
+        baseline_time_limit=PHASE1_BASELINE_ALNS_TIME_LIMIT,
+    )
 
     p1_summary = phase_summary(p1_results, "phase1_offline_baseline")
     show_df("Phase 1 Summary", pd.DataFrame([p1_summary]))
