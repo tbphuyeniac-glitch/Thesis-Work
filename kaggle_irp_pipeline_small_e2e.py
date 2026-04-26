@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover — outside notebook
 
 REPO_URL  = "https://github.com/tbphuyeniac-glitch/Thesis-Work.git"
 REPO_ROOT = Path("/kaggle/working/Thesis-Work")
-REFRESH_WORKING_REPO = True   # force a fresh clone for a clean end-to-end run
+REFRESH_WORKING_REPO = False  # resume-friendly after Kaggle timeout/kernel death
 
 # ── Data files (relative to REPO_ROOT) ───────────────────
 TRAIN_DATA_FILE = "1BISCR501V_90100140_20260323-150407111_filtered_sites.csv"
@@ -56,12 +56,12 @@ MASTER_SEED = 42
 # ── Small end-to-end run scope ───────────────────────────
 # This file is intentionally NOT thesis-scale. It is for a quick Kaggle sanity
 # run that exercises the entire flow and writes the current output layout.
-STORE_LIMIT: Optional[int] = 4
-SKU_LIMIT:   Optional[int] = 2
-TRAIN_START_DATE: Optional[str] = "2025-08-01"
-TRAIN_END_DATE:   Optional[str] = "2025-08-07"
-TEST_START_DATE:  Optional[str] = "2025-08-08"
-TEST_END_DATE:    Optional[str] = "2025-08-14"
+STORE_LIMIT: Optional[int] = None
+SKU_LIMIT:   Optional[int] = 5
+TRAIN_START_DATE: Optional[str] = None
+TRAIN_END_DATE:   Optional[str] = None
+TEST_START_DATE:  Optional[str] = None
+TEST_END_DATE:    Optional[str] = None
 
 # Teacher-data scenario generation still needs a bounded canonical date window
 # so BASE_SPECS can be constructed deterministically even when Phase 1/2 run on
@@ -70,8 +70,10 @@ DEFAULT_TEACHER_START_DATE = "2025-08-01"
 DEFAULT_TEACHER_END_DATE   = "2025-08-14"
 
 # ── Solver / GNN ─────────────────────────────────────────
-# CG always stops on convergence; CG_ITERATIONS is only the safety cap.
-CG_ITERATIONS    = 3
+# CG always stops on convergence; these iteration counts are safety caps, not
+# fixed iteration budgets. Keep them high enough that the run can reach
+# convergence instead of stopping early at the cap.
+CG_ITERATIONS    = 100
 CG_STOPPING_MODE = "convergence"
 BP_MAX_NODES     = 4
 BP_MAX_DEPTH     = 3
@@ -86,10 +88,10 @@ LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 MULTI_SCENARIO_MODE   = True
 # Use more base topologies and more shock realizations per base so the teacher
 # dataset has enough distinct source_instance values for GNN training.
-SCENARIOS_PER_BASE    = 1       # scenarios per base dataset
-CG_ITERATIONS_TEACHER = 1       # quick teacher rows per scenario
-TIME_LIMIT_TEACHER    = 45      # seconds per base ALNS baseline
-SMALL_BASE_SPEC_COUNT = 6       # enough for train/valid/test with split_by=base
+SCENARIOS_PER_BASE    = 5       # scenarios per base dataset
+CG_ITERATIONS_TEACHER = 100      # safety cap; generator stops on convergence
+TIME_LIMIT_TEACHER    = 300      # seconds per base ALNS baseline
+SMALL_BASE_SPEC_COUNT = 10       # enough for train/valid/test with split_by=base
 
 
 def infer_date_range_from_csv(
@@ -200,10 +202,11 @@ RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
 RUN_BENCHMARK        = True
 # Final clean run: wipe old Results/ before any artifacts or logs are written.
-CLEAR_RESULTS_DIR    = True
-# Final clean run: always train from scratch inside this run.
-REUSE_EXISTING_CHECKPOINT = False
-BENCHMARK_N_REPEATS  = 1        # small validation run only
+CLEAR_RESULTS_DIR    = False
+# Resume-friendly retry: reuse an existing checkpoint if the previous run got
+# through GNN training before the kernel died.
+REUSE_EXISTING_CHECKPOINT = True
+BENCHMARK_N_REPEATS  = 3       # small validation run only
 HEURISTIC_TOP_K      = 5
 DEMAND_SHOCK_SEED    = 42
 

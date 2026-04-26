@@ -8169,7 +8169,8 @@ def run_three_way_benchmark(
                                   "runtime_gnn_mode": False, "heuristic_top_k_mode": False}),
             ("B_heuristic_cg",  {"use_gnn": False, "collect_teacher_mode": False,
                                   "runtime_gnn_mode": False, "heuristic_top_k_mode": True,
-                                  "heuristic_top_k": heuristic_top_k}),
+                                  "heuristic_top_k": heuristic_top_k,
+                                  "use_branch_and_price": False}),
             ("C_gnn_guided_cg", {"use_gnn": True,  "collect_teacher_mode": False,
                                   "runtime_gnn_mode": True,  "heuristic_top_k_mode": False}),
         ]
@@ -8192,9 +8193,14 @@ def run_three_way_benchmark(
         rows: List[Dict[str, Any]] = []
         for variant_name, variant_kwargs in variants:
             for repeat_idx, seed in enumerate(seeds):
+                variant_run_kwargs = dict(variant_kwargs)
+                variant_use_branch_and_price = bool(
+                    variant_run_kwargs.pop("use_branch_and_price", True)
+                )
                 run_label = f"{variant_name}__repeat{repeat_idx + 1}"
                 print("\n" + "#" * 80)
                 print(f"# BENCHMARK VARIANT: {variant_name}  repeat {repeat_idx + 1}/{n_repeats}  seed={seed}")
+                print(f"# use_branch_and_price={variant_use_branch_and_price}")
                 print("#" * 80)
                 t0 = time.perf_counter()
                 try:
@@ -8210,7 +8216,7 @@ def run_three_way_benchmark(
                         gnn_mass_threshold=0.55,
                         gnn_max_keep=150,
                         gnn_max_keep_fraction=0.30,
-                        use_branch_and_price=True,
+                        use_branch_and_price=variant_use_branch_and_price,
                         bp_max_nodes=bp_max_nodes,
                         bp_max_depth=bp_max_depth,
                         lt_activation_threshold=lt_activation_threshold,
@@ -8219,7 +8225,7 @@ def run_three_way_benchmark(
                         demand_shock_reallocations_per_product_period=demand_shock_reallocations_per_product_period,
                         demand_shock_non_dispatch_multiplier=demand_shock_non_dispatch_multiplier,
                         demand_shock_seed=seed,
-                        **variant_kwargs,
+                        **variant_run_kwargs,
                     )
                 except Exception as exc:
                     print(f"[Benchmark] Variant {run_label} FAILED: {exc}")
