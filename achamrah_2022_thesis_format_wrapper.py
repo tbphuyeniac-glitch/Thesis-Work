@@ -705,6 +705,9 @@ class AchamrahThesisFormatPipeline:
             "n_routes": int(len(route_df)),
             "n_lt_moves": int(len(lt_detail_df)),
             "validation_metrics": metrics,
+            "constructive_runtime_seconds": float(result.constructive_runtime_seconds) if result is not None else float(artifact.runtime),
+            "improvement_runtime_seconds": float(result.improvement_runtime_seconds) if result is not None else 0.0,
+            "total_runtime_seconds": float(result.total_runtime_seconds) if result is not None else float(artifact.runtime),
         }
 
         return {

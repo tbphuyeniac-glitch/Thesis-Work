@@ -124,6 +124,9 @@ class MatheuristicResult:
     constructive_solution: Optional[SolveArtifacts]
     final_solution: Optional[SolveArtifacts]
     history: List[Tuple[float, float]]
+    constructive_runtime_seconds: float = 0.0
+    improvement_runtime_seconds: float = 0.0
+    total_runtime_seconds: float = 0.0
 
 
 class AchamrahIRPTSolver:
@@ -151,15 +154,17 @@ class AchamrahIRPTSolver:
     def solve_full_matheuristic(self) -> MatheuristicResult:
         start = time.time()
         constructive = self.constructive_phase()
+        constructive_runtime = time.time() - start
         if constructive is None:
             raise RuntimeError("Constructive phase failed to produce a solution.")
 
-        elapsed = time.time() - start
-        remaining = max(1.0, self.params.full_time_limit - elapsed)
+        remaining = max(1.0, self.params.full_time_limit - constructive_runtime)
+        improvement_start = time.time()
         final_solution, history = self.improvement_phase(
             initial_routes=constructive.routes,
             time_limit=min(self.params.improvement_time_limit, remaining),
         )
+        improvement_runtime = time.time() - improvement_start
 
         if final_solution is None:
             best_obj = constructive.objective
@@ -174,6 +179,9 @@ class AchamrahIRPTSolver:
             constructive_solution=constructive,
             final_solution=final_solution,
             history=history,
+            constructive_runtime_seconds=constructive_runtime,
+            improvement_runtime_seconds=improvement_runtime,
+            total_runtime_seconds=time.time() - start,
         )
 
     # ------------------------------------------------------------------
