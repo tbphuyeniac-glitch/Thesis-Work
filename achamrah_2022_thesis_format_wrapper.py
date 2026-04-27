@@ -60,7 +60,11 @@ class DatasetToAchamrahMapper:
         self.end_date = end_date
 
     def load_raw(self) -> pd.DataFrame:
-        df = pd.read_excel(self.excel_path, sheet_name=self.sheet_name or 0)
+        path = Path(self.excel_path)
+        if path.suffix.lower() == ".csv":
+            df = pd.read_csv(self.excel_path)
+        else:
+            df = pd.read_excel(self.excel_path, sheet_name=self.sheet_name or 0)
         missing = [c for c in self.REQUIRED_COLUMNS if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")

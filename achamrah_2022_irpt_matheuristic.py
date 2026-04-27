@@ -209,21 +209,22 @@ class AchamrahIRPTSolver:
         V = list(inst.V)
         A = [(i, j) for i, j in inst.A if self._arc_allowed(i, j, active_nodes_by_period)]
 
-        # Variables
-        x_type = GRB.BINARY
-        flow_type = GRB.CONTINUOUS if relaxed else GRB.INTEGER
+        # Variables — flows are always continuous; relaxed flag controls routing integrality.
+        # relaxed=True  → pure LP relaxation (x/u/z continuous ∈ [0,1])
+        # relaxed=False → MIP (x/u/z binary, all quantities continuous)
+        int_type = GRB.CONTINUOUS if relaxed else GRB.BINARY
 
-        I = m.addVars(P, N0, H, vtype=flow_type, lb=0.0, name="I")
-        Qdir = m.addVars(P, N, H, vtype=flow_type, lb=0.0, name="Q")
-        q = m.addVars(P, N0, N0, V, H, vtype=flow_type, lb=0.0, name="q")
-        y = m.addVars(P, N, N, V, H, vtype=flow_type, lb=0.0, name="y")
+        I = m.addVars(P, N0, H, vtype=GRB.CONTINUOUS, lb=0.0, name="I")
+        Qdir = m.addVars(P, N, H, vtype=GRB.CONTINUOUS, lb=0.0, name="Q")
+        q = m.addVars(P, N0, N0, V, H, vtype=GRB.CONTINUOUS, lb=0.0, name="q")
+        y = m.addVars(P, N, N, V, H, vtype=GRB.CONTINUOUS, lb=0.0, name="y")
         if not allow_lateral_transshipment:
             for key in y.keys():
                 y[key].ub = 0.0
-        S = m.addVars(P, N, H, vtype=flow_type, lb=0.0, name="S")
-        x = m.addVars(N0, N0, V, H, vtype=x_type, lb=0.0, ub=1.0, name="x")
-        u = m.addVars(V, H, vtype=GRB.BINARY, lb=0.0, ub=1.0, name="u")
-        z = m.addVars(N0, V, H, vtype=GRB.BINARY, lb=0.0, ub=1.0, name="z")
+        S = m.addVars(P, N, H, vtype=GRB.CONTINUOUS, lb=0.0, name="S")
+        x = m.addVars(N0, N0, V, H, vtype=int_type, lb=0.0, ub=1.0, name="x")
+        u = m.addVars(V, H, vtype=int_type, lb=0.0, ub=1.0, name="u")
+        z = m.addVars(N0, V, H, vtype=int_type, lb=0.0, ub=1.0, name="z")
 
         # Disable impossible/self arcs explicitly
         for i in N0:
@@ -611,45 +612,70 @@ class AchamrahIRPTSolver:
         return merged
 
     # ------------------------------------------------------------------
-    # Improvement phase (GA + SA)
+    # Improvement phase (GA + SA) — faithful to Achamrah 2022 §4
+    #
+    # Each SA step applies GA operators (select → crossover → mutate) to
+    # generate the candidate, then accepts/rejects via Metropolis criterion.
+    # Population (with cached FMILP objectives) is maintained across steps
+    # so tournament selection uses the real objective, not a routing proxy.
     # ------------------------------------------------------------------
     def improvement_phase(self, initial_routes: Chromosome, time_limit: float) -> Tuple[Optional[SolveArtifacts], List[Tuple[float, float]]]:
         start = time.time()
         T = self.params.initial_temperature
         history: List[Tuple[float, float]] = []
 
-        current_routes = self._copy_chromosome(initial_routes)
-        current_eval = self.evaluate_routes(current_routes, max(30.0, 0.15 * time_limit))
+        # Evaluate constructive solution; it seeds the population.
+        current_eval = self.evaluate_routes(initial_routes, max(30.0, 0.15 * time_limit))
         if current_eval is None:
             return None, history
+        current_routes = self._copy_chromosome(initial_routes)
         best_routes = self._copy_chromosome(current_routes)
         best_eval = current_eval
 
-        population = self.generate_initial_population(current_routes)
+        # Population: list of (chromosome, fmilp_objective) — scored so tournament
+        # selection uses the real objective rather than a routing-cost proxy.
+        pop_scored: List[Tuple[Chromosome, float]] = [
+            (self._copy_chromosome(initial_routes), current_eval.objective)
+        ]
+        init_budget = time_limit * 0.25  # at most 25% of budget to seed population
+        for _ in range(self.params.population_size - 1):
+            if (time.time() - start) >= init_budget:
+                break
+            cand = self.two_opt_neighbor(initial_routes)
+            cand_eval = self.evaluate_routes(cand, max(5.0, 0.02 * time_limit))
+            if cand_eval is not None:
+                pop_scored.append((cand, cand_eval.objective))
 
+        # SA outer loop with GA operators generating each candidate (paper §4)
         while T > self.params.final_temperature and (time.time() - start) < time_limit:
-            accepted_pool: List[Tuple[Chromosome, float]] = []
-            iter_cap = min(self.params.iterations_per_temp, max(1, len(population)))
-
-            for idx in range(iter_cap):
+            for _ in range(self.params.iterations_per_temp):
                 if (time.time() - start) >= time_limit:
                     break
-                candidate = self._copy_chromosome(population[idx % len(population)])
-                candidate_eval = self.evaluate_routes(candidate, max(5.0, 0.02 * time_limit))
-                if candidate_eval is None:
+
+                # --- GA: select two parents, crossover, mutate ---
+                p1 = self._tournament_select_scored(pop_scored)
+                p2 = self._tournament_select_scored(pop_scored)
+                if self.rng.random() < self.params.crossover_probability:
+                    child, _ = self.crossover(p1, p2)
+                else:
+                    child = self._copy_chromosome(p1)
+                if self.rng.random() < self.params.mutation_probability:
+                    child = self.mutate(child)
+
+                # --- Evaluate via fixed-route FMILP ---
+                child_eval = self.evaluate_routes(child, max(5.0, 0.02 * time_limit))
+                if child_eval is None:
                     continue
 
-                delta = candidate_eval.objective - current_eval.objective
-                if delta < 0:
-                    current_routes = candidate
-                    current_eval = candidate_eval
-                    accepted_pool.append((self._copy_chromosome(candidate), candidate_eval.objective))
-                else:
-                    prob = math.exp(-delta / max(1e-9, T))
-                    if self.rng.random() < prob:
-                        current_routes = candidate
-                        current_eval = candidate_eval
-                        accepted_pool.append((self._copy_chromosome(candidate), candidate_eval.objective))
+                # --- SA acceptance (Metropolis criterion) ---
+                delta = child_eval.objective - current_eval.objective
+                if delta < 0 or self.rng.random() < math.exp(-delta / max(1e-9, T)):
+                    current_routes = child
+                    current_eval = child_eval
+                    pop_scored.append((child, child_eval.objective))
+                    # Keep population bounded; discard worst solutions
+                    pop_scored.sort(key=lambda x: x[1])
+                    pop_scored = pop_scored[: self.params.population_size]
 
                 if current_eval.objective < best_eval.objective:
                     best_routes = self._copy_chromosome(current_routes)
@@ -658,13 +684,14 @@ class AchamrahIRPTSolver:
             history.append((T, best_eval.objective))
             T *= self.params.cooling_ratio
 
-            # Generate a new GA population from accepted solutions; fallback to current best
-            seeds = [r for r, _ in sorted(accepted_pool, key=lambda z: z[1])]
-            if not seeds:
-                seeds = [self._copy_chromosome(best_routes)]
-            population = self.ga_next_population(seeds)
-
         return best_eval, history
+
+    def _tournament_select_scored(
+        self, pop_scored: List[Tuple[Chromosome, float]]
+    ) -> Chromosome:
+        """Binary tournament selection using cached FMILP objectives."""
+        contestants = self.rng.sample(pop_scored, min(2, len(pop_scored)))
+        return self._copy_chromosome(min(contestants, key=lambda x: x[1])[0])
 
     def generate_initial_population(self, base_routes: Chromosome) -> List[Chromosome]:
         population: List[Chromosome] = [self._copy_chromosome(base_routes)]

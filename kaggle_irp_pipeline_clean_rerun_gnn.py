@@ -218,6 +218,13 @@ BENCHMARK_N_REPEATS  = 3        # thesis comparison: run 3 repeats per A0/A/B/C 
 HEURISTIC_TOP_K      = 10
 DEMAND_SHOCK_SEED    = 42
 
+# Use an already-trained checkpoint and recompute only benchmark variant C.
+# This is the fastest rerun path after a long GNN training job has completed.
+CHECKPOINT_BENCHMARK_C_ONLY = (
+    os.environ.get("IRP_CHECKPOINT_BENCHMARK_C_ONLY", "0").strip().lower()
+    not in {"0", "false", "no", ""}
+)
+
 # Targeted rerun controls for Kaggle resume workflows. These let you reuse
 # existing scenario/teacher artifacts while retraining the GNN and recomputing
 # only downstream GNN-dependent results.
@@ -245,6 +252,14 @@ BENCHMARK_C_ONLY = (
     os.environ.get("IRP_BENCHMARK_C_ONLY", "0").strip().lower()
     not in {"0", "false", "no", ""}
 )
+if CHECKPOINT_BENCHMARK_C_ONLY:
+    FORCE_GNN_RETRAIN = False
+    FRESH_GNN_TRAINING = False
+    FORCE_RERUN_OFFLINE_GNN_TEST = False
+    FORCE_RERUN_PHASE2 = False
+    FORCE_RERUN_BENCHMARK = True
+    BENCHMARK_C_ONLY = True
+    RUN_PHASE_2 = False
 
 # Resume mode for Kaggle timeout recovery. Set before running the notebook:
 #   import os
@@ -698,7 +713,7 @@ print(f"  resume_bundle_dir={RESUME_BUNDLE_DIR or 'auto' if RESUME_EXISTING_RUN 
 print(f"  force_gnn_retrain={FORCE_GNN_RETRAIN}  fresh_gnn_training={FRESH_GNN_TRAINING}")
 print(f"  force_rerun_offline_gnn_test={FORCE_RERUN_OFFLINE_GNN_TEST}  "
       f"force_rerun_phase2={FORCE_RERUN_PHASE2}  force_rerun_benchmark={FORCE_RERUN_BENCHMARK}")
-print(f"  benchmark_c_only={BENCHMARK_C_ONLY}")
+print(f"  checkpoint_benchmark_c_only={CHECKPOINT_BENCHMARK_C_ONLY}  benchmark_c_only={BENCHMARK_C_ONLY}")
 
 if CLEAR_RESULTS_DIR and RESULTS_DIR.exists():
     print(f"[Clean run] Removing old Results directory: {RESULTS_DIR}")
@@ -768,134 +783,137 @@ print("=" * 70)
 
 teacher_csv_path: Optional[Path] = None
 
-if MULTI_SCENARIO_MODE:
-    print(f"\n[Multi-scenario mode]  bases={len(BASE_SPECS)}  scenarios_per_base={SCENARIOS_PER_BASE}")
-    print(f"  Expected distinct source_instances: {len(BASE_SPECS) * SCENARIOS_PER_BASE}")
-
-    if len(BASE_SPECS) < 3:
-        raise ValueError(
-            f"Need ≥ 3 base specs for a meaningful instance-level split (train/valid/test). "
-            f"Got {len(BASE_SPECS)}.  Add more entries to BASE_SPECS."
-        )
-
-    scenario_cmd = [
-        sys.executable,
-        str(REPO_ROOT / "GNN" / "generate_teacher_scenarios.py"),
-        "--master-csv",          str(TRAIN_DATA_PATH),
-        "--bases",               *BASE_SPECS,
-        "--scenarios-per-base",  str(SCENARIOS_PER_BASE),
-        "--cg-iterations",       str(CG_ITERATIONS_TEACHER),
-        "--time-limit",          str(TIME_LIMIT_TEACHER),
-        "--master-seed",         str(MASTER_SEED),
-        "--out-dir",             TEACHER_SCENARIO_OUT_DIR,
-        "--continue-on-failure",
-    ]
-    agg_csv_probe = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
-    if RUN_STATE.is_done("scenario_generation") and agg_csv_probe.exists() and agg_csv_probe.stat().st_size > 100:
-        print(f"[scenario_generation] already done — reusing {agg_csv_probe}")
-        rc_scenarios = 0
-    else:
-        print("\n[Running scenario generator...]")
-        RUN_STATE.mark_start("scenario_generation", command=list(scenario_cmd))
-        rc_scenarios = run_infrastructure.quiet_subprocess(
-            scenario_cmd,
-            log_path=RUN_LOG_PATH,
-            cwd=REPO_ROOT,
-            env=os.environ.copy(),
-            tag="scenario_generator",
-            heartbeat_every=500,
-        )
-        if rc_scenarios == 0:
-            RUN_STATE.mark_done("scenario_generation", returncode=rc_scenarios)
-        else:
-            print(f"[WARNING] Scenario generator exited with code {rc_scenarios}. "
-                  "Some scenarios may have failed — continuing with collected rows.")
-            RUN_STATE.update("scenario_generation", returncode=rc_scenarios, partial_ok=True)
-
-    agg_csv = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
-    if not agg_csv.exists() or agg_csv.stat().st_size < 100:
-        raise RuntimeError(
-            f"Scenario generation produced no aggregate CSV at {agg_csv}. "
-            "Check the scenario generator log for errors."
-        )
-
-    agg_df = pd.read_csv(agg_csv)
-    print(f"\n[Scenario generation complete]")
-    print(f"  aggregate rows    : {len(agg_df)}")
-    n_instances = agg_df["source_instance"].nunique() if "source_instance" in agg_df.columns else 0
-    print(f"  unique instances  : {n_instances}")
-    if n_instances < 3:
-        print(f"  [WARNING] Only {n_instances} distinct source_instance values — "
-              "instance-level test split may be empty. Increase BASE_SPECS diversity.")
-
-    # Copy aggregate to Results/teacher/ under the canonical name so the
-    # GNN graph builder finds it at the standard location.
-    teacher_dir = RESULTS_DIR / "teacher"
-    teacher_dir.mkdir(parents=True, exist_ok=True)
-    teacher_csv_path = teacher_dir / "teacher_rows.csv"
-    shutil.copy2(agg_csv, teacher_csv_path)
-    print(f"  teacher CSV       : {teacher_csv_path}")
-
-    # Manifest summary
-    manifest_path = Path(TEACHER_SCENARIO_OUT_DIR) / "scenarios_manifest.json"
-    if manifest_path.exists():
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        scenarios_run   = len(manifest.get("scenarios", []))
-        split_assign    = manifest.get("split_assignment", {})
-        for split in ["train", "valid", "test"]:
-            n = sum(1 for v in split_assign.values() if v == split)
-            print(f"  {split:<6} scenarios : {n}")
-
+if CHECKPOINT_BENCHMARK_C_ONLY:
+    print("\n[Teacher data collection skipped] checkpoint benchmark C-only mode does not rebuild teacher rows or graphs.")
 else:
-    # Single-run mode: collect teacher rows from one CG run
-    print("\n[Single-run mode — collecting teacher rows from one CG run]")
-    print("  WARNING: only 1 source_instance — test split will be empty.")
-    print("  Switch MULTI_SCENARIO_MODE=True for a real train/valid/test split.")
+    if MULTI_SCENARIO_MODE:
+        print(f"\n[Multi-scenario mode]  bases={len(BASE_SPECS)}  scenarios_per_base={SCENARIOS_PER_BASE}")
+        print(f"  Expected distinct source_instances: {len(BASE_SPECS) * SCENARIOS_PER_BASE}")
 
-    _, single_data, _, _, single_meta = build_data(
-        irp,
-        TRAIN_DATA_PATH,
-        start_date=TRAIN_START_DATE,
-        end_date=TRAIN_END_DATE,
-    )
-    show_json("Dataset metadata", single_meta)
+        if len(BASE_SPECS) < 3:
+            raise ValueError(
+                f"Need ≥ 3 base specs for a meaningful instance-level split (train/valid/test). "
+                f"Got {len(BASE_SPECS)}.  Add more entries to BASE_SPECS."
+            )
 
-    p1_results = run_phase(irp, single_data, use_gnn=False, collect_teacher=True)
+        scenario_cmd = [
+            sys.executable,
+            str(REPO_ROOT / "GNN" / "generate_teacher_scenarios.py"),
+            "--master-csv",          str(TRAIN_DATA_PATH),
+            "--bases",               *BASE_SPECS,
+            "--scenarios-per-base",  str(SCENARIOS_PER_BASE),
+            "--cg-iterations",       str(CG_ITERATIONS_TEACHER),
+            "--time-limit",          str(TIME_LIMIT_TEACHER),
+            "--master-seed",         str(MASTER_SEED),
+            "--out-dir",             TEACHER_SCENARIO_OUT_DIR,
+            "--continue-on-failure",
+        ]
+        agg_csv_probe = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
+        if RUN_STATE.is_done("scenario_generation") and agg_csv_probe.exists() and agg_csv_probe.stat().st_size > 100:
+            print(f"[scenario_generation] already done — reusing {agg_csv_probe}")
+            rc_scenarios = 0
+        else:
+            print("\n[Running scenario generator...]")
+            RUN_STATE.mark_start("scenario_generation", command=list(scenario_cmd))
+            rc_scenarios = run_infrastructure.quiet_subprocess(
+                scenario_cmd,
+                log_path=RUN_LOG_PATH,
+                cwd=REPO_ROOT,
+                env=os.environ.copy(),
+                tag="scenario_generator",
+                heartbeat_every=500,
+            )
+            if rc_scenarios == 0:
+                RUN_STATE.mark_done("scenario_generation", returncode=rc_scenarios)
+            else:
+                print(f"[WARNING] Scenario generator exited with code {rc_scenarios}. "
+                      "Some scenarios may have failed — continuing with collected rows.")
+                RUN_STATE.update("scenario_generation", returncode=rc_scenarios, partial_ok=True)
 
-    teacher_df = pd.DataFrame(p1_results.get("teacher_dataset_rows", []))
-    print(f"\n[Teacher rows collected: {len(teacher_df)}]")
-    # Surface the per-engine teacher_export_diagnostics so a Kaggle reviewer
-    # can detect when batches were dropped for missing graph features (root
-    # cause of the silent constraint_features_json gaps fixed in Item 1).
-    p1_export_diag = p1_results.get("teacher_export_diagnostics") or {}
-    if p1_export_diag:
-        print(f"[Teacher export diagnostics] {p1_export_diag}")
-    if teacher_df.empty:
-        raise RuntimeError(
-            "No teacher rows generated. Increase CG_ITERATIONS_TEACHER or check CG convergence."
+        agg_csv = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
+        if not agg_csv.exists() or agg_csv.stat().st_size < 100:
+            raise RuntimeError(
+                f"Scenario generation produced no aggregate CSV at {agg_csv}. "
+                "Check the scenario generator log for errors."
+            )
+
+        agg_df = pd.read_csv(agg_csv)
+        print(f"\n[Scenario generation complete]")
+        print(f"  aggregate rows    : {len(agg_df)}")
+        n_instances = agg_df["source_instance"].nunique() if "source_instance" in agg_df.columns else 0
+        print(f"  unique instances  : {n_instances}")
+        if n_instances < 3:
+            print(f"  [WARNING] Only {n_instances} distinct source_instance values — "
+                  "instance-level test split may be empty. Increase BASE_SPECS diversity.")
+
+        # Copy aggregate to Results/teacher/ under the canonical name so the
+        # GNN graph builder finds it at the standard location.
+        teacher_dir = RESULTS_DIR / "teacher"
+        teacher_dir.mkdir(parents=True, exist_ok=True)
+        teacher_csv_path = teacher_dir / "teacher_rows.csv"
+        shutil.copy2(agg_csv, teacher_csv_path)
+        print(f"  teacher CSV       : {teacher_csv_path}")
+
+        # Manifest summary
+        manifest_path = Path(TEACHER_SCENARIO_OUT_DIR) / "scenarios_manifest.json"
+        if manifest_path.exists():
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            scenarios_run   = len(manifest.get("scenarios", []))
+            split_assign    = manifest.get("split_assignment", {})
+            for split in ["train", "valid", "test"]:
+                n = sum(1 for v in split_assign.values() if v == split)
+                print(f"  {split:<6} scenarios : {n}")
+
+    else:
+        # Single-run mode: collect teacher rows from one CG run
+        print("\n[Single-run mode — collecting teacher rows from one CG run]")
+        print("  WARNING: only 1 source_instance — test split will be empty.")
+        print("  Switch MULTI_SCENARIO_MODE=True for a real train/valid/test split.")
+
+        _, single_data, _, _, single_meta = build_data(
+            irp,
+            TRAIN_DATA_PATH,
+            start_date=TRAIN_START_DATE,
+            end_date=TRAIN_END_DATE,
         )
+        show_json("Dataset metadata", single_meta)
 
-    teacher_dir = RESULTS_DIR / "teacher"
-    teacher_dir.mkdir(parents=True, exist_ok=True)
-    teacher_pkl = teacher_dir / "teacher_rows.pkl.gz"
-    teacher_df.to_pickle(teacher_pkl)
-    teacher_csv_path = teacher_dir / "teacher_rows.csv"
-    teacher_df.to_csv(teacher_csv_path, index=False)
-    save_phase_outputs(p1_results, "phase1_offline_baseline")
-    print(f"  saved: {teacher_pkl.name}  ({teacher_pkl.stat().st_size / 1024:.0f} KB)")
+        p1_results = run_phase(irp, single_data, use_gnn=False, collect_teacher=True)
 
-    # Single-run mode ran a full ALNS+CG+B&P pipeline above — identical to what
-    # section 8 would run with collect_teacher=False.  Mark Phase 1 complete now
-    # so section 8 skips the redundant re-solve (avoids ~2× ALNS+CG runtime).
-    _p1_dedup_path = RESULTS_DIR / "thesis_summary" / "phase1_offline_baseline_summary.json"
-    _p1_dedup_path.parent.mkdir(parents=True, exist_ok=True)
-    run_infrastructure.write_json_atomic(
-        _p1_dedup_path,
-        phase_summary(p1_results, "phase1_offline_baseline"),
-    )
-    RUN_STATE.mark_done("phase1")
-    print(f"  [Phase 1] marked done (single-run dedup) — section 8 will reuse this result")
+        teacher_df = pd.DataFrame(p1_results.get("teacher_dataset_rows", []))
+        print(f"\n[Teacher rows collected: {len(teacher_df)}]")
+        # Surface the per-engine teacher_export_diagnostics so a Kaggle reviewer
+        # can detect when batches were dropped for missing graph features (root
+        # cause of the silent constraint_features_json gaps fixed in Item 1).
+        p1_export_diag = p1_results.get("teacher_export_diagnostics") or {}
+        if p1_export_diag:
+            print(f"[Teacher export diagnostics] {p1_export_diag}")
+        if teacher_df.empty:
+            raise RuntimeError(
+                "No teacher rows generated. Increase CG_ITERATIONS_TEACHER or check CG convergence."
+            )
+
+        teacher_dir = RESULTS_DIR / "teacher"
+        teacher_dir.mkdir(parents=True, exist_ok=True)
+        teacher_pkl = teacher_dir / "teacher_rows.pkl.gz"
+        teacher_df.to_pickle(teacher_pkl)
+        teacher_csv_path = teacher_dir / "teacher_rows.csv"
+        teacher_df.to_csv(teacher_csv_path, index=False)
+        save_phase_outputs(p1_results, "phase1_offline_baseline")
+        print(f"  saved: {teacher_pkl.name}  ({teacher_pkl.stat().st_size / 1024:.0f} KB)")
+
+        # Single-run mode ran a full ALNS+CG+B&P pipeline above — identical to what
+        # section 8 would run with collect_teacher=False.  Mark Phase 1 complete now
+        # so section 8 skips the redundant re-solve (avoids ~2× ALNS+CG runtime).
+        _p1_dedup_path = RESULTS_DIR / "thesis_summary" / "phase1_offline_baseline_summary.json"
+        _p1_dedup_path.parent.mkdir(parents=True, exist_ok=True)
+        run_infrastructure.write_json_atomic(
+            _p1_dedup_path,
+            phase_summary(p1_results, "phase1_offline_baseline"),
+        )
+        RUN_STATE.mark_done("phase1")
+        print(f"  [Phase 1] marked done (single-run dedup) — section 8 will reuse this result")
 
 
 # =========================================================
@@ -915,165 +933,179 @@ offline_test_dir = gnn_dir / "offline_test"
 offline_test_dir.mkdir(parents=True, exist_ok=True)
 offline_test_csv = offline_test_dir / "test_per_sample.csv"
 
-# -- 7a: Build graph dataset ---------------------------------------------------
-print("\n[Step 7a] Building teacher graph dataset...")
-_graph_build_kwargs = dict(
-    teacher_csv_path=str(teacher_csv_path),
-    build_graphs=True,
-    train_gnn=False,
-    checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
-    run_offline_test=False,
-)
-if "max_skip_ratio" in inspect.signature(irp.run_teacher_graph_and_gnn_training).parameters:
-    _graph_build_kwargs["max_skip_ratio"] = TEACHER_GRAPH_MAX_SKIP_RATIO
+if CHECKPOINT_BENCHMARK_C_ONLY:
+    print("\n[Step 7] checkpoint benchmark C-only mode — skipping graph build, GNN training, and offline GNN test.")
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Checkpoint required for C-only benchmark rerun: {checkpoint}")
+    gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
+    pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
+    training_summary_src = checkpoint.parent / "training_summary.json"
+    if training_summary_src.exists():
+        shutil.copy2(training_summary_src, gnn_dir / "training_summary.json")
+    irp.print_gnn_training_history(gnn_history)
+    print(f"\n  checkpoint exists : {checkpoint.exists()}")
+    print(f"  history rows      : {len(gnn_history)}")
+    offline_gnn_test_wall_seconds: Optional[float] = None
 else:
-    print("[Step 7a] irp.run_teacher_graph_and_gnn_training does not support max_skip_ratio; using repo default.")
-build_result = irp.run_teacher_graph_and_gnn_training(**_graph_build_kwargs)
-
-# Report split sizes
-for split in ["train", "valid", "test"]:
-    split_dir = graph_dir / split
-    n = len(list(split_dir.glob("*.pkl"))) if split_dir.exists() else 0
-    print(f"  {split:<6} samples : {n}")
-
-if (graph_dir / "dataset_summary.json").exists():
-    with open(graph_dir / "dataset_summary.json") as f:
-        ds_summary = json.load(f)
-    show_json("Graph Dataset Summary", ds_summary)
-    graphs_dir = RESULTS_DIR / "graphs"
-    graphs_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(graph_dir / "dataset_summary.json", graphs_dir / "graph_dataset_summary.json")
-
-train_samples = list((graph_dir / "train").glob("*.pkl")) if (graph_dir / "train").exists() else []
-valid_samples = list((graph_dir / "valid").glob("*.pkl")) if (graph_dir / "valid").exists() else []
-test_samples  = list((graph_dir / "test").glob("*.pkl"))  if (graph_dir / "test").exists()  else []
-
-if not train_samples:
-    raise RuntimeError(
-        "No training graph samples built. Check that teacher CSV has "
-        "constraint_features_json populated for at least one group."
+    # -- 7a: Build graph dataset ---------------------------------------------------
+    print("\n[Step 7a] Building teacher graph dataset...")
+    _graph_build_kwargs = dict(
+        teacher_csv_path=str(teacher_csv_path),
+        build_graphs=True,
+        train_gnn=False,
+        checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
+        run_offline_test=False,
     )
-if not valid_samples:
-    raise RuntimeError(
-        "No validation graph samples built. Need ≥ 2 distinct source_instance values. "
-        "Increase BASE_SPECS or SCENARIOS_PER_BASE."
-    )
-if not test_samples:
-    raise RuntimeError(
-        "No held-out test graph samples built. Final run requires a non-empty test split. "
-        "Increase BASE_SPECS / SCENARIOS_PER_BASE or inspect source_instance diversity."
-    )
-
-# -- 7b: Train BiGAT -----------------------------------------------------------
-print(f"\n[Step 7b] Training BiGAT  epochs={GNN_TRAIN_EPOCHS}, objective=pairwise_rank...")
-train_cmd = [
-    sys.executable, "GNN/03_train_bigat.py",
-    "--data-dir",     str(graph_dir),
-    "--dataset-type", "teacher",
-    "--epochs",       str(GNN_TRAIN_EPOCHS),
-    "--patience",     str(GNN_TRAIN_EPOCHS),   # rely on MRR early-stopping
-    "--objective",    "pairwise_rank",
-    "--auto-resume",
-]
-if FRESH_GNN_TRAINING:
-    train_cmd = [arg for arg in train_cmd if arg != "--auto-resume"]
-    for artifact_name in [
-        "best_model.pt",
-        "last_model.pt",
-        "training_history.json",
-        "training_summary.json",
-        "training_loss_curve.png",
-    ]:
-        artifact_path = checkpoint.parent / artifact_name
-        if artifact_path.exists():
-            artifact_path.unlink()
-            print(f"[gnn_training] removed stale artifact for fresh training: {artifact_path}")
-# Skip retraining if a reusable checkpoint already exists. `run_state` is still
-# honored when present, but the checkpoint file itself is the stronger signal:
-# it lets later Kaggle runs reuse the model even if run_state.json is missing.
-if checkpoint.exists() and REUSE_EXISTING_CHECKPOINT and not FORCE_GNN_RETRAIN:
-    print(f"[gnn_training] checkpoint already exists — reusing {checkpoint}")
-    if RUN_STATE.is_done("gnn_training"):
-        print("[gnn_training] run_state confirms prior training completion.")
-    rc_train = 0
-else:
-    if FORCE_GNN_RETRAIN:
-        print(f"[gnn_training] force retrain enabled; running Step 7b for {GNN_TRAIN_EPOCHS} epoch(s).")
-    RUN_STATE.mark_start("gnn_training", epochs=GNN_TRAIN_EPOCHS)
-    rc_train = run_infrastructure.quiet_subprocess(
-        train_cmd,
-        log_path=RUN_LOG_PATH,
-        cwd=REPO_ROOT,
-        env=os.environ.copy(),
-        tag="bigat_train",
-        heartbeat_every=200,
-    )
-    if rc_train == 0:
-        RUN_STATE.mark_done("gnn_training", returncode=rc_train)
+    if "max_skip_ratio" in inspect.signature(irp.run_teacher_graph_and_gnn_training).parameters:
+        _graph_build_kwargs["max_skip_ratio"] = TEACHER_GRAPH_MAX_SKIP_RATIO
     else:
-        print(f"[WARNING] BiGAT training exited with code {rc_train} — will retry on next run")
-        RUN_STATE.update("gnn_training", returncode=rc_train, partial_ok=True)
+        print("[Step 7a] irp.run_teacher_graph_and_gnn_training does not support max_skip_ratio; using repo default.")
+    build_result = irp.run_teacher_graph_and_gnn_training(**_graph_build_kwargs)
 
-gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
-pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
-training_summary_src = checkpoint.parent / "training_summary.json"
-if training_summary_src.exists():
-    shutil.copy2(training_summary_src, gnn_dir / "training_summary.json")
-irp.print_gnn_training_history(gnn_history)
-print(f"\n  checkpoint exists : {checkpoint.exists()}")
-print(f"  history rows      : {len(gnn_history)}")
+    # Report split sizes
+    for split in ["train", "valid", "test"]:
+        split_dir = graph_dir / split
+        n = len(list(split_dir.glob("*.pkl"))) if split_dir.exists() else 0
+        print(f"  {split:<6} samples : {n}")
 
-# -- 7c: Offline held-out test -------------------------------------------------
-# Runtime category: OFFLINE GNN TEST ONLY — forward pass on held-out graphs,
-# no solver involved. `04_test.py` additionally writes forward-pass timing to
-# gnn/offline_test/test_runtime_seconds.json. The subprocess wall time below
-# bounds that with Python startup + I/O overhead.
-offline_gnn_test_wall_seconds: Optional[float] = None
-if checkpoint.exists():
-    print(f"\n[Step 7c] Offline test on {len(test_samples)} held-out samples...")
-    test_cmd = [
-        sys.executable, "GNN/04_test.py",
-        "--data-dir",   str(graph_dir),
-        "--checkpoint", str(checkpoint),
-        "--split",      "test",
-        "--out-file",   str(offline_test_csv),
+    if (graph_dir / "dataset_summary.json").exists():
+        with open(graph_dir / "dataset_summary.json") as f:
+            ds_summary = json.load(f)
+        show_json("Graph Dataset Summary", ds_summary)
+        graphs_dir = RESULTS_DIR / "graphs"
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(graph_dir / "dataset_summary.json", graphs_dir / "graph_dataset_summary.json")
+
+    train_samples = list((graph_dir / "train").glob("*.pkl")) if (graph_dir / "train").exists() else []
+    valid_samples = list((graph_dir / "valid").glob("*.pkl")) if (graph_dir / "valid").exists() else []
+    test_samples  = list((graph_dir / "test").glob("*.pkl"))  if (graph_dir / "test").exists()  else []
+
+    if not train_samples:
+        raise RuntimeError(
+            "No training graph samples built. Check that teacher CSV has "
+            "constraint_features_json populated for at least one group."
+        )
+    if not valid_samples:
+        raise RuntimeError(
+            "No validation graph samples built. Need ≥ 2 distinct source_instance values. "
+            "Increase BASE_SPECS or SCENARIOS_PER_BASE."
+        )
+    if not test_samples:
+        raise RuntimeError(
+            "No held-out test graph samples built. Final run requires a non-empty test split. "
+            "Increase BASE_SPECS / SCENARIOS_PER_BASE or inspect source_instance diversity."
+        )
+
+    # -- 7b: Train BiGAT -----------------------------------------------------------
+    print(f"\n[Step 7b] Training BiGAT  epochs={GNN_TRAIN_EPOCHS}, objective=pairwise_rank...")
+    train_cmd = [
+        sys.executable, "-u", "GNN/03_train_bigat.py",
+        "--data-dir",     str(graph_dir),
+        "--dataset-type", "teacher",
+        "--epochs",       str(GNN_TRAIN_EPOCHS),
+        "--patience",     str(GNN_TRAIN_EPOCHS),   # rely on MRR early-stopping
+        "--objective",    "pairwise_rank",
+        "--auto-resume",
     ]
-    # Skip re-running if we already have a complete offline-test CSV.
-    if (
-        RUN_STATE.is_done("offline_gnn_test")
-        and offline_test_csv.exists()
-        and offline_test_csv.stat().st_size > 50
-        and not FORCE_RERUN_OFFLINE_GNN_TEST
-    ):
-        print(f"[offline_gnn_test] already done — reusing {offline_test_csv}")
-        offline_gnn_test_wall_seconds = float(RUN_STATE.get("offline_gnn_test").get("wall_seconds") or 0.0)
-        rc_offline = 0
+    if FRESH_GNN_TRAINING:
+        train_cmd = [arg for arg in train_cmd if arg != "--auto-resume"]
+        for artifact_name in [
+            "best_model.pt",
+            "last_model.pt",
+            "training_history.json",
+            "training_summary.json",
+            "training_loss_curve.png",
+        ]:
+            artifact_path = checkpoint.parent / artifact_name
+            if artifact_path.exists():
+                artifact_path.unlink()
+                print(f"[gnn_training] removed stale artifact for fresh training: {artifact_path}")
+    # Skip retraining if a reusable checkpoint already exists. `run_state` is still
+    # honored when present, but the checkpoint file itself is the stronger signal:
+    # it lets later Kaggle runs reuse the model even if run_state.json is missing.
+    if checkpoint.exists() and REUSE_EXISTING_CHECKPOINT and not FORCE_GNN_RETRAIN:
+        print(f"[gnn_training] checkpoint already exists — reusing {checkpoint}")
+        if RUN_STATE.is_done("gnn_training"):
+            print("[gnn_training] run_state confirms prior training completion.")
+        rc_train = 0
     else:
-        if FORCE_RERUN_OFFLINE_GNN_TEST:
-            print("[offline_gnn_test] force rerun enabled; recomputing held-out GNN metrics.")
-        RUN_STATE.mark_start("offline_gnn_test", n_samples=len(test_samples))
-        _t_off = time.perf_counter()
-        rc_offline = run_infrastructure.quiet_subprocess(
-            test_cmd,
+        if FORCE_GNN_RETRAIN:
+            print(f"[gnn_training] force retrain enabled; running Step 7b for {GNN_TRAIN_EPOCHS} epoch(s).")
+        RUN_STATE.mark_start("gnn_training", epochs=GNN_TRAIN_EPOCHS)
+        rc_train = run_infrastructure.quiet_subprocess(
+            train_cmd,
             log_path=RUN_LOG_PATH,
             cwd=REPO_ROOT,
             env=os.environ.copy(),
-            tag="bigat_test",
-            heartbeat_every=200,
+            tag="bigat_train",
+            heartbeat_every=1,
         )
-        offline_gnn_test_wall_seconds = time.perf_counter() - _t_off
-        if rc_offline == 0:
-            RUN_STATE.mark_done("offline_gnn_test", returncode=rc_offline,
-                                wall_seconds=offline_gnn_test_wall_seconds)
+        if rc_train == 0:
+            RUN_STATE.mark_done("gnn_training", returncode=rc_train)
         else:
-            print(f"[WARNING] Offline test exited with code {rc_offline} — will retry on next run")
-            RUN_STATE.update("offline_gnn_test", returncode=rc_offline, partial_ok=True)
-    if rc_offline == 0:
-        show_offline_test_results(offline_test_csv)
-    print(f"  [Offline GNN test] subprocess wall time: {offline_gnn_test_wall_seconds:.2f} s")
-else:
-    print(f"\n[Step 7c] Offline test skipped — "
-          f"test_samples={len(test_samples)}, checkpoint={checkpoint.exists()}")
+            print(f"[WARNING] BiGAT training exited with code {rc_train} — will retry on next run")
+            RUN_STATE.update("gnn_training", returncode=rc_train, partial_ok=True)
+
+    gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
+    pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
+    training_summary_src = checkpoint.parent / "training_summary.json"
+    if training_summary_src.exists():
+        shutil.copy2(training_summary_src, gnn_dir / "training_summary.json")
+    irp.print_gnn_training_history(gnn_history)
+    print(f"\n  checkpoint exists : {checkpoint.exists()}")
+    print(f"  history rows      : {len(gnn_history)}")
+
+    # -- 7c: Offline held-out test -------------------------------------------------
+    # Runtime category: OFFLINE GNN TEST ONLY — forward pass on held-out graphs,
+    # no solver involved. `04_test.py` additionally writes forward-pass timing to
+    # gnn/offline_test/test_runtime_seconds.json. The subprocess wall time below
+    # bounds that with Python startup + I/O overhead.
+    offline_gnn_test_wall_seconds: Optional[float] = None
+    if checkpoint.exists():
+        print(f"\n[Step 7c] Offline test on {len(test_samples)} held-out samples...")
+        test_cmd = [
+            sys.executable, "GNN/04_test.py",
+            "--data-dir",   str(graph_dir),
+            "--checkpoint", str(checkpoint),
+            "--split",      "test",
+            "--out-file",   str(offline_test_csv),
+        ]
+        # Skip re-running if we already have a complete offline-test CSV.
+        if (
+            RUN_STATE.is_done("offline_gnn_test")
+            and offline_test_csv.exists()
+            and offline_test_csv.stat().st_size > 50
+            and not FORCE_RERUN_OFFLINE_GNN_TEST
+        ):
+            print(f"[offline_gnn_test] already done — reusing {offline_test_csv}")
+            offline_gnn_test_wall_seconds = float(RUN_STATE.get("offline_gnn_test").get("wall_seconds") or 0.0)
+            rc_offline = 0
+        else:
+            if FORCE_RERUN_OFFLINE_GNN_TEST:
+                print("[offline_gnn_test] force rerun enabled; recomputing held-out GNN metrics.")
+            RUN_STATE.mark_start("offline_gnn_test", n_samples=len(test_samples))
+            _t_off = time.perf_counter()
+            rc_offline = run_infrastructure.quiet_subprocess(
+                test_cmd,
+                log_path=RUN_LOG_PATH,
+                cwd=REPO_ROOT,
+                env=os.environ.copy(),
+                tag="bigat_test",
+                heartbeat_every=200,
+            )
+            offline_gnn_test_wall_seconds = time.perf_counter() - _t_off
+            if rc_offline == 0:
+                RUN_STATE.mark_done("offline_gnn_test", returncode=rc_offline,
+                                    wall_seconds=offline_gnn_test_wall_seconds)
+            else:
+                print(f"[WARNING] Offline test exited with code {rc_offline} — will retry on next run")
+                RUN_STATE.update("offline_gnn_test", returncode=rc_offline, partial_ok=True)
+        if rc_offline == 0:
+            show_offline_test_results(offline_test_csv)
+        print(f"  [Offline GNN test] subprocess wall time: {offline_gnn_test_wall_seconds:.2f} s")
+    else:
+        print(f"\n[Step 7c] Offline test skipped — "
+              f"test_samples={len(test_samples)}, checkpoint={checkpoint.exists()}")
 
 
 # =========================================================
