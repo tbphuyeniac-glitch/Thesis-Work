@@ -17,6 +17,7 @@ import gzip
 import inspect
 import json
 import os
+import pickle
 import pprint
 import shutil
 import subprocess
@@ -1396,6 +1397,84 @@ else:
     print("\n[Phase 3 disabled] RUN_ONLINE_LEARNING=False — online learning is not executed.")
 
 
+def _benchmark_shared_state_meta(
+    data: Any,
+    *,
+    demand_shock_seed: int,
+    n_repeats: int,
+    fixed_shock: bool,
+    seeds: List[int],
+) -> Dict[str, Any]:
+    return {
+        "dataset_id": getattr(data, "dataset_id", "") or "",
+        "n_stores": len(getattr(data, "stores", []) or []),
+        "n_products": len(getattr(data, "products", []) or []),
+        "n_periods": len(getattr(data, "periods", []) or []),
+        "demand_shock_seed": int(demand_shock_seed),
+        "n_repeats": int(n_repeats),
+        "fixed_shock": bool(fixed_shock),
+        "seeds": [int(s) for s in seeds],
+        "shock_probability": 0.85,
+        "max_reallocation_fraction": 0.60,
+        "reallocations_per_product_period": 3,
+        "non_dispatch_shock_multiplier": 1.8,
+        "cw_dispatch_cycle": 5,
+    }
+
+
+def _load_benchmark_shared_state(
+    results_dir: Path,
+    expected_meta: Dict[str, Any],
+) -> Optional[Tuple[Any, List[Tuple[Any, Dict[str, Any], int]], float]]:
+    if os.environ.get("IRP_USE_BENCHMARK_BASELINE_CACHE", "1").strip().lower() in {"0", "false", "no"}:
+        return None
+    cache_path = results_dir / "benchmark" / "shared_benchmark_state.pkl.gz"
+    if not cache_path.exists():
+        return None
+    try:
+        with gzip.open(cache_path, "rb") as f:
+            payload = pickle.load(f)
+        if payload.get("meta") != expected_meta:
+            print(f"[Benchmark cache] found {cache_path}, but metadata does not match current run; recomputing baseline.")
+            return None
+        print(f"[Benchmark cache] loaded shared baseline + shock states from {cache_path}")
+        return (
+            payload["shared_baseline_sol"],
+            payload["shock_states_by_repeat"],
+            float(payload.get("shared_baseline_runtime_seconds") or 0.0),
+        )
+    except Exception as exc:
+        print(f"[Benchmark cache] could not load cache ({exc}); recomputing baseline.")
+        return None
+
+
+def _save_benchmark_shared_state(
+    results_dir: Path,
+    *,
+    meta: Dict[str, Any],
+    shared_baseline_sol: Any,
+    shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]],
+    shared_baseline_runtime_seconds: float,
+) -> None:
+    if os.environ.get("IRP_SAVE_BENCHMARK_BASELINE_CACHE", "1").strip().lower() in {"0", "false", "no"}:
+        return
+    cache_dir = results_dir / "benchmark"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "shared_benchmark_state.pkl.gz"
+    payload = {
+        "meta": meta,
+        "shared_baseline_sol": shared_baseline_sol,
+        "shock_states_by_repeat": shock_states_by_repeat,
+        "shared_baseline_runtime_seconds": float(shared_baseline_runtime_seconds),
+        "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with gzip.open(tmp_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path.replace(cache_path)
+    print(f"[Benchmark cache] saved shared baseline + shock states to {cache_path}")
+
+
 def run_benchmark_c_only_with_existing_rows(
     *,
     _irp: Any,
@@ -1441,40 +1520,64 @@ def run_benchmark_c_only_with_existing_rows(
     print("[Benchmark C-only] WARNING: existing benchmark artifacts do not contain serialized baseline/shock objects.")
     print("  A0/A/B will not rerun, but shared baseline must be solved once to recompute C correctly.")
     print(f"  baseline_time_limit={baseline_time_limit}s  baseline_msg={baseline_msg}")
+    print("  benchmark_cache=enabled (set IRP_USE_BENCHMARK_BASELINE_CACHE=0 to ignore)")
 
     _prior_stop_mode = os.environ.get("IRP_CG_STOPPING_MODE")
     os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
     try:
-        baseline_t0 = time.perf_counter()
-        shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
-            msg=baseline_msg,
-            time_limit=baseline_time_limit,
-            enforce_integer_flows=False,
-            add_valid_16_20=True,
-            allow_lateral_transshipment=False,
-            cw_dispatch_cycle=5,
+        cache_meta = _benchmark_shared_state_meta(
+            data,
+            demand_shock_seed=demand_shock_seed,
+            n_repeats=n_repeats,
+            fixed_shock=fixed_shock,
+            seeds=seeds,
         )
-        shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
-        print(f"[Benchmark C-only] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
-
-        shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
-        for repeat_idx, seed in enumerate(seeds):
-            effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
-            if fixed_shock and shock_states_by_repeat:
-                shock_states_by_repeat.append(shock_states_by_repeat[0])
-                continue
-            repeat_data = copy.deepcopy(data)
-            shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
-                repeat_data,
-                baseline_solution=shared_baseline_sol,
-                shock_probability=0.85,
-                max_reallocation_fraction=0.60,
-                reallocations_per_product_period=3,
-                non_dispatch_shock_multiplier=1.8,
-                cw_dispatch_cycle=5,
-                seed=effective_seed,
+        cached_state = _load_benchmark_shared_state(results_dir, cache_meta)
+        if cached_state is not None:
+            shared_baseline_sol, shock_states_by_repeat, cached_baseline_runtime = cached_state
+            shared_baseline_runtime_seconds = 0.0
+            print(
+                "[Benchmark C-only] reused cached shared baseline/shock states "
+                f"(original_baseline_runtime={cached_baseline_runtime:.1f}s; current_run_baseline_runtime=0.0s)"
             )
-            shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+        else:
+            baseline_t0 = time.perf_counter()
+            shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
+                msg=baseline_msg,
+                time_limit=baseline_time_limit,
+                enforce_integer_flows=False,
+                add_valid_16_20=True,
+                allow_lateral_transshipment=False,
+                cw_dispatch_cycle=5,
+            )
+            shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
+            print(f"[Benchmark C-only] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
+
+            shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
+            for repeat_idx, seed in enumerate(seeds):
+                effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
+                if fixed_shock and shock_states_by_repeat:
+                    shock_states_by_repeat.append(shock_states_by_repeat[0])
+                    continue
+                repeat_data = copy.deepcopy(data)
+                shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
+                    repeat_data,
+                    baseline_solution=shared_baseline_sol,
+                    shock_probability=0.85,
+                    max_reallocation_fraction=0.60,
+                    reallocations_per_product_period=3,
+                    non_dispatch_shock_multiplier=1.8,
+                    cw_dispatch_cycle=5,
+                    seed=effective_seed,
+                )
+                shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+            _save_benchmark_shared_state(
+                results_dir,
+                meta=cache_meta,
+                shared_baseline_sol=shared_baseline_sol,
+                shock_states_by_repeat=shock_states_by_repeat,
+                shared_baseline_runtime_seconds=shared_baseline_runtime_seconds,
+            )
 
         c_rows: List[Dict[str, Any]] = []
         for repeat_idx, seed in enumerate(seeds):
@@ -1638,6 +1741,7 @@ def run_benchmark_a0_only_with_existing_rows(
     print("  A/B/C will not rerun, but shared baseline must be solved once to recompute A0 correctly.")
     print(f"  baseline_time_limit={baseline_time_limit}s  baseline_msg={baseline_msg}")
     print(f"  exact_pricing_time_limit={exact_pricing_time_limit}")
+    print("  benchmark_cache=enabled (set IRP_USE_BENCHMARK_BASELINE_CACHE=0 to ignore)")
 
     _prior_stop_mode = os.environ.get("IRP_CG_STOPPING_MODE")
     os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
@@ -1650,36 +1754,59 @@ def run_benchmark_a0_only_with_existing_rows(
 
     _irp.LateralTransshipmentCG.__init__ = _patched_cg_init
     try:
-        baseline_t0 = time.perf_counter()
-        shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
-            msg=baseline_msg,
-            time_limit=baseline_time_limit,
-            enforce_integer_flows=False,
-            add_valid_16_20=True,
-            allow_lateral_transshipment=False,
-            cw_dispatch_cycle=5,
+        cache_meta = _benchmark_shared_state_meta(
+            data,
+            demand_shock_seed=demand_shock_seed,
+            n_repeats=n_repeats,
+            fixed_shock=fixed_shock,
+            seeds=seeds,
         )
-        shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
-        print(f"[Benchmark A0-only] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
-
-        shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
-        for repeat_idx, seed in enumerate(seeds):
-            effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
-            if fixed_shock and shock_states_by_repeat:
-                shock_states_by_repeat.append(shock_states_by_repeat[0])
-                continue
-            repeat_data = copy.deepcopy(data)
-            shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
-                repeat_data,
-                baseline_solution=shared_baseline_sol,
-                shock_probability=0.85,
-                max_reallocation_fraction=0.60,
-                reallocations_per_product_period=3,
-                non_dispatch_shock_multiplier=1.8,
-                cw_dispatch_cycle=5,
-                seed=effective_seed,
+        cached_state = _load_benchmark_shared_state(results_dir, cache_meta)
+        if cached_state is not None:
+            shared_baseline_sol, shock_states_by_repeat, cached_baseline_runtime = cached_state
+            shared_baseline_runtime_seconds = 0.0
+            print(
+                "[Benchmark A0-only] reused cached shared baseline/shock states "
+                f"(original_baseline_runtime={cached_baseline_runtime:.1f}s; current_run_baseline_runtime=0.0s)"
             )
-            shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+        else:
+            baseline_t0 = time.perf_counter()
+            shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
+                msg=baseline_msg,
+                time_limit=baseline_time_limit,
+                enforce_integer_flows=False,
+                add_valid_16_20=True,
+                allow_lateral_transshipment=False,
+                cw_dispatch_cycle=5,
+            )
+            shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
+            print(f"[Benchmark A0-only] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
+
+            shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
+            for repeat_idx, seed in enumerate(seeds):
+                effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
+                if fixed_shock and shock_states_by_repeat:
+                    shock_states_by_repeat.append(shock_states_by_repeat[0])
+                    continue
+                repeat_data = copy.deepcopy(data)
+                shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
+                    repeat_data,
+                    baseline_solution=shared_baseline_sol,
+                    shock_probability=0.85,
+                    max_reallocation_fraction=0.60,
+                    reallocations_per_product_period=3,
+                    non_dispatch_shock_multiplier=1.8,
+                    cw_dispatch_cycle=5,
+                    seed=effective_seed,
+                )
+                shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+            _save_benchmark_shared_state(
+                results_dir,
+                meta=cache_meta,
+                shared_baseline_sol=shared_baseline_sol,
+                shock_states_by_repeat=shock_states_by_repeat,
+                shared_baseline_runtime_seconds=shared_baseline_runtime_seconds,
+            )
 
         a0_rows: List[Dict[str, Any]] = []
         for repeat_idx, seed in enumerate(seeds):
@@ -1862,36 +1989,59 @@ def run_benchmark_a0_c_with_existing_rows(
     _irp.LateralTransshipmentCG.__init__ = _patched_cg_init
     rows: List[Dict[str, Any]] = []
     try:
-        baseline_t0 = time.perf_counter()
-        shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
-            msg=baseline_msg,
-            time_limit=baseline_time_limit,
-            enforce_integer_flows=False,
-            add_valid_16_20=True,
-            allow_lateral_transshipment=False,
-            cw_dispatch_cycle=5,
+        cache_meta = _benchmark_shared_state_meta(
+            data,
+            demand_shock_seed=demand_shock_seed,
+            n_repeats=n_repeats,
+            fixed_shock=fixed_shock,
+            seeds=seeds,
         )
-        shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
-        print(f"[Benchmark A0+C] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
-
-        shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
-        for repeat_idx, seed in enumerate(seeds):
-            effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
-            if fixed_shock and shock_states_by_repeat:
-                shock_states_by_repeat.append(shock_states_by_repeat[0])
-                continue
-            repeat_data = copy.deepcopy(data)
-            shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
-                repeat_data,
-                baseline_solution=shared_baseline_sol,
-                shock_probability=0.85,
-                max_reallocation_fraction=0.60,
-                reallocations_per_product_period=3,
-                non_dispatch_shock_multiplier=1.8,
-                cw_dispatch_cycle=5,
-                seed=effective_seed,
+        cached_state = _load_benchmark_shared_state(results_dir, cache_meta)
+        if cached_state is not None:
+            shared_baseline_sol, shock_states_by_repeat, cached_baseline_runtime = cached_state
+            shared_baseline_runtime_seconds = 0.0
+            print(
+                "[Benchmark A0+C] reused cached shared baseline/shock states "
+                f"(original_baseline_runtime={cached_baseline_runtime:.1f}s; current_run_baseline_runtime=0.0s)"
             )
-            shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+        else:
+            baseline_t0 = time.perf_counter()
+            shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
+                msg=baseline_msg,
+                time_limit=baseline_time_limit,
+                enforce_integer_flows=False,
+                add_valid_16_20=True,
+                allow_lateral_transshipment=False,
+                cw_dispatch_cycle=5,
+            )
+            shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
+            print(f"[Benchmark A0+C] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
+
+            shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
+            for repeat_idx, seed in enumerate(seeds):
+                effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
+                if fixed_shock and shock_states_by_repeat:
+                    shock_states_by_repeat.append(shock_states_by_repeat[0])
+                    continue
+                repeat_data = copy.deepcopy(data)
+                shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
+                    repeat_data,
+                    baseline_solution=shared_baseline_sol,
+                    shock_probability=0.85,
+                    max_reallocation_fraction=0.60,
+                    reallocations_per_product_period=3,
+                    non_dispatch_shock_multiplier=1.8,
+                    cw_dispatch_cycle=5,
+                    seed=effective_seed,
+                )
+                shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+            _save_benchmark_shared_state(
+                results_dir,
+                meta=cache_meta,
+                shared_baseline_sol=shared_baseline_sol,
+                shock_states_by_repeat=shock_states_by_repeat,
+                shared_baseline_runtime_seconds=shared_baseline_runtime_seconds,
+            )
 
         variant_specs = [
             (
