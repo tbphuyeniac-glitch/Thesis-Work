@@ -224,6 +224,10 @@ CHECKPOINT_BENCHMARK_C_ONLY = (
     os.environ.get("IRP_CHECKPOINT_BENCHMARK_C_ONLY", "0").strip().lower()
     not in {"0", "false", "no", ""}
 )
+CHECKPOINT_BENCHMARK_A0_ONLY = (
+    os.environ.get("IRP_CHECKPOINT_BENCHMARK_A0_ONLY", "0").strip().lower()
+    not in {"0", "false", "no", ""}
+)
 
 # Targeted rerun controls for Kaggle resume workflows. These let you reuse
 # existing scenario/teacher artifacts while retraining the GNN and recomputing
@@ -252,6 +256,37 @@ BENCHMARK_C_ONLY = (
     os.environ.get("IRP_BENCHMARK_C_ONLY", "0").strip().lower()
     not in {"0", "false", "no", ""}
 )
+BENCHMARK_A0_ONLY = (
+    os.environ.get("IRP_BENCHMARK_A0_ONLY", "0").strip().lower()
+    not in {"0", "false", "no", ""}
+)
+_exact_pricing_limit_raw = os.environ.get("IRP_A0_EXACT_PRICING_TIME_LIMIT", "none").strip().lower()
+if _exact_pricing_limit_raw in {"", "none", "null", "off", "false", "no"}:
+    A0_EXACT_PRICING_TIME_LIMIT: Optional[int] = None
+else:
+    A0_EXACT_PRICING_TIME_LIMIT = int(_exact_pricing_limit_raw)
+BENCHMARK_STORE_LIMIT = (
+    int(os.environ["IRP_BENCHMARK_STORE_LIMIT"])
+    if os.environ.get("IRP_BENCHMARK_STORE_LIMIT", "").strip()
+    else STORE_LIMIT
+)
+BENCHMARK_SKU_LIMIT = (
+    int(os.environ["IRP_BENCHMARK_SKU_LIMIT"])
+    if os.environ.get("IRP_BENCHMARK_SKU_LIMIT", "").strip()
+    else SKU_LIMIT
+)
+_benchmark_baseline_limit_raw = os.environ.get(
+    "IRP_BENCHMARK_BASELINE_ALNS_TIME_LIMIT",
+    "none",
+).strip().lower()
+if _benchmark_baseline_limit_raw in {"", "none", "null", "off", "false", "no"}:
+    BENCHMARK_BASELINE_ALNS_TIME_LIMIT: Optional[int] = None
+else:
+    BENCHMARK_BASELINE_ALNS_TIME_LIMIT = int(_benchmark_baseline_limit_raw)
+BENCHMARK_BASELINE_ALNS_MSG = (
+    os.environ.get("IRP_BENCHMARK_BASELINE_ALNS_MSG", "1").strip().lower()
+    not in {"0", "false", "no", ""}
+)
 if CHECKPOINT_BENCHMARK_C_ONLY:
     FORCE_GNN_RETRAIN = False
     FRESH_GNN_TRAINING = False
@@ -260,7 +295,14 @@ if CHECKPOINT_BENCHMARK_C_ONLY:
     FORCE_RERUN_BENCHMARK = True
     BENCHMARK_C_ONLY = True
     RUN_PHASE_2 = False
-
+if CHECKPOINT_BENCHMARK_A0_ONLY:
+    FORCE_GNN_RETRAIN = False
+    FRESH_GNN_TRAINING = False
+    FORCE_RERUN_OFFLINE_GNN_TEST = False
+    FORCE_RERUN_PHASE2 = False
+    FORCE_RERUN_BENCHMARK = True
+    BENCHMARK_A0_ONLY = True
+    RUN_PHASE_2 = False
 # Resume mode for Kaggle timeout recovery. Set before running the notebook:
 #   import os
 #   os.environ["IRP_RESUME_EXISTING_RUN"] = "1"
@@ -714,6 +756,11 @@ print(f"  force_gnn_retrain={FORCE_GNN_RETRAIN}  fresh_gnn_training={FRESH_GNN_T
 print(f"  force_rerun_offline_gnn_test={FORCE_RERUN_OFFLINE_GNN_TEST}  "
       f"force_rerun_phase2={FORCE_RERUN_PHASE2}  force_rerun_benchmark={FORCE_RERUN_BENCHMARK}")
 print(f"  checkpoint_benchmark_c_only={CHECKPOINT_BENCHMARK_C_ONLY}  benchmark_c_only={BENCHMARK_C_ONLY}")
+print(f"  checkpoint_benchmark_a0_only={CHECKPOINT_BENCHMARK_A0_ONLY}  benchmark_a0_only={BENCHMARK_A0_ONLY}")
+print(f"  benchmark_store_limit={BENCHMARK_STORE_LIMIT}  benchmark_sku_limit={BENCHMARK_SKU_LIMIT}")
+print(f"  benchmark_baseline_alns_time_limit={BENCHMARK_BASELINE_ALNS_TIME_LIMIT}s  "
+      f"benchmark_baseline_alns_msg={BENCHMARK_BASELINE_ALNS_MSG}")
+print(f"  a0_exact_pricing_time_limit={A0_EXACT_PRICING_TIME_LIMIT}")
 
 if CLEAR_RESULTS_DIR and RESULTS_DIR.exists():
     print(f"[Clean run] Removing old Results directory: {RESULTS_DIR}")
@@ -783,8 +830,8 @@ print("=" * 70)
 
 teacher_csv_path: Optional[Path] = None
 
-if CHECKPOINT_BENCHMARK_C_ONLY:
-    print("\n[Teacher data collection skipped] checkpoint benchmark C-only mode does not rebuild teacher rows or graphs.")
+if CHECKPOINT_BENCHMARK_C_ONLY or CHECKPOINT_BENCHMARK_A0_ONLY:
+    print("\n[Teacher data collection skipped] checkpoint benchmark-only mode does not rebuild teacher rows or graphs.")
 else:
     if MULTI_SCENARIO_MODE:
         print(f"\n[Multi-scenario mode]  bases={len(BASE_SPECS)}  scenarios_per_base={SCENARIOS_PER_BASE}")
@@ -933,16 +980,20 @@ offline_test_dir = gnn_dir / "offline_test"
 offline_test_dir.mkdir(parents=True, exist_ok=True)
 offline_test_csv = offline_test_dir / "test_per_sample.csv"
 
-if CHECKPOINT_BENCHMARK_C_ONLY:
-    print("\n[Step 7] checkpoint benchmark C-only mode — skipping graph build, GNN training, and offline GNN test.")
-    if not checkpoint.exists():
+if CHECKPOINT_BENCHMARK_C_ONLY or CHECKPOINT_BENCHMARK_A0_ONLY:
+    print("\n[Step 7] checkpoint benchmark-only mode — skipping graph build, GNN training, and offline GNN test.")
+    if CHECKPOINT_BENCHMARK_C_ONLY and not checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint required for C-only benchmark rerun: {checkpoint}")
-    gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
-    pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
-    training_summary_src = checkpoint.parent / "training_summary.json"
-    if training_summary_src.exists():
-        shutil.copy2(training_summary_src, gnn_dir / "training_summary.json")
-    irp.print_gnn_training_history(gnn_history)
+    if checkpoint.exists():
+        gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
+        pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
+        training_summary_src = checkpoint.parent / "training_summary.json"
+        if training_summary_src.exists():
+            shutil.copy2(training_summary_src, gnn_dir / "training_summary.json")
+        irp.print_gnn_training_history(gnn_history)
+    else:
+        gnn_history = []
+        print("  no GNN checkpoint found/needed for A0-only benchmark rerun.")
     print(f"\n  checkpoint exists : {checkpoint.exists()}")
     print(f"  history rows      : {len(gnn_history)}")
     offline_gnn_test_wall_seconds: Optional[float] = None
@@ -1357,6 +1408,8 @@ def run_benchmark_c_only_with_existing_rows(
     gnn_checkpoint_path: str,
     demand_shock_seed: int,
     n_repeats: int,
+    baseline_time_limit: Optional[int],
+    baseline_msg: bool,
 ) -> pd.DataFrame:
     """Recompute only benchmark variant C and merge it with existing A0/A/B rows.
 
@@ -1387,14 +1440,15 @@ def run_benchmark_c_only_with_existing_rows(
     print(f"  {existing_per_run_path}")
     print("[Benchmark C-only] WARNING: existing benchmark artifacts do not contain serialized baseline/shock objects.")
     print("  A0/A/B will not rerun, but shared baseline must be solved once to recompute C correctly.")
+    print(f"  baseline_time_limit={baseline_time_limit}s  baseline_msg={baseline_msg}")
 
     _prior_stop_mode = os.environ.get("IRP_CG_STOPPING_MODE")
     os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
     try:
         baseline_t0 = time.perf_counter()
         shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
-            msg=False,
-            time_limit=None,
+            msg=baseline_msg,
+            time_limit=baseline_time_limit,
             enforce_integer_flows=False,
             add_valid_16_20=True,
             allow_lateral_transshipment=False,
@@ -1543,6 +1597,445 @@ def run_benchmark_c_only_with_existing_rows(
     return per_run_df
 
 
+def run_benchmark_a0_only_with_existing_rows(
+    *,
+    _irp: Any,
+    data: Any,
+    results_dir: Path,
+    existing_per_run_path: Path,
+    cg_iterations: int,
+    bp_max_nodes: int,
+    bp_max_depth: int,
+    demand_shock_seed: int,
+    n_repeats: int,
+    baseline_time_limit: Optional[int],
+    baseline_msg: bool,
+    exact_pricing_time_limit: Optional[int],
+) -> pd.DataFrame:
+    """Recompute only benchmark A0 and merge it with existing A/B/C rows."""
+    if not existing_per_run_path.exists():
+        raise FileNotFoundError(
+            f"A0-only benchmark needs existing A/B/C rows at {existing_per_run_path}"
+        )
+
+    existing_df = pd.read_csv(existing_per_run_path)
+    keep_df = existing_df[existing_df["variant"].astype(str) != "A0_cg_full_exact"].copy()
+    if keep_df.empty:
+        raise RuntimeError(
+            "Existing benchmark CSV has no non-A0 rows to preserve. "
+            "Run a full A0/A/B/C benchmark once first."
+        )
+
+    fixed_shock = os.environ.get("IRP_BENCHMARK_FIXED_SHOCK", "0").lower() not in {"0", "false", "no", ""}
+    n_repeats = max(1, int(n_repeats))
+    seeds = [int(demand_shock_seed)] * n_repeats if fixed_shock else [
+        int(demand_shock_seed) + 10007 * r for r in range(n_repeats)
+    ]
+
+    print("\n[Benchmark A0-only] Preserving existing A/B/C rows from:")
+    print(f"  {existing_per_run_path}")
+    print("[Benchmark A0-only] WARNING: existing benchmark artifacts do not contain serialized baseline/shock objects.")
+    print("  A/B/C will not rerun, but shared baseline must be solved once to recompute A0 correctly.")
+    print(f"  baseline_time_limit={baseline_time_limit}s  baseline_msg={baseline_msg}")
+    print(f"  exact_pricing_time_limit={exact_pricing_time_limit}")
+
+    _prior_stop_mode = os.environ.get("IRP_CG_STOPPING_MODE")
+    os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
+    original_cg_init = _irp.LateralTransshipmentCG.__init__
+
+    def _patched_cg_init(self, *args, **kwargs):
+        if bool(kwargs.get("exact_full_mode", False)):
+            kwargs["exact_pricing_time_limit"] = exact_pricing_time_limit
+        return original_cg_init(self, *args, **kwargs)
+
+    _irp.LateralTransshipmentCG.__init__ = _patched_cg_init
+    try:
+        baseline_t0 = time.perf_counter()
+        shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
+            msg=baseline_msg,
+            time_limit=baseline_time_limit,
+            enforce_integer_flows=False,
+            add_valid_16_20=True,
+            allow_lateral_transshipment=False,
+            cw_dispatch_cycle=5,
+        )
+        shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
+        print(f"[Benchmark A0-only] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
+
+        shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
+        for repeat_idx, seed in enumerate(seeds):
+            effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
+            if fixed_shock and shock_states_by_repeat:
+                shock_states_by_repeat.append(shock_states_by_repeat[0])
+                continue
+            repeat_data = copy.deepcopy(data)
+            shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
+                repeat_data,
+                baseline_solution=shared_baseline_sol,
+                shock_probability=0.85,
+                max_reallocation_fraction=0.60,
+                reallocations_per_product_period=3,
+                non_dispatch_shock_multiplier=1.8,
+                cw_dispatch_cycle=5,
+                seed=effective_seed,
+            )
+            shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+
+        a0_rows: List[Dict[str, Any]] = []
+        for repeat_idx, seed in enumerate(seeds):
+            run_label = f"A0_cg_full_exact__repeat{repeat_idx + 1}"
+            repeat_data, shock_summary, effective_seed = shock_states_by_repeat[repeat_idx]
+            print("\n" + "#" * 80)
+            print(f"# BENCHMARK A0-ONLY: repeat {repeat_idx + 1}/{n_repeats} seed={effective_seed}")
+            print("# exact_full_mode=True, GNN=False, top-k=False, pruning=False")
+            print("#" * 80)
+            t0 = time.perf_counter()
+            variant_baseline = copy.deepcopy(shared_baseline_sol)
+            variant_data = copy.deepcopy(repeat_data)
+            pipeline = _irp.IRPResearchPipeline(variant_data)
+            variant_results = pipeline.run_lt_recourse_from_baseline(
+                variant_baseline,
+                shock_summary=shock_summary,
+                use_random_initial_patterns=True,
+                n_initial_patterns_per_product_period=5,
+                cg_iterations=cg_iterations,
+                msg=False,
+                gnn_checkpoint=_irp.DEFAULT_GNN_CHECKPOINT,
+                use_classical_fallback=False,
+                gnn_mass_threshold=0.55,
+                gnn_max_keep=150,
+                gnn_max_keep_fraction=0.30,
+                use_branch_and_price=True,
+                bp_max_nodes=bp_max_nodes,
+                bp_max_depth=bp_max_depth,
+                lt_activation_threshold=10.0,
+                use_gnn=False,
+                collect_teacher_mode=False,
+                runtime_gnn_mode=False,
+                heuristic_top_k_mode=False,
+                exact_full_mode=True,
+            )
+            variant_runtime = time.perf_counter() - t0
+            run_context = {
+                "run_label": run_label,
+                "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
+                "dataset_id": getattr(data, "dataset_id", "") or "",
+                "scenario_id": str(effective_seed),
+                "seed": effective_seed,
+                "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
+                "fine_tune_runtime_seconds": 0.0,
+                "shared_baseline_runtime_seconds": shared_baseline_runtime_seconds,
+            }
+            row = _irp._collect_benchmark_metrics(
+                "A0_cg_full_exact",
+                variant_results,
+                variant_runtime,
+                run_context=run_context,
+            )
+            row["repeat"] = repeat_idx + 1
+            row["a0_exact_pricing_time_limit"] = exact_pricing_time_limit
+            a0_rows.append(row)
+
+    finally:
+        _irp.LateralTransshipmentCG.__init__ = original_cg_init
+        if _prior_stop_mode is None:
+            os.environ.pop("IRP_CG_STOPPING_MODE", None)
+        else:
+            os.environ["IRP_CG_STOPPING_MODE"] = _prior_stop_mode
+
+    benchmark_dir = results_dir / "benchmark"
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    per_run_df = pd.concat([pd.DataFrame(a0_rows), keep_df], ignore_index=True)
+    if not per_run_df.empty and "variant" in per_run_df.columns:
+        per_run_df["variant"] = pd.Categorical(
+            per_run_df["variant"],
+            categories=_irp.BENCHMARK_VARIANT_ORDER,
+            ordered=True,
+        )
+        sort_cols = ["variant"] + [c for c in ("repeat", "run_label") if c in per_run_df.columns]
+        per_run_df = per_run_df.sort_values(sort_cols).reset_index(drop=True)
+
+    per_run_df.to_csv(benchmark_dir / "comparison_per_run.csv", index=False)
+    per_run_df.to_csv(benchmark_dir / "comparison.csv", index=False)
+
+    numeric_cols = [
+        "rmp_objective", "realized_cost_no_lt", "realized_cost_with_lt",
+        "lt_cost_with_lt", "shortage_cost_with_lt",
+        "cg_iterations", "total_runtime_seconds",
+        "variant_runtime_seconds", "shared_baseline_runtime_seconds",
+        "total_runtime_with_shared_baseline_seconds",
+        "phase1_baseline_runtime_seconds", "phase2_cg_runtime_seconds",
+        "gnn_inference_runtime_seconds", "columns_generated",
+        "columns_selected_by_gnn", "columns_added_to_rmp",
+        "column_pool_utilization", "gnn_scoring_failures",
+    ]
+    numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
+    agg_rows: List[Dict[str, Any]] = []
+    for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
+        row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
+        for c in numeric_cols:
+            numeric = pd.to_numeric(grp[c], errors="coerce")
+            row[f"{c}_mean"] = float(numeric.mean())
+            row[f"{c}_std"] = float(numeric.std(ddof=0)) if len(numeric) else float("nan")
+            row[f"{c}_min"] = float(numeric.min()) if len(numeric) else float("nan")
+            row[f"{c}_max"] = float(numeric.max()) if len(numeric) else float("nan")
+        agg_rows.append(row)
+    aggregate_df = pd.DataFrame(agg_rows)
+    if not aggregate_df.empty and "variant" in aggregate_df.columns:
+        aggregate_df["variant"] = pd.Categorical(
+            aggregate_df["variant"],
+            categories=_irp.BENCHMARK_VARIANT_ORDER,
+            ordered=True,
+        )
+        aggregate_df = aggregate_df.sort_values("variant").reset_index(drop=True)
+    aggregate_df.to_csv(benchmark_dir / "comparison_aggregate.csv", index=False)
+
+    thesis_dir = results_dir / "thesis_summary"
+    thesis_dir.mkdir(parents=True, exist_ok=True)
+    aggregate_df.to_csv(thesis_dir / "benchmark_comparison.csv", index=False)
+
+    for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
+        summary = {
+            "variant": variant_name,
+            "n_repeats": int(len(grp)),
+            "runs": grp.to_dict(orient="records"),
+        }
+        with open(benchmark_dir / f"variant_{variant_name}_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+    return per_run_df
+
+
+def run_benchmark_a0_c_with_existing_rows(
+    *,
+    _irp: Any,
+    data: Any,
+    results_dir: Path,
+    existing_per_run_path: Path,
+    cg_iterations: int,
+    bp_max_nodes: int,
+    bp_max_depth: int,
+    gnn_checkpoint_path: str,
+    demand_shock_seed: int,
+    n_repeats: int,
+    baseline_time_limit: Optional[int],
+    baseline_msg: bool,
+    exact_pricing_time_limit: Optional[int],
+) -> pd.DataFrame:
+    """Recompute benchmark A0 and C, preserving existing A/B rows."""
+    if not existing_per_run_path.exists():
+        raise FileNotFoundError(
+            f"A0+C benchmark needs existing A/B rows at {existing_per_run_path}"
+        )
+
+    existing_df = pd.read_csv(existing_per_run_path)
+    rerun_variants = {"A0_cg_full_exact", "C_gnn_guided_cg"}
+    keep_df = existing_df[~existing_df["variant"].astype(str).isin(rerun_variants)].copy()
+    if keep_df.empty:
+        raise RuntimeError(
+            "Existing benchmark CSV has no A/B rows to preserve. "
+            "Run a full A0/A/B/C benchmark once first."
+        )
+
+    fixed_shock = os.environ.get("IRP_BENCHMARK_FIXED_SHOCK", "0").lower() not in {"0", "false", "no", ""}
+    n_repeats = max(1, int(n_repeats))
+    seeds = [int(demand_shock_seed)] * n_repeats if fixed_shock else [
+        int(demand_shock_seed) + 10007 * r for r in range(n_repeats)
+    ]
+
+    print("\n[Benchmark A0+C] Preserving existing A/B rows from:")
+    print(f"  {existing_per_run_path}")
+    print("[Benchmark A0+C] WARNING: existing benchmark artifacts do not contain serialized baseline/shock objects.")
+    print("  A/B will not rerun, but shared baseline must be solved once to recompute A0 and C correctly.")
+    print(f"  baseline_time_limit={baseline_time_limit}s  baseline_msg={baseline_msg}")
+    print(f"  exact_pricing_time_limit={exact_pricing_time_limit}")
+
+    _prior_stop_mode = os.environ.get("IRP_CG_STOPPING_MODE")
+    os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
+    original_cg_init = _irp.LateralTransshipmentCG.__init__
+
+    def _patched_cg_init(self, *args, **kwargs):
+        if bool(kwargs.get("exact_full_mode", False)):
+            kwargs["exact_pricing_time_limit"] = exact_pricing_time_limit
+        return original_cg_init(self, *args, **kwargs)
+
+    _irp.LateralTransshipmentCG.__init__ = _patched_cg_init
+    rows: List[Dict[str, Any]] = []
+    try:
+        baseline_t0 = time.perf_counter()
+        shared_baseline_sol = _irp.BaselineALNSModel(data).solve(
+            msg=baseline_msg,
+            time_limit=baseline_time_limit,
+            enforce_integer_flows=False,
+            add_valid_16_20=True,
+            allow_lateral_transshipment=False,
+            cw_dispatch_cycle=5,
+        )
+        shared_baseline_runtime_seconds = time.perf_counter() - baseline_t0
+        print(f"[Benchmark A0+C] shared baseline solved in {shared_baseline_runtime_seconds:.1f}s")
+
+        shock_states_by_repeat: List[Tuple[Any, Dict[str, Any], int]] = []
+        for repeat_idx, seed in enumerate(seeds):
+            effective_seed = int(demand_shock_seed) if fixed_shock else int(seed)
+            if fixed_shock and shock_states_by_repeat:
+                shock_states_by_repeat.append(shock_states_by_repeat[0])
+                continue
+            repeat_data = copy.deepcopy(data)
+            shock_summary = _irp.apply_hidden_local_reallocation_demand_shocks(
+                repeat_data,
+                baseline_solution=shared_baseline_sol,
+                shock_probability=0.85,
+                max_reallocation_fraction=0.60,
+                reallocations_per_product_period=3,
+                non_dispatch_shock_multiplier=1.8,
+                cw_dispatch_cycle=5,
+                seed=effective_seed,
+            )
+            shock_states_by_repeat.append((repeat_data, shock_summary, effective_seed))
+
+        variant_specs = [
+            (
+                "A0_cg_full_exact",
+                {
+                    "use_gnn": False,
+                    "collect_teacher_mode": False,
+                    "runtime_gnn_mode": False,
+                    "heuristic_top_k_mode": False,
+                    "exact_full_mode": True,
+                },
+            ),
+            (
+                "C_gnn_guided_cg",
+                {
+                    "use_gnn": True,
+                    "collect_teacher_mode": False,
+                    "runtime_gnn_mode": True,
+                    "heuristic_top_k_mode": False,
+                },
+            ),
+        ]
+
+        for variant_name, variant_kwargs in variant_specs:
+            for repeat_idx, seed in enumerate(seeds):
+                run_label = f"{variant_name}__repeat{repeat_idx + 1}"
+                repeat_data, shock_summary, effective_seed = shock_states_by_repeat[repeat_idx]
+                print("\n" + "#" * 80)
+                print(f"# BENCHMARK A0+C: {variant_name} repeat {repeat_idx + 1}/{n_repeats} seed={effective_seed}")
+                print("#" * 80)
+                t0 = time.perf_counter()
+                variant_baseline = copy.deepcopy(shared_baseline_sol)
+                variant_data = copy.deepcopy(repeat_data)
+                pipeline = _irp.IRPResearchPipeline(variant_data)
+                variant_results = pipeline.run_lt_recourse_from_baseline(
+                    variant_baseline,
+                    shock_summary=shock_summary,
+                    use_random_initial_patterns=True,
+                    n_initial_patterns_per_product_period=5,
+                    cg_iterations=cg_iterations,
+                    msg=False,
+                    gnn_checkpoint=gnn_checkpoint_path,
+                    use_classical_fallback=False,
+                    gnn_mass_threshold=0.55,
+                    gnn_max_keep=150,
+                    gnn_max_keep_fraction=0.30,
+                    use_branch_and_price=True,
+                    bp_max_nodes=bp_max_nodes,
+                    bp_max_depth=bp_max_depth,
+                    lt_activation_threshold=10.0,
+                    **variant_kwargs,
+                )
+                variant_runtime = time.perf_counter() - t0
+                run_context = {
+                    "run_label": run_label,
+                    "source_instance": os.environ.get("IRP_SOURCE_INSTANCE", ""),
+                    "dataset_id": getattr(data, "dataset_id", "") or "",
+                    "scenario_id": str(effective_seed),
+                    "seed": effective_seed,
+                    "benchmark_mode": "strict" if os.environ.get("IRP_STRICT_BENCHMARK", "0").lower() not in {"0","false","no",""} else "default",
+                    "fine_tune_runtime_seconds": 0.0,
+                    "shared_baseline_runtime_seconds": shared_baseline_runtime_seconds,
+                }
+                row = _irp._collect_benchmark_metrics(
+                    variant_name,
+                    variant_results,
+                    variant_runtime,
+                    run_context=run_context,
+                )
+                row["repeat"] = repeat_idx + 1
+                if variant_name == "A0_cg_full_exact":
+                    row["a0_exact_pricing_time_limit"] = exact_pricing_time_limit
+                rows.append(row)
+
+    finally:
+        _irp.LateralTransshipmentCG.__init__ = original_cg_init
+        if _prior_stop_mode is None:
+            os.environ.pop("IRP_CG_STOPPING_MODE", None)
+        else:
+            os.environ["IRP_CG_STOPPING_MODE"] = _prior_stop_mode
+
+    benchmark_dir = results_dir / "benchmark"
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    per_run_df = pd.concat([pd.DataFrame(rows), keep_df], ignore_index=True)
+    if not per_run_df.empty and "variant" in per_run_df.columns:
+        per_run_df["variant"] = pd.Categorical(
+            per_run_df["variant"],
+            categories=_irp.BENCHMARK_VARIANT_ORDER,
+            ordered=True,
+        )
+        sort_cols = ["variant"] + [c for c in ("repeat", "run_label") if c in per_run_df.columns]
+        per_run_df = per_run_df.sort_values(sort_cols).reset_index(drop=True)
+
+    per_run_df.to_csv(benchmark_dir / "comparison_per_run.csv", index=False)
+    per_run_df.to_csv(benchmark_dir / "comparison.csv", index=False)
+
+    numeric_cols = [
+        "rmp_objective", "realized_cost_no_lt", "realized_cost_with_lt",
+        "lt_cost_with_lt", "shortage_cost_with_lt",
+        "cg_iterations", "total_runtime_seconds",
+        "variant_runtime_seconds", "shared_baseline_runtime_seconds",
+        "total_runtime_with_shared_baseline_seconds",
+        "phase1_baseline_runtime_seconds", "phase2_cg_runtime_seconds",
+        "gnn_inference_runtime_seconds", "columns_generated",
+        "columns_selected_by_gnn", "columns_added_to_rmp",
+        "column_pool_utilization", "gnn_scoring_failures",
+    ]
+    numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
+    agg_rows: List[Dict[str, Any]] = []
+    for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
+        row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
+        for c in numeric_cols:
+            numeric = pd.to_numeric(grp[c], errors="coerce")
+            row[f"{c}_mean"] = float(numeric.mean())
+            row[f"{c}_std"] = float(numeric.std(ddof=0)) if len(numeric) else float("nan")
+            row[f"{c}_min"] = float(numeric.min()) if len(numeric) else float("nan")
+            row[f"{c}_max"] = float(numeric.max()) if len(numeric) else float("nan")
+        agg_rows.append(row)
+    aggregate_df = pd.DataFrame(agg_rows)
+    if not aggregate_df.empty and "variant" in aggregate_df.columns:
+        aggregate_df["variant"] = pd.Categorical(
+            aggregate_df["variant"],
+            categories=_irp.BENCHMARK_VARIANT_ORDER,
+            ordered=True,
+        )
+        aggregate_df = aggregate_df.sort_values("variant").reset_index(drop=True)
+    aggregate_df.to_csv(benchmark_dir / "comparison_aggregate.csv", index=False)
+
+    thesis_dir = results_dir / "thesis_summary"
+    thesis_dir.mkdir(parents=True, exist_ok=True)
+    aggregate_df.to_csv(thesis_dir / "benchmark_comparison.csv", index=False)
+
+    for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
+        summary = {
+            "variant": variant_name,
+            "n_repeats": int(len(grp)),
+            "runs": grp.to_dict(orient="records"),
+        }
+        with open(benchmark_dir / f"variant_{variant_name}_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+    return per_run_df
+
+
 # =========================================================
 # 11) A0/A/B/C benchmark (optional)
 # =========================================================
@@ -1573,7 +2066,11 @@ if RUN_BENCHMARK:
         benchmark_df = pd.read_csv(bench_per_run_path)
         benchmark_wall_seconds = float(RUN_STATE.get("benchmark").get("wall_seconds") or 0.0)
     else:
-        if FORCE_RERUN_BENCHMARK and BENCHMARK_C_ONLY:
+        if FORCE_RERUN_BENCHMARK and BENCHMARK_A0_ONLY and BENCHMARK_C_ONLY:
+            print("[benchmark] force rerun enabled; recomputing A0_cg_full_exact + C_gnn_guided_cg and preserving existing A/B rows.")
+        elif FORCE_RERUN_BENCHMARK and BENCHMARK_A0_ONLY:
+            print("[benchmark] force rerun enabled; recomputing only A0_cg_full_exact and preserving existing A/B/C rows.")
+        elif FORCE_RERUN_BENCHMARK and BENCHMARK_C_ONLY:
             print("[benchmark] force rerun enabled; recomputing only C_gnn_guided_cg and preserving existing A0/A/B rows.")
         elif FORCE_RERUN_BENCHMARK:
             print("[benchmark] force rerun enabled; recomputing A0/A/B/C benchmark with the current checkpoint.")
@@ -1581,12 +2078,45 @@ if RUN_BENCHMARK:
         _, bm_data, _, _, _ = build_data(
             irp,
             TEST_DATA_PATH,
+            store_limit=BENCHMARK_STORE_LIMIT,
+            sku_limit=BENCHMARK_SKU_LIMIT,
             start_date=TEST_START_DATE,
             end_date=TEST_END_DATE,
         )
         _t_bm = time.perf_counter()
         try:
-            if BENCHMARK_C_ONLY:
+            if BENCHMARK_A0_ONLY and BENCHMARK_C_ONLY:
+                benchmark_df = run_benchmark_a0_c_with_existing_rows(
+                    _irp=irp,
+                    data=bm_data,
+                    results_dir=RESULTS_DIR,
+                    existing_per_run_path=bench_per_run_path,
+                    cg_iterations=CG_ITERATIONS,
+                    bp_max_nodes=BP_MAX_NODES,
+                    bp_max_depth=BP_MAX_DEPTH,
+                    gnn_checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
+                    demand_shock_seed=DEMAND_SHOCK_SEED,
+                    n_repeats=BENCHMARK_N_REPEATS,
+                    baseline_time_limit=BENCHMARK_BASELINE_ALNS_TIME_LIMIT,
+                    baseline_msg=BENCHMARK_BASELINE_ALNS_MSG,
+                    exact_pricing_time_limit=A0_EXACT_PRICING_TIME_LIMIT,
+                )
+            elif BENCHMARK_A0_ONLY:
+                benchmark_df = run_benchmark_a0_only_with_existing_rows(
+                    _irp=irp,
+                    data=bm_data,
+                    results_dir=RESULTS_DIR,
+                    existing_per_run_path=bench_per_run_path,
+                    cg_iterations=CG_ITERATIONS,
+                    bp_max_nodes=BP_MAX_NODES,
+                    bp_max_depth=BP_MAX_DEPTH,
+                    demand_shock_seed=DEMAND_SHOCK_SEED,
+                    n_repeats=BENCHMARK_N_REPEATS,
+                    baseline_time_limit=BENCHMARK_BASELINE_ALNS_TIME_LIMIT,
+                    baseline_msg=BENCHMARK_BASELINE_ALNS_MSG,
+                    exact_pricing_time_limit=A0_EXACT_PRICING_TIME_LIMIT,
+                )
+            elif BENCHMARK_C_ONLY:
                 benchmark_df = run_benchmark_c_only_with_existing_rows(
                     _irp=irp,
                     data=bm_data,
@@ -1598,6 +2128,8 @@ if RUN_BENCHMARK:
                     gnn_checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
                     demand_shock_seed=DEMAND_SHOCK_SEED,
                     n_repeats=BENCHMARK_N_REPEATS,
+                    baseline_time_limit=BENCHMARK_BASELINE_ALNS_TIME_LIMIT,
+                    baseline_msg=BENCHMARK_BASELINE_ALNS_MSG,
                 )
             else:
                 benchmark_df = irp.run_three_way_benchmark(
