@@ -51,6 +51,7 @@ class DatasetToAchamrahMapper:
         sku_limit: Optional[int] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        period_granularity: str = "daily",  # "daily" | "weekly" | "biweekly" | "monthly"
     ):
         self.excel_path = excel_path
         self.sheet_name = sheet_name
@@ -58,6 +59,7 @@ class DatasetToAchamrahMapper:
         self.sku_limit = sku_limit
         self.start_date = start_date
         self.end_date = end_date
+        self.period_granularity = period_granularity
 
     def load_raw(self) -> pd.DataFrame:
         path = Path(self.excel_path)
@@ -96,11 +98,26 @@ class DatasetToAchamrahMapper:
 
     def preprocess(self) -> pd.DataFrame:
         df = self.load_raw()
+
+        # Aggregate daily rows to the chosen granularity before grouping
+        gran = self.period_granularity.lower()
+        if gran == "weekly":
+            df["period_date"] = df["period_date"].dt.to_period("W").apply(lambda p: p.start_time)
+        elif gran == "biweekly":
+            # Snap each date to the nearest Monday of its 2-week bucket
+            ref = df["period_date"].min()
+            df["period_date"] = df["period_date"].apply(
+                lambda d: ref + pd.Timedelta(weeks=((d - ref).days // 14) * 2)
+            )
+        elif gran == "monthly":
+            df["period_date"] = df["period_date"].dt.to_period("M").apply(lambda p: p.start_time)
+        # else "daily": no change
+
         grp = (
             df.groupby(["store", "sku", "period_date"], as_index=False)
               .agg(
                   sale_qty=("sale_qty", "sum"),
-                  end_qty=("end_qty", "sum"),
+                  end_qty=("end_qty", "last"),   # end-of-period snapshot: take last
                   price=("price", "median"),
               )
         )
@@ -127,6 +144,9 @@ class DatasetToAchamrahMapper:
         unique_dates = sorted(grp["period_date"].drop_duplicates().tolist())
         date_to_period = {dt: i + 1 for i, dt in enumerate(unique_dates)}
         grp["period"] = grp["period_date"].map(date_to_period)
+        n_periods = len(unique_dates)
+        print(f"[preprocess] granularity={gran}  periods={n_periods}  "
+              f"stores={grp['store'].nunique()}  skus={grp['sku'].nunique()}")
         return grp
 
     def build_instance(

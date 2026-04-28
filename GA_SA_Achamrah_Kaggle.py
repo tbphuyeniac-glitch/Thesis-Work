@@ -56,6 +56,13 @@ SKU_LIMIT:   Optional[int] = 5    # reduce for faster smoke test; None = all SKU
 START_DATE:  Optional[str] = "2025-08-01"
 END_DATE:    Optional[str] = "2025-09-30"
 
+# ── Period granularity ───────────────────────────────────
+# "daily"    → 1 period per day  (VERY large model, OOM risk with >3 weeks)
+# "weekly"   → 1 period per week (RECOMMENDED: 2 months → 8-9 periods)
+# "biweekly" → 1 period per 2 weeks
+# "monthly"  → 1 period per month
+PERIOD_GRANULARITY = "weekly"
+
 # ── Solver parameters (Achamrah 2022 Table 2 calibration) ─
 INITIAL_TEMPERATURE     = 92.0
 FINAL_TEMPERATURE       = 4.2
@@ -202,6 +209,7 @@ def run_achamrah_pipeline() -> Tuple[Dict[str, Any], Any]:
         sku_limit=SKU_LIMIT,
         start_date=START_DATE,
         end_date=END_DATE,
+        period_granularity=PERIOD_GRANULARITY,
     )
 
     print("\nBuilding IRPTInstance from dataset...")
@@ -472,35 +480,46 @@ def write_readme(
         f"- Data file: {DATA_FILE}  Date range: {START_DATE} → {END_DATE}",
         "",
         "## Key Results",
-        f"- Best objective: {_safe_float(summary['best_objective']):.4f}",
-        f"- Constructive objective: {_safe_float(summary['constructive_objective']):.4f}",
-        f"- Final (GA+SA) objective: {_safe_float(summary['final_objective']):.4f}",
-        f"- LT moves: {summary['n_lt_moves']}   Routes: {summary['n_routes']}",
+        f"- **Best objective**: {_safe_float(summary['best_objective']):.4f}",
+        f"- Constructive (RMILP): {_safe_float(summary['constructive_objective']):.4f}",
+        f"- Final (GA+SA): {_safe_float(summary['final_objective']):.4f}",
+        f"- **Improvement**: {_safe_float(summary['constructive_objective'] - summary['best_objective']):.4f} "
+        f"({100 * (summary['constructive_objective'] - summary['best_objective']) / max(1, summary['constructive_objective']):.1f}%)",
+        "",
+        "## Cost Breakdown (Final)",
+        f"- Holding cost: {_safe_float(summary['objective_breakdown'].get('holding_cost')):.2f}",
+        f"- Routing cost: {_safe_float(summary['objective_breakdown'].get('routing_cost')):.2f}",
+        f"- Transshipment cost: {_safe_float(summary['objective_breakdown'].get('transshipment_cost')):.2f}",
+        f"- Shortage cost: {_safe_float(summary['objective_breakdown'].get('shortage_cost')):.2f}",
+        "",
+        "## Solution Quality",
+        f"- Routes: {summary['n_routes']}  LT moves: {summary['n_lt_moves']}",
         f"- MAE={_safe_float(summary['validation_metrics'].get('MAE')):.4f}  "
         f"RMSE={_safe_float(summary['validation_metrics'].get('RMSE')):.4f}  "
-        f"MAPE={_safe_float(summary['validation_metrics'].get('MAPE')):.4f}",
+        f"MAPE={_safe_float(summary['validation_metrics'].get('MAPE')):.4f}%",
         "",
         "## Runtime",
-        f"- Constructive phase : {_safe_float(summary['constructive_runtime_seconds']):.1f}s",
-        f"- GA+SA improvement  : {_safe_float(summary['improvement_runtime_seconds']):.1f}s",
-        f"- Total (matheuristic): {_safe_float(summary['total_runtime_seconds']):.1f}s",
-        f"- Wall time (pipeline): {runtime_breakdown.get('pipeline_wall_seconds', 0):.1f}s",
+        f"- Constructive phase: {_safe_float(summary['constructive_runtime_seconds']):.1f}s",
+        f"- GA+SA improvement: {_safe_float(summary['improvement_runtime_seconds']):.1f}s",
+        f"- Total solver: {_safe_float(summary['total_runtime_seconds']):.1f}s",
+        f"- Wall time: {runtime_breakdown.get('pipeline_wall_seconds', 0):.1f}s",
         "",
-        "## File Map",
+        "## Files & Charts",
         "",
-        "Open these first for reporting:",
+        "**Key reporting files:**",
         "| File | Description |",
         "|------|-------------|",
-        "| `thesis_summary/phase_comparison.csv` | Phase-by-phase headline KPIs |",
-        "| `thesis_summary/effectiveness_report.csv` | One-file scoreboard: costs + metrics + runtimes |",
-        "| `thesis_summary/runtime_breakdown.json` | Constructive vs GA+SA vs wall time |",
-        "| `run_manifest.json` | Structured index of all artifacts |",
+        "| `thesis_summary/phase_comparison.csv` | Phase KPIs |",
+        "| `thesis_summary/effectiveness_report.csv` | One-file scoreboard |",
+        "| `charts/ga_sa_improvement_history.png` | GA+SA convergence chart |",
+        "| `run_manifest.json` | Artifact index |",
         "",
-        "Stage folders:",
+        "**By stage:**",
         "| Folder | Contents |",
         "|--------|----------|",
-        "| `achamrah_matheuristic/` | Per-stage solver artifacts (routes, LT plan, inventory, comparison) |",
-        "| `thesis_summary/` | Aggregated reporting files |",
+        "| `achamrah_matheuristic/` | Routes, LT plan, inventory, comparison |",
+        "| `thesis_summary/` | Aggregated metrics & reports |",
+        "| `charts/` | Performance visualizations |",
         "",
     ]
     (results_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
@@ -558,14 +577,18 @@ def print_thesis_summary_files(results_dir: Path) -> None:
     thesis_summary_files = [
         ("README.md",                               "Human-readable results directory map"),
         ("thesis_summary/phase_comparison.csv",     "Phase-by-phase headline KPIs"),
-        ("thesis_summary/effectiveness_report.csv", "One-file scoreboard: costs + GNN metrics + runtimes"),
+        ("thesis_summary/effectiveness_report.csv", "One-file scoreboard: costs + metrics + runtimes"),
         ("thesis_summary/runtime_breakdown.json",   "Constructive vs GA+SA vs wall time"),
+        ("charts/ga_sa_improvement_history.png",    "GA+SA convergence & temperature schedule"),
         ("run_manifest.json",                       "Structured index of all artifacts"),
     ]
     print("\n[Thesis-summary files] — open these first for reporting")
     for rel, desc in thesis_summary_files:
         p = results_dir / rel
-        status = f"{p.stat().st_size / 1024:>8.1f} KB" if p.exists() else "  (missing)"
+        if p.exists():
+            status = f"{p.stat().st_size / 1024:>8.1f} KB"
+        else:
+            status = "  (missing)"
         print(f"  {rel:<48s}  {status}   {desc}")
 
 
@@ -577,7 +600,7 @@ def print_results_tree(results_dir: Path) -> None:
         for p in sorted(root_files):
             print(f"    {p.name:<70s}  {p.stat().st_size / 1024:>7.1f} KB")
 
-    stage_dirs = ["achamrah_matheuristic", "thesis_summary"]
+    stage_dirs = ["achamrah_matheuristic", "thesis_summary", "charts"]
     for stage in stage_dirs:
         d = results_dir / stage
         if not d.exists():
@@ -629,7 +652,7 @@ if __name__ == "__main__":
     write_readme(RESULTS_DIR, outputs, pipeline, runtime_breakdown)
 
     artifacts_by_stage: Dict[str, List[str]] = {}
-    for stage in ["achamrah_matheuristic", "thesis_summary"]:
+    for stage in ["achamrah_matheuristic", "thesis_summary", "charts"]:
         d = RESULTS_DIR / stage
         if d.exists():
             artifacts_by_stage[stage] = sorted(
@@ -640,8 +663,61 @@ if __name__ == "__main__":
 
     # --- Step 5: display results ---
     from achamrah_2022_thesis_format_wrapper import print_lt_plan
+    import matplotlib.pyplot as plt
 
     summary = outputs["summary"]
+    result = outputs["result"]
+
+    # Build cost summary table
+    breakdown = summary["objective_breakdown"]
+    cost_data = [
+        ("Holding (inventory)", f"{breakdown.get('holding_cost', 0):.2f}", f"{100 * breakdown.get('holding_cost', 0) / max(1, summary['best_objective']):.1f}%"),
+        ("Routing (vehicles)", f"{breakdown.get('routing_cost', 0):.2f}", f"{100 * breakdown.get('routing_cost', 0) / max(1, summary['best_objective']):.1f}%"),
+        ("Transshipment (LT)", f"{breakdown.get('transshipment_cost', 0):.2f}", f"{100 * breakdown.get('transshipment_cost', 0) / max(1, summary['best_objective']):.1f}%"),
+        ("Shortage (lost sales)", f"{breakdown.get('shortage_cost', 0):.2f}", f"{100 * breakdown.get('shortage_cost', 0) / max(1, summary['best_objective']):.1f}%"),
+        ("TOTAL", f"{summary['best_objective']:.2f}", "100.0%"),
+    ]
+    cost_summary = pd.DataFrame(cost_data, columns=["Cost Component", "Amount", "% of Total"])
+
+    # GA/SA improvement chart
+    if result is not None and result.history:
+        temps, objs = zip(*result.history)
+        temps = list(temps)
+        objs = list(objs)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Left: Temperature vs Objective (improvement trajectory)
+        ax1.plot(range(len(temps)), objs, 'b-o', linewidth=2, markersize=4, label='Best objective')
+        ax1.axhline(y=summary.get('constructive_objective', 0), color='r', linestyle='--',
+                   linewidth=2, label='Constructive phase')
+        ax1.set_xlabel("SA Step", fontsize=11, fontweight='bold')
+        ax1.set_ylabel("Objective (cost)", fontsize=11, fontweight='bold')
+        ax1.set_title("GA+SA Improvement History", fontsize=12, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(fontsize=10)
+
+        # Right: Temperature schedule
+        ax2_twin = ax2.twinx()
+        ax2.plot(range(len(temps)), objs, 'b-o', linewidth=2, markersize=4, label='Objective')
+        ax2_twin.plot(range(len(temps)), temps, 'r-s', linewidth=2, markersize=4, label='Temperature')
+        ax2.set_xlabel("SA Step", fontsize=11, fontweight='bold')
+        ax2.set_ylabel("Objective (cost)", fontsize=11, fontweight='bold', color='b')
+        ax2_twin.set_ylabel("Temperature", fontsize=11, fontweight='bold', color='r')
+        ax2.set_title("Temperature Schedule & Objective", fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.tick_params(axis='y', labelcolor='b')
+        ax2_twin.tick_params(axis='y', labelcolor='r')
+        lines1, labels1 = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_twin.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='upper right')
+
+        plt.tight_layout()
+        chart_path = RESULTS_DIR / "charts"
+        chart_path.mkdir(parents=True, exist_ok=True)
+        plt.savefig(chart_path / "ga_sa_improvement_history.png", dpi=150, bbox_inches='tight')
+        print(f"[Chart] saved ga_sa_improvement_history.png")
+        plt.show()
 
     print("\n" + "=" * 70)
     print("ACHAMRAH 2022 IRP-T MATHEURISTIC — RESULTS")
@@ -662,11 +738,19 @@ if __name__ == "__main__":
     print(f"  Total runtime           : {summary['total_runtime_seconds']:.1f}s")
     print(f"  Wall time               : {wall_seconds:.1f}s")
 
-    print("\nObjective breakdown:")
-    pprint.pprint(summary["objective_breakdown"])
+    print("\n" + "-" * 70)
+    print("COST BREAKDOWN")
+    print("-" * 70)
+    show_df("Cost Summary", cost_summary)
 
-    print("\nValidation metrics:")
-    pprint.pprint(summary["validation_metrics"])
+    print("\n" + "-" * 70)
+    print("VALIDATION METRICS")
+    print("-" * 70)
+    metrics_df = pd.DataFrame([summary["validation_metrics"]])
+    show_df("Metrics (MAE/RMSE/MAPE/Bias)", metrics_df)
+
+    print("\nFull objective breakdown:")
+    pprint.pprint(summary["objective_breakdown"])
 
     show_df("Phase Comparison", phase_comparison_df)
     show_df("Effectiveness Report", effectiveness_df)

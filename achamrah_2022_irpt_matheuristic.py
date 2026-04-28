@@ -461,11 +461,17 @@ class AchamrahIRPTSolver:
         allow_lateral_transshipment: bool = True,
         model_name: str = "IRPT",
     ) -> SolveArtifacts:
+        # Disable O(H²) valid_20 automatically when H is large to avoid OOM.
+        # The paper was calibrated on 4-8 period instances; beyond ~20 periods
+        # the constraint set grows quadratically and dominates memory.
+        n_periods = len(self.inst.H)
+        use_v20 = n_periods <= 20
         m, vars_dict = self.build_model(
             relaxed=relaxed,
             fixed_routes=fixed_routes,
             active_nodes_by_period=active_nodes_by_period,
             allow_lateral_transshipment=allow_lateral_transshipment,
+            use_valid_20=use_v20,
             model_name=model_name,
         )
         if time_limit is not None:

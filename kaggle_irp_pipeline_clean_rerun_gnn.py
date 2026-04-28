@@ -59,7 +59,7 @@ MASTER_SEED = 42
 # Remove store / SKU / date slicing so Phase 1 and Phase 2 run on the full
 # provided CSVs. This is the "full model with full dataset" configuration.
 STORE_LIMIT: Optional[int] = None
-SKU_LIMIT:   Optional[int] = None
+SKU_LIMIT:   Optional[int] = 5
 TRAIN_START_DATE: Optional[str] = None
 TRAIN_END_DATE:   Optional[str] = None
 TEST_START_DATE:  Optional[str] = None
@@ -80,6 +80,23 @@ BP_MAX_DEPTH     = 8
 PHASE1_BASELINE_ALNS_TIME_LIMIT = int(os.environ.get("IRP_PHASE1_BASELINE_ALNS_TIME_LIMIT", "900"))
 GNN_TRAIN_EPOCHS = int(os.environ.get("IRP_GNN_TRAIN_EPOCHS", "100"))
 LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
+
+# ── Step 7b trainer selection ─────────────────────────────
+# When True (default), Step 7b trains BiGAT directly from the aggregate teacher
+# CSV via GNN/train_bipat_from_aggregate.py — this re-uses the existing teacher
+# data (no re-running of CG) and uses controlled dynamic sampling +
+# curriculum. When False, falls back to the legacy GNN/03_train_bigat.py path
+# that consumes pre-built .pkl graph samples from Step 7a.
+USE_AGGREGATE_TRAINER = os.environ.get("IRP_USE_AGGREGATE_TRAINER", "1").lower() in {"1", "true", "yes"}
+AGG_TRAIN_ROWS_PER_EPOCH         = int(os.environ.get("IRP_AGG_ROWS_PER_EPOCH", "5000"))
+AGG_TRAIN_VALID_ROWS_PER_EPOCH   = int(os.environ.get("IRP_AGG_VALID_ROWS_PER_EPOCH", "2000"))
+AGG_TRAIN_MAX_ROWS_PER_INSTANCE  = int(os.environ.get("IRP_AGG_MAX_ROWS_PER_INSTANCE", "200"))
+AGG_TRAIN_BATCH_SIZE             = int(os.environ.get("IRP_AGG_BATCH_SIZE", "128"))
+AGG_TRAIN_LR                     = float(os.environ.get("IRP_AGG_LR", "5e-4"))
+AGG_TRAIN_WEIGHT_DECAY           = float(os.environ.get("IRP_AGG_WEIGHT_DECAY", "1e-4"))
+AGG_TRAIN_PATIENCE               = int(os.environ.get("IRP_AGG_PATIENCE", "20"))
+AGG_TRAIN_FULL_VALID_EVERY       = int(os.environ.get("IRP_AGG_FULL_VALID_EVERY", "10"))
+AGG_TRAIN_OUT_DIRNAME            = os.environ.get("IRP_AGG_OUT_DIRNAME", "gnn_training")
 
 
 # ── Teacher / scenario generation ────────────────────────
@@ -767,6 +784,10 @@ print(f"  cg_iterations={CG_ITERATIONS}  bp_nodes={BP_MAX_NODES}  bp_depth={BP_M
 print(f"  phase1_baseline_alns_time_limit={PHASE1_BASELINE_ALNS_TIME_LIMIT}s")
 print(f"  run_phase1_canonical_solve={RUN_PHASE1_CANONICAL_SOLVE}")
 print(f"  gnn_epochs={GNN_TRAIN_EPOCHS}  scenarios_per_base={SCENARIOS_PER_BASE}  benchmark_repeats={BENCHMARK_N_REPEATS}")
+print(f"  use_aggregate_trainer={USE_AGGREGATE_TRAINER}  "
+      f"agg_rows/epoch={AGG_TRAIN_ROWS_PER_EPOCH}  agg_valid_rows/epoch={AGG_TRAIN_VALID_ROWS_PER_EPOCH}  "
+      f"agg_max_rows/source={AGG_TRAIN_MAX_ROWS_PER_INSTANCE}  agg_full_valid_every={AGG_TRAIN_FULL_VALID_EVERY}  "
+      f"agg_lr={AGG_TRAIN_LR}  agg_patience={AGG_TRAIN_PATIENCE}")
 print(f"  lt_min_units={LT_MIN_UNITS}  integer_outputs={INTEGER_FINAL_OUTPUTS}  benchmark_fixed_shock={BENCHMARK_FIXED_SHOCK}")
 print(f"  resume_existing_run={RESUME_EXISTING_RUN}  refresh_working_repo={REFRESH_WORKING_REPO}")
 print(f"  clear_results_dir={CLEAR_RESULTS_DIR}  reuse_existing_checkpoint={REUSE_EXISTING_CHECKPOINT}")
@@ -1071,29 +1092,92 @@ else:
         )
 
     # -- 7b: Train BiGAT -----------------------------------------------------------
-    print(f"\n[Step 7b] Training BiGAT  epochs={GNN_TRAIN_EPOCHS}, objective=pairwise_rank...")
-    train_cmd = [
-        sys.executable, "-u", "GNN/03_train_bigat.py",
-        "--data-dir",     str(graph_dir),
-        "--dataset-type", "teacher",
-        "--epochs",       str(GNN_TRAIN_EPOCHS),
-        "--patience",     str(GNN_TRAIN_EPOCHS),   # rely on MRR early-stopping
-        "--objective",    "pairwise_rank",
-        "--auto-resume",
-    ]
+    # Two trainer paths:
+    #   (a) USE_AGGREGATE_TRAINER=True  → GNN/train_bipat_from_aggregate.py
+    #       trains directly from aggregate_teacher_rows.csv with controlled
+    #       sampling + curriculum (5,000 rows/epoch). Outputs go to
+    #       Results/<AGG_TRAIN_OUT_DIRNAME>/. After training we copy the best
+    #       checkpoint to DEFAULT_GNN_CHECKPOINT so downstream stages (offline
+    #       test, Phase 2 inference, benchmark) keep working unchanged.
+    #   (b) USE_AGGREGATE_TRAINER=False → legacy GNN/03_train_bigat.py path
+    #       consuming the .pkl graph dataset built in Step 7a.
+    if USE_AGGREGATE_TRAINER:
+        agg_out_dir = RESULTS_DIR / AGG_TRAIN_OUT_DIRNAME
+        agg_teacher_csv = Path(TEACHER_SCENARIO_OUT_DIR) / "aggregate_teacher_rows.csv"
+        agg_manifest = Path(TEACHER_SCENARIO_OUT_DIR) / "scenarios_manifest.json"
+        if not agg_teacher_csv.exists() or not agg_manifest.exists():
+            print(f"[Step 7b] aggregate trainer requested but inputs missing: "
+                  f"csv={agg_teacher_csv.exists()} manifest={agg_manifest.exists()}; "
+                  f"falling back to legacy GNN/03_train_bigat.py.")
+            _use_aggregate = False
+        else:
+            _use_aggregate = True
+        print(f"\n[Step 7b] Training BiGAT  epochs={GNN_TRAIN_EPOCHS}, "
+              f"trainer={'aggregate' if _use_aggregate else 'legacy_pairwise_rank'}...")
+        if _use_aggregate:
+            train_cmd = [
+                sys.executable, "-u", "GNN/train_bipat_from_aggregate.py",
+                "--teacher-csv",                      str(agg_teacher_csv),
+                "--manifest",                         str(agg_manifest),
+                "--out-dir",                          str(agg_out_dir),
+                "--rows-per-epoch",                   str(AGG_TRAIN_ROWS_PER_EPOCH),
+                "--valid-rows-per-epoch",             str(AGG_TRAIN_VALID_ROWS_PER_EPOCH),
+                "--max-rows-per-source-instance-per-epoch", str(AGG_TRAIN_MAX_ROWS_PER_INSTANCE),
+                "--max-epochs",                       str(GNN_TRAIN_EPOCHS),
+                "--batch-size",                       str(AGG_TRAIN_BATCH_SIZE),
+                "--lr",                               str(AGG_TRAIN_LR),
+                "--weight-decay",                     str(AGG_TRAIN_WEIGHT_DECAY),
+                "--early-stopping-patience",          str(AGG_TRAIN_PATIENCE),
+                "--full-valid-every",                 str(AGG_TRAIN_FULL_VALID_EVERY),
+                "--seed",                             str(MASTER_SEED),
+            ]
+        else:
+            train_cmd = [
+                sys.executable, "-u", "GNN/03_train_bigat.py",
+                "--data-dir",     str(graph_dir),
+                "--dataset-type", "teacher",
+                "--epochs",       str(GNN_TRAIN_EPOCHS),
+                "--patience",     str(GNN_TRAIN_EPOCHS),
+                "--objective",    "pairwise_rank",
+                "--auto-resume",
+            ]
+    else:
+        _use_aggregate = False
+        print(f"\n[Step 7b] Training BiGAT  epochs={GNN_TRAIN_EPOCHS}, "
+              f"trainer=legacy_pairwise_rank...")
+        train_cmd = [
+            sys.executable, "-u", "GNN/03_train_bigat.py",
+            "--data-dir",     str(graph_dir),
+            "--dataset-type", "teacher",
+            "--epochs",       str(GNN_TRAIN_EPOCHS),
+            "--patience",     str(GNN_TRAIN_EPOCHS),   # rely on MRR early-stopping
+            "--objective",    "pairwise_rank",
+            "--auto-resume",
+        ]
     if FRESH_GNN_TRAINING:
         train_cmd = [arg for arg in train_cmd if arg != "--auto-resume"]
-        for artifact_name in [
+        legacy_artifacts = [
             "best_model.pt",
             "last_model.pt",
             "training_history.json",
             "training_summary.json",
             "training_loss_curve.png",
-        ]:
+        ]
+        for artifact_name in legacy_artifacts:
             artifact_path = checkpoint.parent / artifact_name
             if artifact_path.exists():
                 artifact_path.unlink()
-                print(f"[gnn_training] removed stale artifact for fresh training: {artifact_path}")
+                print(f"[gnn_training] removed stale legacy artifact: {artifact_path}")
+        if _use_aggregate:
+            for artifact_name in [
+                "best_valid_loss.pt", "best_valid_prauc.pt", "last.pt",
+                "training_log.csv", "sampling_log.csv", "split_summary.csv",
+                "config.json", "final_test_metrics.json",
+            ]:
+                artifact_path = (RESULTS_DIR / AGG_TRAIN_OUT_DIRNAME) / artifact_name
+                if artifact_path.exists():
+                    artifact_path.unlink()
+                    print(f"[gnn_training] removed stale aggregate artifact: {artifact_path}")
     # Skip retraining if a reusable checkpoint already exists. `run_state` is still
     # honored when present, but the checkpoint file itself is the stronger signal:
     # it lets later Kaggle runs reuse the model even if run_state.json is missing.
@@ -1119,6 +1203,35 @@ else:
         else:
             print(f"[WARNING] BiGAT training exited with code {rc_train} — will retry on next run")
             RUN_STATE.update("gnn_training", returncode=rc_train, partial_ok=True)
+
+    # When the aggregate trainer was used, mirror its best checkpoint to the
+    # repo-default path so downstream stages (offline test, Phase 2 inference,
+    # benchmark variant C) load the new GNN automatically.
+    if USE_AGGREGATE_TRAINER and _use_aggregate:
+        agg_out_dir = RESULTS_DIR / AGG_TRAIN_OUT_DIRNAME
+        candidates = [agg_out_dir / "best_valid_prauc.pt",
+                      agg_out_dir / "best_valid_loss.pt",
+                      agg_out_dir / "last.pt"]
+        agg_best = next((p for p in candidates if p.exists()), None)
+        if agg_best is not None:
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(agg_best, checkpoint)
+            print(f"[gnn_training] mirrored aggregate checkpoint {agg_best.name} → {checkpoint}")
+            # Also mirror history + final-test metrics under Results/gnn/
+            gnn_dir.mkdir(parents=True, exist_ok=True)
+            for src_name, dst_name in [
+                ("training_log.csv",         "training_history.csv"),
+                ("final_test_metrics.json",  "training_summary.json"),
+                ("sampling_log.csv",         "sampling_log.csv"),
+                ("split_summary.csv",        "split_summary.csv"),
+                ("config.json",              "training_config.json"),
+            ]:
+                src = agg_out_dir / src_name
+                if src.exists():
+                    shutil.copy2(src, gnn_dir / dst_name)
+        else:
+            print(f"[gnn_training] WARNING: aggregate trainer ran but no best/last "
+                  f"checkpoint found under {agg_out_dir}")
 
     gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
     pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
