@@ -25,21 +25,22 @@ from gurobipy import GRB
 from achamrah_2022_irpt_matheuristic import (
     IRPTInstance,
     AchamrahIRPTSolver,
-    SolveArtifacts,
 )
+
+from dataclasses import field as _field
 
 
 @dataclass
-class ExtendedSolveArtifacts(SolveArtifacts):
-    """Extended solve artifacts with cost breakdown and LT tracking."""
-    cost_breakdown: Dict[str, float] = None
-    lt_moves: List[Dict[str, Any]] = None
-    
-    def __post_init__(self):
-        if self.cost_breakdown is None:
-            self.cost_breakdown = {}
-        if self.lt_moves is None:
-            self.lt_moves = []
+class ExtendedSolveArtifacts:
+    """Solve artifacts for the direct MIP solve (not the matheuristic)."""
+    objective: float
+    status: int
+    runtime: float
+    mip_gap: float
+    num_vars: int
+    num_constrs: int
+    cost_breakdown: Dict[str, float] = _field(default_factory=dict)
+    lt_moves: List[Dict[str, Any]] = _field(default_factory=list)
 
 
 class AchamrahIntegratedExtendedSolver(AchamrahIRPTSolver):
