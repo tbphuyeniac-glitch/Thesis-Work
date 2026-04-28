@@ -1045,52 +1045,60 @@ if (CHECKPOINT_BENCHMARK_C_ONLY or CHECKPOINT_BENCHMARK_A0_ONLY or BENCHMARK_CG_
     offline_gnn_test_wall_seconds: Optional[float] = None
 else:
     # -- 7a: Build graph dataset ---------------------------------------------------
-    print("\n[Step 7a] Building teacher graph dataset...")
-    _graph_build_kwargs = dict(
-        teacher_csv_path=str(teacher_csv_path),
-        build_graphs=True,
-        train_gnn=False,
-        checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
-        run_offline_test=False,
-    )
-    if "max_skip_ratio" in inspect.signature(irp.run_teacher_graph_and_gnn_training).parameters:
-        _graph_build_kwargs["max_skip_ratio"] = TEACHER_GRAPH_MAX_SKIP_RATIO
+    # Skipped when using aggregate trainer — it builds in-memory graphs from the
+    # aggregate CSV directly and does not need pre-built .pkl samples on disk.
+    if USE_AGGREGATE_TRAINER:
+        print("\n[Step 7a] Skipped — aggregate trainer builds graphs in-memory from CSV.")
+        train_samples = []
+        valid_samples = []
+        test_samples  = []
     else:
-        print("[Step 7a] irp.run_teacher_graph_and_gnn_training does not support max_skip_ratio; using repo default.")
-    build_result = irp.run_teacher_graph_and_gnn_training(**_graph_build_kwargs)
-
-    # Report split sizes
-    for split in ["train", "valid", "test"]:
-        split_dir = graph_dir / split
-        n = len(list(split_dir.glob("*.pkl"))) if split_dir.exists() else 0
-        print(f"  {split:<6} samples : {n}")
-
-    if (graph_dir / "dataset_summary.json").exists():
-        with open(graph_dir / "dataset_summary.json") as f:
-            ds_summary = json.load(f)
-        show_json("Graph Dataset Summary", ds_summary)
-        graphs_dir = RESULTS_DIR / "graphs"
-        graphs_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(graph_dir / "dataset_summary.json", graphs_dir / "graph_dataset_summary.json")
-
-    train_samples = list((graph_dir / "train").glob("*.pkl")) if (graph_dir / "train").exists() else []
-    valid_samples = list((graph_dir / "valid").glob("*.pkl")) if (graph_dir / "valid").exists() else []
-    test_samples  = list((graph_dir / "test").glob("*.pkl"))  if (graph_dir / "test").exists()  else []
-
-    if not train_samples:
-        raise RuntimeError(
-            "No training graph samples built. Check that teacher CSV has "
-            "constraint_features_json populated for at least one group."
+        print("\n[Step 7a] Building teacher graph dataset...")
+        _graph_build_kwargs = dict(
+            teacher_csv_path=str(teacher_csv_path),
+            build_graphs=True,
+            train_gnn=False,
+            checkpoint_path=irp.DEFAULT_GNN_CHECKPOINT,
+            run_offline_test=False,
         )
-    if not valid_samples:
-        raise RuntimeError(
-            "No validation graph samples built. Need ≥ 2 distinct source_instance values. "
-            "Increase BASE_SPECS or SCENARIOS_PER_BASE."
-        )
-    if not test_samples:
-        raise RuntimeError(
-            "No held-out test graph samples built. Final run requires a non-empty test split. "
-            "Increase BASE_SPECS / SCENARIOS_PER_BASE or inspect source_instance diversity."
+        if "max_skip_ratio" in inspect.signature(irp.run_teacher_graph_and_gnn_training).parameters:
+            _graph_build_kwargs["max_skip_ratio"] = TEACHER_GRAPH_MAX_SKIP_RATIO
+        else:
+            print("[Step 7a] irp.run_teacher_graph_and_gnn_training does not support max_skip_ratio; using repo default.")
+        build_result = irp.run_teacher_graph_and_gnn_training(**_graph_build_kwargs)
+
+        # Report split sizes
+        for split in ["train", "valid", "test"]:
+            split_dir = graph_dir / split
+            n = len(list(split_dir.glob("*.pkl"))) if split_dir.exists() else 0
+            print(f"  {split:<6} samples : {n}")
+
+        if (graph_dir / "dataset_summary.json").exists():
+            with open(graph_dir / "dataset_summary.json") as f:
+                ds_summary = json.load(f)
+            show_json("Graph Dataset Summary", ds_summary)
+            graphs_dir = RESULTS_DIR / "graphs"
+            graphs_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(graph_dir / "dataset_summary.json", graphs_dir / "graph_dataset_summary.json")
+
+        train_samples = list((graph_dir / "train").glob("*.pkl")) if (graph_dir / "train").exists() else []
+        valid_samples = list((graph_dir / "valid").glob("*.pkl")) if (graph_dir / "valid").exists() else []
+        test_samples  = list((graph_dir / "test").glob("*.pkl"))  if (graph_dir / "test").exists()  else []
+
+        if not train_samples:
+            raise RuntimeError(
+                "No training graph samples built. Check that teacher CSV has "
+                "constraint_features_json populated for at least one group."
+            )
+        if not valid_samples:
+            raise RuntimeError(
+                "No validation graph samples built. Need ≥ 2 distinct source_instance values. "
+                "Increase BASE_SPECS or SCENARIOS_PER_BASE."
+            )
+        if not test_samples:
+            raise RuntimeError(
+                "No held-out test graph samples built. Final run requires a non-empty test split. "
+                "Increase BASE_SPECS / SCENARIOS_PER_BASE or inspect source_instance diversity."
         )
 
     # -- 7b: Train BiGAT -----------------------------------------------------------
