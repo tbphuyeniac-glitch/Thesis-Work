@@ -334,7 +334,9 @@ if CHECKPOINT_BENCHMARK_A0_ONLY:
     RUN_PHASE_2 = False
 if BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE:
     FORCE_GNN_RETRAIN = False
-    FRESH_GNN_TRAINING = False
+    # Respect explicit IRP_FRESH_GNN_TRAINING=1 — only override if user did not set it
+    if os.environ.get("IRP_FRESH_GNN_TRAINING", "0").strip().lower() not in {"1", "true", "yes"}:
+        FRESH_GNN_TRAINING = False
     FORCE_RERUN_OFFLINE_GNN_TEST = False
     FORCE_RERUN_PHASE2 = False
     FORCE_RERUN_BENCHMARK = True
