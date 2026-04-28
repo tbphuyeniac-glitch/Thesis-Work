@@ -1137,9 +1137,8 @@ else:
                 "--batch-size",                       str(AGG_TRAIN_BATCH_SIZE),
                 "--lr",                               str(AGG_TRAIN_LR),
                 "--weight-decay",                     str(AGG_TRAIN_WEIGHT_DECAY),
-                "--early-stopping-patience",          str(AGG_TRAIN_PATIENCE),
+                "--early-stopping-patience",          str(GNN_TRAIN_EPOCHS + 9999),
                 "--full-valid-every",                 str(AGG_TRAIN_FULL_VALID_EVERY),
-                "--disable-early-stopping",
                 "--seed",                             str(MASTER_SEED),
             ]
         else:
