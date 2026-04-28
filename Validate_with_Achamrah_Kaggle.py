@@ -772,8 +772,18 @@ class AchamrahRunner:
         f_cost = {(p, i): SHORTAGE_COST_RATE for p in P for i in N}
         f_cost.update({(p, 0): 0.0 for p in P})
         b_cost = {(i, j): LT_COST_FLAT for i in N for j in N if i != j}
-        C_cap  = {i: 1000.0 for i in N}
-        C_cap[0] = 100000.0
+
+        # Storage capacities: size from data so the constraint never spuriously
+        # binds. Stores: 5× initial inventory + buffer for LT/delivery inflows.
+        # Warehouse: must absorb g_rep[(p,t)] inflows across the horizon, since
+        # Qdir is bounded by V*Q per period (~1000) << g (~100000). Set to a
+        # large constant so the CW balance + capacity is always feasible.
+        C_cap = {}
+        for i in N:
+            init_total_i = sum(I0.get((p, i), 0.0) for p in P)
+            C_cap[i] = max(10000.0, init_total_i * 5.0 + 5000.0)
+        C_cap[0] = 1e12   # warehouse: effectively unbounded
+
         g_rep  = {(p, t): 100000.0 for p in P for t in H}
 
         instance = IRPTInstance(
