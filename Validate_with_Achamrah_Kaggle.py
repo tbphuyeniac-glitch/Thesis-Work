@@ -533,6 +533,18 @@ class ThesisCRunner:
                 lt_ship_cost_flat=LT_COST_FLAT,
                 distance_matrix_path=dist_path,
             )
+            # ── Cost normalisation for fair comparison with Achamrah ──────
+            # Achamrah's model has no per-unit CW shipping cost, no vehicle
+            # fixed cost, no warehouse holding cost, and uses flat unit rates
+            # for holding/shortage (not price-scaled). Override to match.
+            for s in data.stores:
+                for p in data.products:
+                    data.holding_cost_store[(s, p)] = HOLDING_COST_RATE
+                    data.shortage_cost[(s, p)]       = SHORTAGE_COST_RATE
+                    data.ship_cost_cw[(s, p)]        = 0.0
+            for p in data.products:
+                data.holding_cost_wh[p] = 0.0
+            data.vehicle_fixed_cost = 0.0
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
@@ -569,6 +581,10 @@ class ThesisCRunner:
 
                 # Build IRPData
                 data = self._build_irp_data(scenario, df_slice, dist_dict)
+
+                # Demand shock disabled — realized demand equals forecast demand.
+                # This ensures both methods face identical deterministic demand.
+                data.realized_demand = dict(data.demand)
 
                 # Run ALNS baseline
                 baseline_sol = irp.BaselineALNSModel(data).solve(
@@ -699,9 +715,9 @@ class AchamrahRunner:
         self.mip_gap            = mip_gap
         self.threads            = threads
         self.source_name = (
-            "Achamrah_Original_Integrated"
+            "Achamrah_Matheuristic_VehicleLT"
             if vehicle_indexed_lt
-            else "Achamrah_Integrated_Simplified_LT"
+            else "Achamrah_Matheuristic_SimplifiedLT"
         )
 
     def _build_achamrah_instance(
@@ -807,7 +823,11 @@ class AchamrahRunner:
         lt_moves_out: List[Dict] = []
 
         try:
+            from achamrah_2022_irpt_matheuristic import (
+                AchamrahIRPTSolver, HeuristicParams,
+            )
             from achamrah_integrated_extended_solver import AchamrahIntegratedExtendedSolver
+            from gurobipy import GRB
 
             instance, store_to_id, sku_to_id, periods_dt = self._build_achamrah_instance(
                 scenario, df_slice, dist_dict
@@ -815,28 +835,49 @@ class AchamrahRunner:
             id_to_store = {v: k for k, v in store_to_id.items()}
             id_to_sku   = {v: k for k, v in sku_to_id.items()}
 
-            solver = AchamrahIntegratedExtendedSolver(
+            # ── Phase 1+2: run the real Achamrah 2022 matheuristic ────────
+            # Constructive phase: RMILP → cluster MILPs → initial routes
+            # Improvement phase:  GA+SA hybrid, each candidate evaluated by FMILP
+            params = HeuristicParams(
+                full_time_limit=float(self.time_limit),
+                constructive_time_limit=float(self.time_limit) * 0.25,
+                improvement_time_limit=float(self.time_limit) * 0.75,
+                rmilp_mipgap=self.mip_gap,
+                cluster_mipgap=self.mip_gap,
+                fmilp_mipgap=self.mip_gap,
+            )
+            math_solver = AchamrahIRPTSolver(instance, params=params)
+            math_result = math_solver.solve_full_matheuristic()
+
+            best_routes = math_result.best_routes
+
+            # ── Phase 3: evaluate best routes with extended solver ────────
+            # Re-solve the FMILP with best_routes fixed to extract cost
+            # breakdown and LT moves (using simplified LT mode for thesis match).
+            eval_solver = AchamrahIntegratedExtendedSolver(
                 instance,
                 vehicle_indexed_lt=self.vehicle_indexed_lt,
             )
-            artifacts = solver.solve_model(
-                time_limit=float(self.time_limit),
+            artifacts = eval_solver.solve_model(
+                time_limit=max(120.0, float(self.time_limit) * 0.15),
                 mip_gap=self.mip_gap,
                 allow_lateral_transshipment=True,
+                fixed_routes=best_routes,
             )
 
             runtime = time.time() - t0
 
-            # Determine status from Gurobi status codes
-            from gurobipy import GRB
-            if artifacts.status == GRB.OPTIMAL:
+            # Status: if matheuristic produced a solution use it; otherwise
+            # fall back to the evaluation solve status.
+            math_obj = math_result.best_objective
+            if math.isfinite(math_obj):
+                status = "success"
+            elif artifacts.status == GRB.OPTIMAL:
                 status = "success"
             elif artifacts.status == GRB.TIME_LIMIT and not math.isinf(artifacts.objective):
-                status = "success"   # feasible incumbent within time limit
+                status = "success"
             elif artifacts.status == GRB.TIME_LIMIT:
                 status = "timeout"
-            elif artifacts.status == GRB.INFEASIBLE:
-                status = "failed"
             else:
                 status = "failed"
 
@@ -847,7 +888,8 @@ class AchamrahRunner:
             holding_cost      = cb.get("holding",  0.0)
             shortage_cost     = cb.get("shortage", 0.0)
             lt_cost           = cb.get("lt",       0.0)
-            total_cost        = cb.get("total",    artifacts.objective)
+            # Prefer matheuristic objective (from GA+SA); fall back to eval
+            total_cost = math_obj if math.isfinite(math_obj) else cb.get("total", artifacts.objective)
 
             # Compute shortage qty from raw model output
             lt_moves_raw = artifacts.lt_moves or []
