@@ -62,9 +62,14 @@ ALLOW_GNN_FALLBACK: bool = (
 VEHICLE_COUNT:    int   = 2
 VEHICLE_CAPACITY: float = 500.0
 
-# Cost parameters — must be IDENTICAL for both methods
-HOLDING_COST_RATE:   float = 0.01
-SHORTAGE_COST_RATE:  float = 0.25
+# Cost parameters — must be IDENTICAL for both methods.
+# CRITICAL: shortage_cost MUST exceed LT_COST_FLAT (0.6) for LT to be
+# beneficial. With shortage < LT cost, CG finds zero improving columns
+# (instant termination) and ALNS prefers shortages over deliveries.
+# Using shortage=2.0 and holding=0.1 ensures LT and deliveries are both
+# economically meaningful in the optimization.
+HOLDING_COST_RATE:   float = 0.1
+SHORTAGE_COST_RATE:  float = 2.0
 LT_COST_FLAT:        float = 0.6
 ROUTING_ALPHA:       float = 1.0
 
@@ -534,13 +539,14 @@ class ThesisCRunner:
                 distance_matrix_path=dist_path,
             )
             # ── Cost normalisation for fair comparison with Achamrah ──────
-            # Achamrah's model has no per-unit CW shipping cost, no vehicle
-            # fixed cost, no warehouse holding cost, and uses flat unit rates
-            # for holding/shortage (not price-scaled). Override to match.
+            # Achamrah has no CW shipping cost, no vehicle fixed cost, no
+            # warehouse holding cost, and uses flat unit rates. Override to
+            # match. shortage_cost=2.0 > LT_COST_FLAT=0.6 so LT is
+            # economically beneficial (saves 1.4/unit vs unmet shortage).
             for s in data.stores:
                 for p in data.products:
-                    data.holding_cost_store[(s, p)] = HOLDING_COST_RATE
-                    data.shortage_cost[(s, p)]       = SHORTAGE_COST_RATE
+                    data.holding_cost_store[(s, p)] = HOLDING_COST_RATE   # 0.1 flat
+                    data.shortage_cost[(s, p)]       = SHORTAGE_COST_RATE  # 2.0 flat
                     data.ship_cost_cw[(s, p)]        = 0.0
             for p in data.products:
                 data.holding_cost_wh[p] = 0.0
@@ -599,7 +605,10 @@ class ThesisCRunner:
                 os.environ["IRP_GNN_MIN_KEEP_FRAC"]   = "0.05"
                 os.environ["IRP_GNN_MAX_KEEP_FRAC"]   = "0.50"
 
-                # Run CG + GNN (variant C)
+                # Run CG + GNN (variant C).
+                # lt_activation_threshold=1.0 ensures CG activates even for
+                # small (≥1 unit) shortages; default 10.0 is too coarse for
+                # small scenarios.
                 pipeline = irp.IRPResearchPipeline(data)
                 results  = pipeline.run_lt_recourse_from_baseline(
                     baseline_sol,
@@ -614,6 +623,7 @@ class ThesisCRunner:
                     use_classical_fallback=False,
                     gnn_max_keep=100,
                     gnn_max_keep_fraction=0.50,
+                    lt_activation_threshold=1.0,
                 )
 
             runtime = time.time() - t0
@@ -624,12 +634,12 @@ class ThesisCRunner:
             realized_no_lt = results.get("realized_no_lt_cost_breakdown", {}) or {}
             cg_history = results.get("cg_episode_history") or results.get("cg_history", [])
 
-            total_cost   = float(realized.get("total_realized_operating_cost", float("nan")))
-            holding_cost = float(realized.get("holding_cost_realized", 0.0))
-            routing_cost = float(realized_no_lt.get("routing_cost_realized", 0.0))
-            lt_cost      = float(realized.get("lateral_transshipment_cost_realized", 0.0))
+            total_cost    = float(realized.get("total_realized_operating_cost", float("nan")))
+            holding_cost  = float(realized.get("store_holding_cost_realized", 0.0))
+            routing_cost  = float(realized_no_lt.get("route_distance_cost_executed_plan", 0.0))
+            lt_cost       = float(realized.get("lateral_transshipment_cost_realized", 0.0))
             shortage_cost = float(realized.get("shortage_cost_realized", 0.0))
-            shortage_qty = float(realized.get("shortage_qty_realized", 0.0))
+            shortage_qty  = float(realized.get("total_realized_shortage_units", 0.0))
 
             # Service level = 1 - shortage_qty / total_demand
             total_demand = float(realized.get("total_demand", 1.0)) or 1.0
@@ -648,6 +658,10 @@ class ThesisCRunner:
             n_cols_gen  = int(results.get("gnn_candidates_before", 0))
             n_cols_sel  = int(results.get("gnn_selected_columns", 0))
             n_cols_gen  = n_cols_gen or sum(int(ep.get("generated_columns", 0)) for ep in cg_history)
+
+            print(f"  [ThesisC breakdown] routing={routing_cost:.2f}  "
+                  f"holding={holding_cost:.2f}  shortage={shortage_cost:.2f}  "
+                  f"lt={lt_cost:.2f}  total={total_cost:.2f}")
 
             return ScenarioResult(
                 scenario_id=scenario.scenario_id,
@@ -921,6 +935,11 @@ class AchamrahRunner:
                     "vehicle": mv.get("vehicle", "N/A") or "N/A",
                     "achamrah_vehicle_indexed_lt": self.vehicle_indexed_lt,
                 })
+
+            if success:
+                print(f"  [Achamrah breakdown] routing={routing_cost:.2f}  "
+                      f"holding={holding_cost:.2f}  shortage={shortage_cost:.2f}  "
+                      f"lt={lt_cost:.2f}  total={total_cost:.2f}")
 
             result = ScenarioResult(
                 scenario_id=scenario.scenario_id,

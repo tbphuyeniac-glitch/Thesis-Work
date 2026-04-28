@@ -271,11 +271,11 @@ FORCE_RERUN_BENCHMARK = (
     not in {"0", "false", "no", ""}
 )
 BENCHMARK_C_ONLY = (
-    os.environ.get("IRP_BENCHMARK_C_ONLY", "0").strip().lower()
+    os.environ.get("IRP_BENCHMARK_C_ONLY", "1").strip().lower()
     not in {"0", "false", "no", ""}
 )
 BENCHMARK_A0_ONLY = (
-    os.environ.get("IRP_BENCHMARK_A0_ONLY", "0").strip().lower()
+    os.environ.get("IRP_BENCHMARK_A0_ONLY", "1").strip().lower()
     not in {"0", "false", "no", ""}
 )
 BENCHMARK_CG_ONLY_FROM_CACHE = (
@@ -2922,20 +2922,17 @@ def run_benchmark_a0_c_with_existing_rows(
     baseline_msg: bool,
     exact_pricing_time_limit: Optional[int],
 ) -> pd.DataFrame:
-    """Recompute benchmark A0 and C, preserving existing A/B rows."""
-    if not existing_per_run_path.exists():
-        raise FileNotFoundError(
-            f"A0+C benchmark needs existing A/B rows at {existing_per_run_path}"
-        )
-
-    existing_df = pd.read_csv(existing_per_run_path)
+    """Run benchmark A0 and C, optionally preserving existing A/B rows."""
+    existing_df = (
+        pd.read_csv(existing_per_run_path)
+        if existing_per_run_path.exists()
+        else pd.DataFrame()
+    )
     rerun_variants = {"A0_cg_full_exact", "C_gnn_guided_cg"}
-    keep_df = existing_df[~existing_df["variant"].astype(str).isin(rerun_variants)].copy()
-    if keep_df.empty:
-        raise RuntimeError(
-            "Existing benchmark CSV has no A/B rows to preserve. "
-            "Run a full A0/A/B/C benchmark once first."
-        )
+    if not existing_df.empty and "variant" in existing_df.columns:
+        keep_df = existing_df[~existing_df["variant"].astype(str).isin(rerun_variants)].copy()
+    else:
+        keep_df = pd.DataFrame()
 
     fixed_shock = os.environ.get("IRP_BENCHMARK_FIXED_SHOCK", "0").lower() not in {"0", "false", "no", ""}
     n_repeats = max(1, int(n_repeats))
@@ -2943,10 +2940,14 @@ def run_benchmark_a0_c_with_existing_rows(
         int(demand_shock_seed) + 10007 * r for r in range(n_repeats)
     ]
 
-    print("\n[Benchmark A0+C] Preserving existing A/B rows from:")
-    print(f"  {existing_per_run_path}")
-    print("[Benchmark A0+C] WARNING: existing benchmark artifacts do not contain serialized baseline/shock objects.")
-    print("  A/B will not rerun, but shared baseline must be solved once to recompute A0 and C correctly.")
+    print("\n[Benchmark A0+C] Running only A0_cg_full_exact and C_gnn_guided_cg.")
+    if keep_df.empty:
+        print("  No existing A/B rows found/preserved; output benchmark table will contain only A0 and C.")
+    else:
+        print("  Preserving existing A/B rows from:")
+        print(f"  {existing_per_run_path}")
+        print("[Benchmark A0+C] WARNING: existing benchmark artifacts do not contain serialized baseline/shock objects.")
+        print("  A/B will not rerun, but shared baseline must be solved once to recompute A0 and C correctly.")
     print(f"  baseline_time_limit={baseline_time_limit}s  baseline_msg={baseline_msg}")
     print(f"  exact_pricing_time_limit={exact_pricing_time_limit}")
 
@@ -3098,7 +3099,11 @@ def run_benchmark_a0_c_with_existing_rows(
 
     benchmark_dir = results_dir / "benchmark"
     benchmark_dir.mkdir(parents=True, exist_ok=True)
-    per_run_df = pd.concat([pd.DataFrame(rows), keep_df], ignore_index=True)
+    per_run_df = (
+        pd.concat([pd.DataFrame(rows), keep_df], ignore_index=True)
+        if not keep_df.empty
+        else pd.DataFrame(rows)
+    )
     if not per_run_df.empty and "variant" in per_run_df.columns:
         per_run_df["variant"] = pd.Categorical(
             per_run_df["variant"],
