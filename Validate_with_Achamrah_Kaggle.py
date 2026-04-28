@@ -24,7 +24,9 @@ Design:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import io
 import json
 import math
 import os
@@ -562,40 +564,41 @@ class ThesisCRunner:
             )
 
         try:
-            irp = self._load_irp()
+            with contextlib.redirect_stdout(io.StringIO()):
+                irp = self._load_irp()
 
-            # Build IRPData
-            data = self._build_irp_data(scenario, df_slice, dist_dict)
+                # Build IRPData
+                data = self._build_irp_data(scenario, df_slice, dist_dict)
 
-            # Run ALNS baseline
-            baseline_sol = irp.BaselineALNSModel(data).solve(
-                msg=False,
-                time_limit=max(60, self.time_limit // 4),
-                allow_lateral_transshipment=False,
-            )
+                # Run ALNS baseline
+                baseline_sol = irp.BaselineALNSModel(data).solve(
+                    msg=False,
+                    time_limit=max(60, self.time_limit // 4),
+                    allow_lateral_transshipment=False,
+                )
 
-            # Set env vars for GNN selection
-            os.environ["IRP_GNN_SELECTION_MODE"] = self.gnn_selection_mode
-            os.environ["IRP_GNN_MIN_KEEP"]        = "3"
-            os.environ["IRP_GNN_MIN_KEEP_FRAC"]   = "0.05"
-            os.environ["IRP_GNN_MAX_KEEP_FRAC"]   = "0.50"
+                # Set env vars for GNN selection
+                os.environ["IRP_GNN_SELECTION_MODE"] = self.gnn_selection_mode
+                os.environ["IRP_GNN_MIN_KEEP"]        = "3"
+                os.environ["IRP_GNN_MIN_KEEP_FRAC"]   = "0.05"
+                os.environ["IRP_GNN_MAX_KEEP_FRAC"]   = "0.50"
 
-            # Run CG + GNN (variant C)
-            pipeline = irp.IRPResearchPipeline(data)
-            results  = pipeline.run_lt_recourse_from_baseline(
-                baseline_sol,
-                use_random_initial_patterns=True,
-                n_initial_patterns_per_product_period=5,
-                cg_iterations=self.cg_iterations,
-                msg=False,
-                gnn_checkpoint=self.checkpoint_path,
-                use_gnn=True,
-                runtime_gnn_mode=True,
-                gnn_selection_mode=self.gnn_selection_mode,
-                use_classical_fallback=False,
-                gnn_max_keep=100,
-                gnn_max_keep_fraction=0.50,
-            )
+                # Run CG + GNN (variant C)
+                pipeline = irp.IRPResearchPipeline(data)
+                results  = pipeline.run_lt_recourse_from_baseline(
+                    baseline_sol,
+                    use_random_initial_patterns=True,
+                    n_initial_patterns_per_product_period=5,
+                    cg_iterations=self.cg_iterations,
+                    msg=False,
+                    gnn_checkpoint=self.checkpoint_path,
+                    use_gnn=True,
+                    runtime_gnn_mode=True,
+                    gnn_selection_mode=self.gnn_selection_mode,
+                    use_classical_fallback=False,
+                    gnn_max_keep=100,
+                    gnn_max_keep_fraction=0.50,
+                )
 
             runtime = time.time() - t0
 
