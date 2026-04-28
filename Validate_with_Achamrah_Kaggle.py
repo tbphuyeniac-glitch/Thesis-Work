@@ -656,6 +656,7 @@ class ThesisCRunner:
             tb = traceback.format_exc()
             status = "timeout" if runtime >= self.time_limit * 0.98 else "failed"
             print(f"[ThesisC] {scenario.scenario_id} {status}: {exc}")
+            print(f"[ThesisC TRACEBACK]:\n{tb}")
             return ScenarioResult(
                 scenario_id=scenario.scenario_id,
                 method="Thesis_C_ALNS_CG_GNN",
@@ -894,6 +895,7 @@ class AchamrahRunner:
             tb = traceback.format_exc()
             status = "timeout" if runtime >= self.time_limit * 0.98 else "failed"
             print(f"[Achamrah] {scenario.scenario_id} {status}: {exc}")
+            print(f"[Achamrah TRACEBACK]:\n{tb}")
             result = ScenarioResult(
                 scenario_id=scenario.scenario_id,
                 method=self.source_name,

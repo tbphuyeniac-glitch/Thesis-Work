@@ -242,6 +242,8 @@ class AchamrahIntegratedExtendedSolver(AchamrahIRPTSolver):
                 m.addConstr(lhs == rhs, name=f"inv_cw[{p},{t}]")
         
         # (2) Inventory balance for POS (WITH SIMPLIFIED LT)
+        # Correct form: I[t] = prev + inbound + S[t] - demand - outbound_lt
+        # S[t] represents unmet demand (shortage), so it adds back to inventory
         if allow_lateral_transshipment:
             for p in P:
                 for i in N:
@@ -251,10 +253,11 @@ class AchamrahIntegratedExtendedSolver(AchamrahIRPTSolver):
                         inbound_lt = gp.quicksum(y[p, j, i, t] for j in N if j != i)
                         demand = inst.D[p, i, t]
                         outbound_lt = gp.quicksum(y[p, i, j, t] for j in N if j != i)
-                        
-                        lhs = I[p, i, t] + S[p, i, t]
-                        rhs = prev_inv + inbound_direct + inbound_lt - demand - outbound_lt
-                        m.addConstr(lhs == rhs, name=f"inv_pos[{p},{i},{t}]")
+
+                        m.addConstr(
+                            I[p, i, t] == prev_inv + inbound_direct + inbound_lt - demand - outbound_lt + S[p, i, t],
+                            name=f"inv_pos[{p},{i},{t}]"
+                        )
         else:
             for p in P:
                 for i in N:
@@ -262,10 +265,11 @@ class AchamrahIntegratedExtendedSolver(AchamrahIRPTSolver):
                         prev_inv = inst.I0[p, i] if t == H[0] else I[p, i, t-1]
                         inbound = Qdir[p, i, t]
                         demand = inst.D[p, i, t]
-                        
-                        lhs = I[p, i, t] + S[p, i, t]
-                        rhs = prev_inv + inbound - demand
-                        m.addConstr(lhs == rhs, name=f"inv_pos_no_lt[{p},{i},{t}]")
+
+                        m.addConstr(
+                            I[p, i, t] == prev_inv + inbound - demand + S[p, i, t],
+                            name=f"inv_pos_no_lt[{p},{i},{t}]"
+                        )
         
         # (3) Non-negative inventory (optional tightening)
         for p in P:
