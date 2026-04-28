@@ -391,7 +391,7 @@ def _sample_controlled(
         if sub.empty or k <= 0:
             return []
         # Group by source_instance, then sample with per-instance cap to ensure diversity
-        by_inst = list(sub.groupby("source_instance").indices.items())
+        by_inst = list(sub.groupby("source_instance").groups.items())
         rng.shuffle(by_inst)
         chosen: List[int] = []
         # Round 1: at most max_per_source_instance per source
