@@ -181,8 +181,8 @@ class ScenarioGenerator:
         df.columns = ["store", "sku", "sale_qty", "end_qty", "period_raw"]
         df["store"]    = df["store"].astype(str).str.strip()
         df["sku"]      = df["sku"].astype(str).str.strip()
-        df["sale_qty"] = pd.to_numeric(df["sale_qty"], errors="coerce").fillna(0.0)
-        df["end_qty"]  = pd.to_numeric(df["end_qty"], errors="coerce").fillna(0.0)
+        df["sale_qty"] = pd.to_numeric(df["sale_qty"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["end_qty"]  = pd.to_numeric(df["end_qty"], errors="coerce").fillna(0.0).clip(lower=0.0)
         df["date"]     = pd.to_datetime(df["period_raw"].astype(str), format="%Y%m%d", errors="coerce")
         df = df.dropna(subset=["date"])
 
@@ -329,8 +329,8 @@ class SharedDataBuilder:
         df.columns = ["store", "sku", "sale_qty", "end_qty", "period_raw"]
         df["store"]    = df["store"].astype(str).str.strip()
         df["sku"]      = df["sku"].astype(str).str.strip()
-        df["sale_qty"] = pd.to_numeric(df["sale_qty"], errors="coerce").fillna(0.0)
-        df["end_qty"]  = pd.to_numeric(df["end_qty"], errors="coerce").fillna(0.0)
+        df["sale_qty"] = pd.to_numeric(df["sale_qty"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["end_qty"]  = pd.to_numeric(df["end_qty"], errors="coerce").fillna(0.0).clip(lower=0.0)
         df["date"]     = pd.to_datetime(df["period_raw"].astype(str), format="%Y%m%d", errors="coerce")
         df = df.dropna(subset=["date"])
 
