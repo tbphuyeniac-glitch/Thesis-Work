@@ -1213,6 +1213,18 @@ else:
         else:
             print(f"[WARNING] BiGAT training exited with code {rc_train} — will retry on next run")
             RUN_STATE.update("gnn_training", returncode=rc_train, partial_ok=True)
+            # Print last 60 lines from the run log to surface the actual error
+            if RUN_LOG_PATH and Path(RUN_LOG_PATH).exists():
+                try:
+                    with open(RUN_LOG_PATH, encoding="utf-8", errors="replace") as _f:
+                        _all_lines = _f.readlines()
+                    _tail = _all_lines[-60:] if len(_all_lines) > 60 else _all_lines
+                    print("[gnn_training] --- last 60 log lines ---")
+                    for _l in _tail:
+                        print(_l, end="")
+                    print("[gnn_training] --- end of log tail ---")
+                except Exception as _e:
+                    print(f"[gnn_training] could not read log tail: {_e}")
 
     # When the aggregate trainer was used, mirror its best checkpoint to the
     # repo-default path so downstream stages (offline test, Phase 2 inference,
