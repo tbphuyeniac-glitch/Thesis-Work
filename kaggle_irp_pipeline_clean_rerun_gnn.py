@@ -1129,6 +1129,7 @@ else:
                 "--weight-decay",                     str(AGG_TRAIN_WEIGHT_DECAY),
                 "--early-stopping-patience",          str(AGG_TRAIN_PATIENCE),
                 "--full-valid-every",                 str(AGG_TRAIN_FULL_VALID_EVERY),
+                "--disable-early-stopping",
                 "--seed",                             str(MASTER_SEED),
             ]
         else:

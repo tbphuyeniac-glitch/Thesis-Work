@@ -643,6 +643,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--early-stopping-patience", type=int, default=20)
     parser.add_argument("--full-valid-every", type=int, default=10)
+    parser.add_argument("--disable-early-stopping", action="store_true", default=False,
+                        help="If set, train for all --max-epochs without early stopping.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -933,6 +935,8 @@ def main() -> None:
         if not math.isfinite(train_loss) or math.isnan(train_loss):
             print("[early-stop] train loss is NaN/inf — aborting.")
             break
+        if args.disable_early_stopping:
+            continue  # skip all early stopping checks
         if epoch < EASY_END_EPOCH:
             continue  # don't early-stop during the easy curriculum
         if bad_epochs >= args.early_stopping_patience:
