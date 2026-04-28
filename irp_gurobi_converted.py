@@ -3438,6 +3438,28 @@ class LateralTransshipmentCG:
         self.gnn_min_keep = int(gnn_min_keep)
         self.gnn_max_keep = int(gnn_max_keep) if gnn_max_keep is not None else None
         self.gnn_max_keep_fraction = float(gnn_max_keep_fraction)
+        # --- env-var overrides applied after constructor arguments ---
+        _env_mode = os.environ.get("IRP_GNN_SELECTION_MODE", "").strip()
+        if _env_mode:
+            self.gnn_selection_mode = _env_mode
+        _env_min_keep = os.environ.get("IRP_GNN_MIN_KEEP", "").strip()
+        if _env_min_keep:
+            self.gnn_min_keep = max(1, int(_env_min_keep))
+        _env_min_frac = os.environ.get("IRP_GNN_MIN_KEEP_FRAC", "").strip()
+        if _env_min_frac:
+            self._gnn_min_keep_frac = max(0.0, float(_env_min_frac))
+        else:
+            self._gnn_min_keep_frac = 0.10
+        _env_max_frac = os.environ.get("IRP_GNN_MAX_KEEP_FRAC", "").strip()
+        if _env_max_frac:
+            self.gnn_max_keep_fraction = max(0.0, min(1.0, float(_env_max_frac)))
+        # Disable-fallback: raise instead of silently passing all columns through
+        self._gnn_disable_fallback = (
+            os.environ.get("IRP_GNN_DISABLE_FALLBACK", "0").strip().lower()
+            not in {"0", "false", "no", ""}
+        )
+        self._gnn_fallback_count = 0
+        self._gnn_debug_rows: List[Dict[str, Any]] = []
         if getattr(self, "strict_benchmark_mode", False):
             print(f"  gnn_max_keep                    : {self.gnn_max_keep} -> None")
             print(f"  gnn_max_keep_fraction           : {self.gnn_max_keep_fraction} -> 1.0")
@@ -3647,20 +3669,38 @@ class LateralTransshipmentCG:
         selector = self._gnn_adaptive_select_indices
         if selector is None:
             raise RuntimeError("GNN adaptive selector helper is not loaded")
-        max_keep = self.gnn_max_keep
-        if self.gnn_max_keep_fraction > 0:
-            fraction_cap = max(self.gnn_min_keep, int(math.ceil(len(score_rows) * self.gnn_max_keep_fraction)))
-            max_keep = min(max_keep, fraction_cap) if max_keep is not None else fraction_cap
+        n = len(score_rows)
+        if self.gnn_selection_mode == "adaptive_gap":
+            # Compute lower/upper bounds from IRP_GNN_MIN_KEEP / MIN_KEEP_FRAC / MAX_KEEP_FRAC
+            lower_bound = max(self.gnn_min_keep,
+                              int(math.ceil(n * self._gnn_min_keep_frac)))
+            upper_bound = max(lower_bound,
+                              int(math.ceil(n * self.gnn_max_keep_fraction)))
+            effective_min_keep = lower_bound
+            effective_max_keep = upper_bound
+        else:
+            effective_min_keep = self.gnn_min_keep
+            effective_max_keep = self.gnn_max_keep
+            if self.gnn_max_keep_fraction > 0:
+                fraction_cap = max(self.gnn_min_keep,
+                                   int(math.ceil(n * self.gnn_max_keep_fraction)))
+                effective_max_keep = (
+                    min(effective_max_keep, fraction_cap)
+                    if effective_max_keep is not None else fraction_cap
+                )
         selected_idx, info = selector(
             scores,
             tie_breaker=[row["gnn_prob"] for row in score_rows],
             selection_mode=self.gnn_selection_mode,
             mass_threshold=self.gnn_mass_threshold,
             relative_threshold=self.gnn_relative_threshold,
-            min_keep=self.gnn_min_keep,
-            max_keep=max_keep,
+            min_keep=effective_min_keep,
+            max_keep=effective_max_keep,
+            top_frac=self.gnn_max_keep_fraction,
+            top_k_count=effective_max_keep if effective_max_keep is not None else self.gnn_min_keep,
+            threshold_val=self.gnn_relative_threshold,
         )
-        info["max_keep"] = max_keep
+        info["max_keep"] = effective_max_keep
         info["max_keep_fraction"] = self.gnn_max_keep_fraction
 
         # ---- Fairness protection: per (product, period) minimum quota --------
@@ -3764,10 +3804,18 @@ class LateralTransshipmentCG:
         if not feasible:
             return selected_idx, None
 
-        best_idx = min(feasible, key=lambda item: item[1])[0]
-        if best_idx not in selected_idx:
-            selected_idx = [best_idx] + selected_idx
-        return selected_idx, best_idx
+        n_restore = max(1, self.gnn_min_keep)
+        best_n = sorted(feasible, key=lambda item: item[1])[:n_restore]
+        selected_set = set(selected_idx)
+        restored = []
+        for idx, _ in best_n:
+            if idx not in selected_set:
+                selected_set.add(idx)
+                restored.append(idx)
+        if restored:
+            selected_idx = restored + selected_idx
+        primary_fallback = best_n[0][0]
+        return selected_idx, primary_fallback
 
     def _record_teacher_rows(
         self,
@@ -3988,6 +4036,11 @@ class LateralTransshipmentCG:
 
         try:
             if self._gnn_build_graph is None:
+                reason = f"graph builder not loaded: {getattr(self, '_gnn_unavailable_reason', 'unknown')}"
+                print(f"[GNN] FALLBACK — {reason}")
+                if self._gnn_disable_fallback:
+                    raise RuntimeError(f"[GNN] IRP_GNN_DISABLE_FALLBACK=1 and {reason}")
+                self._gnn_fallback_count += 1
                 return patterns
 
             raw_graph = self._gnn_build_graph(
@@ -4004,6 +4057,13 @@ class LateralTransshipmentCG:
                 or self._gnn_graph_to_tensors is None
                 or self._gnn_normalize_dataset is None
             ):
+                reason = (
+                    f"model not available: {getattr(self, '_gnn_unavailable_reason', 'unknown')}"
+                )
+                print(f"[GNN] FALLBACK — {reason} (fallback #{self._gnn_fallback_count + 1})")
+                if self._gnn_disable_fallback:
+                    raise RuntimeError(f"[GNN] IRP_GNN_DISABLE_FALLBACK=1 and {reason}")
+                self._gnn_fallback_count += 1
                 probs = [0.0 for _ in patterns]
                 score_rows = self._compute_combined_column_scores(patterns, probs)
                 gnn_selected_idx = []
@@ -4015,6 +4075,7 @@ class LateralTransshipmentCG:
                     "mass_threshold": float(self.gnn_mass_threshold),
                     "relative_threshold": float(self.gnn_relative_threshold),
                     "score_mass_total": 0.0,
+                    "fallback_reason": reason,
                 }
             else:
                 torch = importlib.import_module("torch")
@@ -4127,16 +4188,73 @@ class LateralTransshipmentCG:
                     f"| pattern={row['pattern_id']} | rc={row['reduced_cost']} "
                     f"| column_cost={row['column_cost']:.6f}"
                 )
+
+            n_candidates = len(patterns)
+            n_selected = len(selected)
+            if n_selected == n_candidates and n_candidates > self.gnn_min_keep:
+                print(
+                    f"[GNN] WARNING — pruning inactive: all {n_candidates} candidates kept "
+                    f"(mode={self.gnn_selection_mode}, min_keep={self.gnn_min_keep}). "
+                    f"Check that scores are non-trivial and mode is configured correctly."
+                )
+
+            scores_list = [r["gnn_prob"] for r in score_rows]
+            avg_score = float(sum(scores_list) / len(scores_list)) if scores_list else float("nan")
+            debug_row: Dict[str, Any] = {
+                "episode": episode,
+                "n_candidates": n_candidates,
+                "n_selected": n_selected,
+                "prune_ratio": round(1.0 - n_selected / n_candidates, 4) if n_candidates else 0.0,
+                "avg_score": round(avg_score, 6),
+                "adaptive_k": adaptive_info.get("adaptive_k"),
+                "selection_mode": adaptive_info.get("selection_mode", self.gnn_selection_mode),
+                "max_score_gap": adaptive_info.get("max_score_gap"),
+                "gap_position": adaptive_info.get("gap_position"),
+                "negative_rc_count": full_negative_rc_count,
+                "classical_fallback_used": fallback_idx is not None,
+                "fallback_reason": adaptive_info.get("fallback_reason"),
+            }
+            self._gnn_debug_rows.append(debug_row)
+            _debug_log_path = os.environ.get("IRP_GNN_DEBUG_LOG_PATH", "").strip()
+            if _debug_log_path:
+                import csv as _csv
+                _write_header = not os.path.exists(_debug_log_path)
+                with open(_debug_log_path, "a", newline="") as _fh:
+                    _writer = _csv.DictWriter(_fh, fieldnames=list(debug_row.keys()))
+                    if _write_header:
+                        _writer.writeheader()
+                    _writer.writerow(debug_row)
+
             return selected
         except Exception as exc:
-            # Track scoring failures so the benchmark can detect when Run C
-            # silently degraded to the all-patterns fallback (was previously a
-            # blind passthrough with no accounting).
             self._gnn_scoring_failures = int(getattr(self, "_gnn_scoring_failures", 0)) + 1
+            self._gnn_fallback_count = int(getattr(self, "_gnn_fallback_count", 0)) + 1
+            _shapes = ""
+            try:
+                import torch as _torch
+                _local_frames = exc.__traceback__
+                while _local_frames and _local_frames.tb_next:
+                    _local_frames = _local_frames.tb_next
+                _lv = _local_frames.tb_frame.f_locals if _local_frames else {}
+                _shape_parts = [
+                    f"{k}={tuple(v.shape)}"
+                    for k, v in _lv.items()
+                    if hasattr(v, "shape")
+                ]
+                if _shape_parts:
+                    _shapes = " shapes=[" + ", ".join(_shape_parts[:5]) + "]"
+            except Exception:
+                pass
             print(
-                f"[GNN] Scoring skipped for this pricing episode (failure "
-                f"#{self._gnn_scoring_failures}): {exc}"
+                f"[GNN] Scoring exception ({type(exc).__name__}) — episode {episode} "
+                f"falling back to all {len(patterns)} patterns "
+                f"(failure #{self._gnn_scoring_failures}){_shapes}: {exc}"
             )
+            if self._gnn_disable_fallback:
+                raise RuntimeError(
+                    f"[GNN] IRP_GNN_DISABLE_FALLBACK=1 and scoring raised "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             return patterns
 
     def _collect_teacher_batch_without_gnn_prefilter(
@@ -7395,6 +7513,9 @@ class IRPResearchPipeline:
             "teacher_export_diagnostics": dict(cg_engine.teacher_export_diagnostics),
             "alns_history": list(getattr(baseline_sol, "alns_history", []) or []),
             "gnn_scoring_failures": int(getattr(cg_engine, "_gnn_scoring_failures", 0)),
+            "gnn_fallback_count": int(getattr(cg_engine, "_gnn_fallback_count", 0)),
+            "gnn_selection_mode": getattr(cg_engine, "gnn_selection_mode", "cumulative_mass"),
+            "gnn_debug_rows": list(getattr(cg_engine, "_gnn_debug_rows", [])),
             "lt_plan_source": (
                 "cg_selected_patterns_with_follower_filter"
                 if stackelberg_aware_scoring else "cg_selected_patterns"
@@ -7569,6 +7690,19 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
     selected_in_rmp = len(getattr(cg_sol, "selected_patterns", []) or []) if cg_sol is not None else 0
     pool_util = (selected_in_rmp / pool_size) if pool_size > 0 else 0.0
     gnn_scoring_failures = int(results.get("gnn_scoring_failures", 0) or 0)
+    gnn_fallback_count = int(results.get("gnn_fallback_count", 0) or 0)
+    gnn_selection_mode_val = results.get("gnn_selection_mode", "cumulative_mass") or "cumulative_mass"
+    _debug_rows = results.get("gnn_debug_rows") or []
+    gnn_candidates_before = int(sum(r.get("n_candidates", 0) for r in _debug_rows)) if _debug_rows else 0
+    gnn_selected_columns_sum = int(sum(r.get("n_selected", 0) for r in _debug_rows)) if _debug_rows else 0
+    gnn_prune_ratio_avg = (
+        float(sum(r.get("prune_ratio", 0.0) for r in _debug_rows) / len(_debug_rows))
+        if _debug_rows else float("nan")
+    )
+    _avg_scores = [r["avg_score"] for r in _debug_rows if r.get("avg_score") is not None]
+    gnn_avg_score_val = float(sum(_avg_scores) / len(_avg_scores)) if _avg_scores else float("nan")
+    _adaptive_ks = [r["adaptive_k"] for r in _debug_rows if r.get("adaptive_k") is not None]
+    gnn_adaptive_k_avg = float(sum(_adaptive_ks) / len(_adaptive_ks)) if _adaptive_ks else float("nan")
     # Baseline ALNS runtime lives in efficiency_metrics["alns_runtime_seconds"]
     # (there is no baseline_sol.runtime_seconds attribute — earlier code was
     # always getting NaN here).
@@ -7641,6 +7775,14 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
         "columns_added_to_rmp": total_cols_added,
         "column_pool_utilization": float(pool_util),
         "gnn_scoring_failures": gnn_scoring_failures,
+        "gnn_fallback_count": gnn_fallback_count,
+        "gnn_candidates_before": gnn_candidates_before,
+        "gnn_scored_columns": gnn_candidates_before,
+        "gnn_selected_columns": gnn_selected_columns_sum,
+        "gnn_prune_ratio": round(gnn_prune_ratio_avg, 4) if not (gnn_prune_ratio_avg != gnn_prune_ratio_avg) else float("nan"),
+        "gnn_avg_score": round(gnn_avg_score_val, 6) if not (gnn_avg_score_val != gnn_avg_score_val) else float("nan"),
+        "gnn_adaptive_k": round(gnn_adaptive_k_avg, 2) if not (gnn_adaptive_k_avg != gnn_adaptive_k_avg) else float("nan"),
+        "gnn_selection_mode": gnn_selection_mode_val,
     }
 
 
@@ -8273,7 +8415,8 @@ def run_three_way_benchmark(
                                   "heuristic_top_k": heuristic_top_k,
                                   "use_branch_and_price": False}),
             ("C_gnn_guided_cg", {"use_gnn": True,  "collect_teacher_mode": False,
-                                  "runtime_gnn_mode": True,  "heuristic_top_k_mode": False}),
+                                  "runtime_gnn_mode": True,  "heuristic_top_k_mode": False,
+                                  "gnn_selection_mode": os.environ.get("IRP_GNN_SELECTION_MODE", "cumulative_mass").strip() or "cumulative_mass"}),
         ]
         # Same seed sequence is reused across variants so variant differences
         # aren't confounded by different demand realizations.
@@ -8456,6 +8599,9 @@ def run_three_way_benchmark(
             "gnn_inference_runtime_seconds",
             "columns_generated", "columns_selected_by_gnn", "columns_added_to_rmp",
             "column_pool_utilization", "gnn_scoring_failures",
+            "gnn_fallback_count", "gnn_candidates_before", "gnn_scored_columns",
+            "gnn_selected_columns", "gnn_prune_ratio", "gnn_avg_score",
+            "gnn_adaptive_k",
         ]
         numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
         agg_rows: List[Dict[str, Any]] = []

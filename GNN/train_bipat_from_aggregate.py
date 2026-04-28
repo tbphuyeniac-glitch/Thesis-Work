@@ -159,17 +159,31 @@ def _group_key(row: Dict[str, Any]) -> GroupKey:
     return source_instance, branch_node, episode, product, period, constraint_state
 
 
+def _simple_graph_id(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Graph ID = (source_instance, branch_node_id, episode) only.
+
+    This groups ALL columns for a single CG episode together, regardless of
+    constraint_state_hash. Constraint features are then extracted once per
+    graph and shared across all columns in that episode.
+    """
+    return (
+        str(row.get("source_instance") or row.get("instance_id") or "default"),
+        str(row.get("branch_node_id") or row.get("node_id") or "root"),
+        str(row.get("episode") or row.get("episode_id") or "0"),
+    )
+
+
 def _propagate_constraint_features(rows: List[Dict[str, Any]]) -> None:
-    """Fill empty `constraint_features_json` from first non-empty in same group."""
-    first_by_group: Dict[GroupKey, str] = {}
+    """Fill empty `constraint_features_json` from first non-empty in same (source_instance, branch_node_id, episode) group."""
+    first_by_graph: Dict[Tuple[str, str, str], str] = {}
     for row in rows:
-        key = _group_key(row)
+        gid = _simple_graph_id(row)
         value = str(row.get("constraint_features_json") or "").strip()
-        if value and key not in first_by_group:
-            first_by_group[key] = value
+        if value and gid not in first_by_graph:
+            first_by_graph[gid] = value
     for row in rows:
         if not str(row.get("constraint_features_json") or "").strip():
-            row["constraint_features_json"] = first_by_group.get(_group_key(row), "")
+            row["constraint_features_json"] = first_by_graph.get(_simple_graph_id(row), "")
 
 
 # =====================================================================
@@ -225,24 +239,39 @@ def _backfill_metadata(
 def _build_graphs(rows: List[Dict[str, Any]]) -> Tuple[
     List[Dict[str, Any]],
     List[Dict[str, Any]],
+    Dict[str, Any],
 ]:
-    """Group rows by GroupKey and build one in-memory graph sample per group.
+    """Group rows by simple graph_id (source_instance, branch_node_id, episode) and
+    build one in-memory graph sample per group. Constraint features are extracted
+    once per graph and cached. All columns in a graph use the same constraint features.
 
     Returns:
         graphs: list of {column_features, constraint_features, edges, ..., metadata}
-                length = number of groups
+                length = number of graph groups
         row_index: list of {row_id, graph_id, col_idx_in_graph, label, metadata...}
                    length = number of rows that successfully landed in a graph
+        diagnostics: Dict with graph_count, graphs_with_constraints, constraint_feature_dim,
+                     avg_constraint_nodes, repeated_constraint_hashes, etc.
     """
-    grouped: Dict[GroupKey, List[Dict[str, Any]]] = defaultdict(list)
+    import hashlib
+
+    # Group by simple graph_id only
+    grouped: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        grouped[_group_key(row)].append(row)
+        grouped[_simple_graph_id(row)].append(row)
 
     graphs: List[Dict[str, Any]] = []
     row_index: List[Dict[str, Any]] = []
     skipped_groups = 0
+    groups_with_constraints = 0
+    groups_missing_constraints = 0
+    constraint_hashes: List[str] = []
+    constraint_node_counts: List[int] = []
+    constraint_feature_dims: set = set()
 
-    for key, group_rows in grouped.items():
+    for simple_gid, group_rows in grouped.items():
+        source_instance, branch_node_id, episode = simple_gid
+
         # Sort within group so column ordering is deterministic
         try:
             group_rows.sort(key=lambda r: (
@@ -253,16 +282,41 @@ def _build_graphs(rows: List[Dict[str, Any]]) -> Tuple[
             group_rows.sort(key=lambda r: str(r.get("pattern_id", "")))
 
         try:
+            # Find the first non-null constraint_features_json in this graph
+            constraint_json = None
+            for r in group_rows:
+                val = str(r.get("constraint_features_json") or "").strip()
+                if val:
+                    constraint_json = val
+                    break
+
+            if constraint_json:
+                groups_with_constraints += 1
+                # Hash the constraint features for repetition detection
+                constraint_hash = hashlib.sha256(constraint_json.encode()).hexdigest()[:12]
+                constraint_hashes.append(constraint_hash)
+                # Count nodes in constraint features
+                try:
+                    con_feat = json.loads(constraint_json)
+                    if isinstance(con_feat, list):
+                        constraint_node_counts.append(len(con_feat))
+                        if con_feat and isinstance(con_feat[0], (list, tuple)):
+                            constraint_feature_dims.add(len(con_feat[0]))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            else:
+                groups_missing_constraints += 1
+
             sample = utilities.build_training_sample_from_exported_teacher_rows(
                 group_rows,
-                episode_id=key[2],
-                source_instance=key[0],
-                product=key[3],
-                period=key[4],
-                branch_node_id=key[1],
-                decision_state_id=key[5],
+                episode_id=episode,
+                source_instance=source_instance,
+                product=str(group_rows[0].get("product") or "unknown_product"),
+                period=str(group_rows[0].get("period") or "unknown_period"),
+                branch_node_id=branch_node_id,
+                decision_state_id=constraint_json and hashlib.sha1(constraint_json.encode()).hexdigest()[:12] or "no_constraints",
             )
-        except Exception:
+        except Exception as exc:
             skipped_groups += 1
             continue
 
@@ -286,11 +340,34 @@ def _build_graphs(rows: List[Dict[str, Any]]) -> Tuple[
                 "split": str(r.get("split") or ""),
             })
 
+    # Compute repetition stats
+    constraint_hash_counts = Counter(constraint_hashes)
+    repeated_hashes = [(h, c) for h, c in constraint_hash_counts.most_common() if c > 1]
+
+    diagnostics = {
+        "total_graph_groups": len(grouped),
+        "graphs_with_constraints": groups_with_constraints,
+        "graphs_missing_constraints": groups_missing_constraints,
+        "graphs_skipped": skipped_groups,
+        "avg_constraint_nodes": (
+            float(sum(constraint_node_counts) / len(constraint_node_counts))
+            if constraint_node_counts else 0.0
+        ),
+        "constraint_feature_dimensions": sorted(list(constraint_feature_dims)),
+        "unique_constraint_hashes": len(constraint_hash_counts),
+        "repeated_constraint_hashes_count": len(repeated_hashes),
+        "repeated_constraint_hashes_top5": [
+            {"hash": h, "count": c} for h, c in repeated_hashes[:5]
+        ],
+    }
+
     if skipped_groups:
         print(f"[graphs] skipped {skipped_groups}/{len(grouped)} groups due to "
-              f"missing/invalid features (typical: blank constraint_features_json).")
+              f"missing/invalid features.")
 
-    return graphs, row_index
+    print(f"[graphs] diagnostics: {diagnostics}")
+
+    return graphs, row_index, diagnostics
 
 
 def _normalize_graphs(
@@ -702,7 +779,7 @@ def main() -> None:
     # 2) Build graphs and the per-row index
     # ------------------------------------------------------------------
     t0 = time.time()
-    graphs, row_index_records = _build_graphs(rows_raw)
+    graphs, row_index_records, graph_diagnostics = _build_graphs(rows_raw)
     print(f"[graphs] built {len(graphs)} graphs from {len(row_index_records)} rows "
           f"in {time.time() - t0:.1f}s")
     if not graphs or not row_index_records:
@@ -866,7 +943,12 @@ def main() -> None:
         history.append(row)
         pd.DataFrame(history).to_csv(history_csv, index=False)
 
-        # --- Sampling log row ---
+        # --- Sampling log row + per-epoch graph cache diagnostics ---
+        sampled_graph_ids = set(train_batch["graph_id"].unique().tolist())
+        graphs_with_valid_constraints = sum(
+            1 for gid in sampled_graph_ids
+            if gid < len(graphs) and graphs[gid]["constraint_features"].size > 0
+        )
         sampling_log.append({
             "epoch": epoch,
             "regime": train_sampling_stats.get("regime", ""),
@@ -876,6 +958,8 @@ def main() -> None:
             "pos_count": train_sampling_stats["pos"],
             "neg_count": train_sampling_stats["neg"],
             "n_unique_source_instances": train_sampling_stats.get("n_unique_source_instances", 0),
+            "n_unique_graphs": len(sampled_graph_ids),
+            "graphs_with_valid_constraints": graphs_with_valid_constraints,
             "by_shock_profile": json.dumps(train_sampling_stats.get("by_shock_profile", {}), default=str),
             "by_store_limit": json.dumps(train_sampling_stats.get("by_store_limit", {}), default=str),
             "by_sku_limit": json.dumps(train_sampling_stats.get("by_sku_limit", {}), default=str),
@@ -916,6 +1000,7 @@ def main() -> None:
                 "constraint": utilities.CONSTRAINT_FEATURE_NAMES,
                 "edge": utilities.EDGE_FEATURE_NAMES,
             },
+            "graph_diagnostics": graph_diagnostics,
             "valid_metrics": v_metrics,
             "full_valid_metrics": fv_metrics,
             "optimizer_state": optimizer.state_dict(),

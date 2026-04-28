@@ -582,8 +582,21 @@ def adaptive_select_indices(
     relative_threshold: float = 0.85,
     min_keep: int = 1,
     max_keep: int | None = None,
+    top_frac: float = 0.30,
+    top_k_count: int = 10,
+    threshold_val: float = 0.50,
 ) -> Tuple[List[int], Dict[str, Any]]:
-    """Shared adaptive self-defined-k selector for runtime and offline tests."""
+    """Shared adaptive self-defined-k selector for runtime and offline tests.
+
+    Modes
+    -----
+    cumulative_mass   : keep top columns until their mass >= mass_threshold (default)
+    relative_threshold: keep all columns scoring >= relative_threshold * best_score
+    adaptive_gap      : cut at the largest score gap between consecutive sorted scores
+    top_frac          : keep top fraction (top_frac) of candidates
+    top_k             : keep exactly top_k_count columns
+    threshold         : keep all columns with score >= threshold_val
+    """
     values = [max(0.0, float(value)) for value in scores]
     if not values:
         return [], {
@@ -592,13 +605,19 @@ def adaptive_select_indices(
             "ordered_indices": [],
             "selected_indices": [],
             "score_mass_total": 0.0,
+            "max_score_gap": 0.0,
+            "gap_position": 0,
         }
 
     tie = [float(value) for value in tie_breaker] if tie_breaker is not None else values
     ordered = sorted(range(len(values)), key=lambda idx: (values[idx], tie[idx]), reverse=True)
     ordered_scores = [values[idx] for idx in ordered]
-    if sum(ordered_scores) <= 1e-12:
+    all_zero = sum(ordered_scores) <= 1e-12
+    if all_zero:
         ordered_scores = [1.0 for _ in ordered]
+
+    max_score_gap = 0.0
+    gap_position = 0
 
     if selection_mode == "relative_threshold":
         best = max(ordered_scores) if ordered_scores else 0.0
@@ -613,6 +632,22 @@ def adaptive_select_indices(
             k_star += 1
             if cumulative >= float(mass_threshold):
                 break
+    elif selection_mode == "adaptive_gap":
+        if len(ordered_scores) <= 1:
+            k_star = len(ordered_scores)
+        else:
+            gaps = [ordered_scores[i] - ordered_scores[i + 1]
+                    for i in range(len(ordered_scores) - 1)]
+            gap_position = int(max(range(len(gaps)), key=lambda i: gaps[i]))
+            max_score_gap = float(gaps[gap_position])
+            k_star = gap_position + 1
+    elif selection_mode == "top_frac":
+        k_star = max(1, int(math.ceil(len(ordered_scores) * float(top_frac))))
+    elif selection_mode == "top_k":
+        k_star = min(len(ordered_scores), max(1, int(top_k_count)))
+    elif selection_mode == "threshold":
+        raw_scores = [values[idx] for idx in ordered]
+        k_star = sum(1 for score in raw_scores if score >= float(threshold_val))
     else:
         raise ValueError(f"unknown selection_mode={selection_mode!r}")
 
@@ -629,6 +664,8 @@ def adaptive_select_indices(
         "score_mass_total": float(sum(ordered_scores)),
         "ordered_indices": [int(idx) for idx in ordered],
         "selected_indices": [int(idx) for idx in selected],
+        "max_score_gap": float(max_score_gap),
+        "gap_position": int(gap_position),
     }
 
 

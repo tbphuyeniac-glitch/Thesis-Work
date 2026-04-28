@@ -1,0 +1,245 @@
+[2026-04-13 18:17:42.577129] train_samples=1 valid_samples=1
+[2026-04-13 18:17:42.577636] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 2}
+[2026-04-13 18:17:42.577979] model=BiGAT device=cpu hidden_dim=16
+[2026-04-13 18:17:42.766669] epoch=001 objective=pairwise_rank train_loss=0.6667 valid_loss=0.6935 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.0909 pos_score=0.5404 neg_score=0.5406 score_gap=-0.0002 col_emb_norm=4.0008 con_emb_norm=3.9992 param_update_norm=0.075590
+[2026-04-13 18:17:42.772338] saved best BiGAT model
+[2026-04-13 18:17:42.837595] epoch=002 objective=pairwise_rank train_loss=0.6682 valid_loss=0.6933 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.1429 pos_score=0.5387 neg_score=0.5388 score_gap=-0.0001 col_emb_norm=4.0034 con_emb_norm=3.9996 param_update_norm=0.058793
+[2026-04-13 18:17:42.840242] saved best BiGAT model
+[2026-04-13 18:17:42.935844] epoch=003 objective=pairwise_rank train_loss=0.6610 valid_loss=0.6933 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.1429 pos_score=0.5376 neg_score=0.5377 score_gap=-0.0001 col_emb_norm=4.0069 con_emb_norm=4.0003 param_update_norm=0.049605
+[2026-04-13 18:17:42.937801] saved best BiGAT model
+[2026-04-13 18:17:42.997286] epoch=004 objective=pairwise_rank train_loss=0.6602 valid_loss=0.6934 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.0909 pos_score=0.5372 neg_score=0.5373 score_gap=-0.0001 col_emb_norm=4.0093 con_emb_norm=4.0012 param_update_norm=0.044775
+[2026-04-13 18:17:43.070700] epoch=005 objective=pairwise_rank train_loss=0.6947 valid_loss=0.6933 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.0909 pos_score=0.5367 neg_score=0.5368 score_gap=-0.0001 col_emb_norm=4.0095 con_emb_norm=4.0023 param_update_norm=0.041521
+[2026-04-13 18:17:43.134565] epoch=006 objective=pairwise_rank train_loss=0.6806 valid_loss=0.6932 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.0909 pos_score=0.5365 neg_score=0.5365 score_gap=-0.0000 col_emb_norm=4.0092 con_emb_norm=4.0037 param_update_norm=0.039401
+[2026-04-13 18:17:43.136757] saved best BiGAT model
+[2026-04-13 18:17:43.194229] epoch=007 objective=pairwise_rank train_loss=0.6542 valid_loss=0.6931 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.5372 neg_score=0.5372 score_gap=0.0000 col_emb_norm=4.0094 con_emb_norm=4.0049 param_update_norm=0.038619
+[2026-04-13 18:17:43.196175] saved best BiGAT model
+[2026-04-13 18:17:43.249620] epoch=008 objective=pairwise_rank train_loss=0.6635 valid_loss=0.6930 valid_f1=0.2222 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5384 neg_score=0.5383 score_gap=0.0001 col_emb_norm=4.0095 con_emb_norm=4.0065 param_update_norm=0.037126
+[2026-04-13 18:17:43.253378] saved best BiGAT model
+[2026-04-13 18:17:43.314528] epoch=009 objective=pairwise_rank train_loss=0.6582 valid_loss=0.6929 valid_f1=0.2222 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5394 neg_score=0.5392 score_gap=0.0001 col_emb_norm=4.0102 con_emb_norm=4.0079 param_update_norm=0.034848
+[2026-04-13 18:17:43.316432] saved best BiGAT model
+[2026-04-13 18:17:43.379051] epoch=010 objective=pairwise_rank train_loss=0.6563 valid_loss=0.6928 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=1.0000 pos_score=0.5403 neg_score=0.5402 score_gap=0.0002 col_emb_norm=4.0107 con_emb_norm=4.0093 param_update_norm=0.034336
+[2026-04-13 18:17:43.381439] saved best BiGAT model
+[2026-04-13 18:17:43.444942] epoch=011 objective=pairwise_rank train_loss=0.6358 valid_loss=0.6928 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=1.0000 pos_score=0.5409 neg_score=0.5407 score_gap=0.0002 col_emb_norm=4.0114 con_emb_norm=4.0100 param_update_norm=0.032929
+[2026-04-13 18:17:43.447519] saved best BiGAT model
+[2026-04-13 18:17:43.562678] epoch=012 objective=pairwise_rank train_loss=0.6994 valid_loss=0.6927 valid_f1=0.2222 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5411 neg_score=0.5409 score_gap=0.0002 col_emb_norm=4.0113 con_emb_norm=4.0108 param_update_norm=0.031487
+[2026-04-13 18:17:43.565873] saved best BiGAT model
+[2026-04-13 18:17:43.660476] epoch=013 objective=pairwise_rank train_loss=0.6459 valid_loss=0.6927 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.5408 neg_score=0.5406 score_gap=0.0002 col_emb_norm=4.0116 con_emb_norm=4.0115 param_update_norm=0.031630
+[2026-04-13 18:17:43.669140] saved best BiGAT model
+[2026-04-13 18:17:43.738882] epoch=014 objective=pairwise_rank train_loss=0.6665 valid_loss=0.6926 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.5409 neg_score=0.5406 score_gap=0.0002 col_emb_norm=4.0114 con_emb_norm=4.0123 param_update_norm=0.031841
+[2026-04-13 18:17:43.741666] saved best BiGAT model
+[2026-04-13 18:17:43.802178] epoch=015 objective=pairwise_rank train_loss=0.6551 valid_loss=0.6925 valid_f1=0.2222 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5403 neg_score=0.5399 score_gap=0.0003 col_emb_norm=4.0119 con_emb_norm=4.0131 param_update_norm=0.031602
+[2026-04-13 18:17:43.804177] saved best BiGAT model
+[2026-04-13 18:17:43.860218] epoch=016 objective=pairwise_rank train_loss=0.6459 valid_loss=0.6912 valid_f1=0.2222 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5398 neg_score=0.5389 score_gap=0.0010 col_emb_norm=4.0122 con_emb_norm=4.0141 param_update_norm=0.030701
+[2026-04-13 18:17:43.862137] saved best BiGAT model
+[2026-04-13 18:17:43.919574] epoch=017 objective=pairwise_rank train_loss=0.6150 valid_loss=0.6903 valid_f1=0.2222 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5389 neg_score=0.5375 score_gap=0.0014 col_emb_norm=4.0133 con_emb_norm=4.0148 param_update_norm=0.030073
+[2026-04-13 18:17:43.921399] saved best BiGAT model
+[2026-04-13 18:17:44.009436] epoch=018 objective=pairwise_rank train_loss=0.6482 valid_loss=0.6889 valid_f1=0.2222 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.5384 neg_score=0.5363 score_gap=0.0021 col_emb_norm=4.0145 con_emb_norm=4.0155 param_update_norm=0.029444
+[2026-04-13 18:17:44.011366] saved best BiGAT model
+[2026-04-13 18:17:44.068129] epoch=019 objective=pairwise_rank train_loss=0.6466 valid_loss=0.6877 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.5384 neg_score=0.5357 score_gap=0.0027 col_emb_norm=4.0159 con_emb_norm=4.0162 param_update_norm=0.028694
+[2026-04-13 18:17:44.069964] saved best BiGAT model
+[2026-04-13 18:17:44.123147] epoch=020 objective=pairwise_rank train_loss=0.6465 valid_loss=0.6868 valid_f1=0.2222 valid_top1=0.0000 valid_mrr=1.0000 pos_score=0.5391 neg_score=0.5359 score_gap=0.0032 col_emb_norm=4.0174 con_emb_norm=4.0167 param_update_norm=0.028299
+[2026-04-13 18:17:44.125282] saved best BiGAT model
+[2026-04-13 18:17:44.302904] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-13 18:17:44.303270] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-14 22:23:54.129358] train_samples=5 valid_samples=1
+[2026-04-14 22:23:54.129653] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 6}
+[2026-04-14 22:23:54.129708] model=BiGAT device=cpu hidden_dim=16
+[2026-04-14 22:23:54.466557] epoch=001 objective=pairwise_rank train_loss=0.6901 valid_loss=0.6747 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.3333 pos_score=0.4395 neg_score=0.4290 score_gap=0.0106 col_emb_norm=3.9987 con_emb_norm=4.0051 param_update_norm=0.217504
+[2026-04-14 22:23:54.470452] saved best BiGAT model
+[2026-04-14 22:23:54.748616] epoch=002 objective=pairwise_rank train_loss=0.6965 valid_loss=0.6697 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.3333 pos_score=0.4556 neg_score=0.4417 score_gap=0.0139 col_emb_norm=3.9972 con_emb_norm=4.0107 param_update_norm=0.144896
+[2026-04-14 22:23:54.750020] saved best BiGAT model
+[2026-04-14 22:23:55.049642] epoch=003 objective=pairwise_rank train_loss=0.6831 valid_loss=0.6659 valid_f1=0.3077 valid_top1=0.0000 valid_mrr=0.3333 pos_score=0.4692 neg_score=0.4532 score_gap=0.0160 col_emb_norm=3.9982 con_emb_norm=4.0126 param_update_norm=0.116853
+[2026-04-14 22:23:55.051106] saved best BiGAT model
+[2026-04-14 22:23:55.336293] epoch=004 objective=pairwise_rank train_loss=0.6689 valid_loss=0.6651 valid_f1=0.3077 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.4669 neg_score=0.4505 score_gap=0.0164 col_emb_norm=3.9958 con_emb_norm=4.0124 param_update_norm=0.117722
+[2026-04-14 22:23:55.337842] saved best BiGAT model
+[2026-04-14 22:23:55.605399] epoch=005 objective=pairwise_rank train_loss=0.6649 valid_loss=0.6655 valid_f1=0.3077 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.4699 neg_score=0.4537 score_gap=0.0162 col_emb_norm=3.9961 con_emb_norm=4.0169 param_update_norm=0.107695
+[2026-04-14 22:23:55.890000] epoch=006 objective=pairwise_rank train_loss=0.6608 valid_loss=0.6665 valid_f1=0.3077 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.4670 neg_score=0.4513 score_gap=0.0158 col_emb_norm=3.9976 con_emb_norm=4.0175 param_update_norm=0.102451
+[2026-04-14 22:23:56.247916] epoch=007 objective=pairwise_rank train_loss=0.6544 valid_loss=0.6649 valid_f1=0.1818 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.4556 neg_score=0.4387 score_gap=0.0169 col_emb_norm=4.0008 con_emb_norm=4.0155 param_update_norm=0.102667
+[2026-04-14 22:23:56.249380] saved best BiGAT model
+[2026-04-14 22:23:56.597949] epoch=008 objective=pairwise_rank train_loss=0.6685 valid_loss=0.6657 valid_f1=0.1818 valid_top1=0.0000 valid_mrr=0.5000 pos_score=0.4442 neg_score=0.4276 score_gap=0.0166 col_emb_norm=4.0035 con_emb_norm=4.0094 param_update_norm=0.110737
+[2026-04-14 22:23:56.947197] epoch=009 objective=pairwise_rank train_loss=0.6562 valid_loss=0.6678 valid_f1=0.1818 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4356 neg_score=0.4201 score_gap=0.0155 col_emb_norm=4.0079 con_emb_norm=4.0058 param_update_norm=0.103955
+[2026-04-14 22:23:57.301201] epoch=010 objective=pairwise_rank train_loss=0.6514 valid_loss=0.6648 valid_f1=0.1818 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4301 neg_score=0.4126 score_gap=0.0175 col_emb_norm=4.0111 con_emb_norm=4.0043 param_update_norm=0.097496
+[2026-04-14 22:23:57.302975] saved best BiGAT model
+[2026-04-14 22:23:57.641601] epoch=011 objective=pairwise_rank train_loss=0.6504 valid_loss=0.6595 valid_f1=0.1818 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4308 neg_score=0.4099 score_gap=0.0209 col_emb_norm=4.0150 con_emb_norm=4.0048 param_update_norm=0.094888
+[2026-04-14 22:23:57.646365] saved best BiGAT model
+[2026-04-14 22:23:57.998416] epoch=012 objective=pairwise_rank train_loss=0.6579 valid_loss=0.6526 valid_f1=0.3333 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4353 neg_score=0.4096 score_gap=0.0257 col_emb_norm=4.0186 con_emb_norm=4.0072 param_update_norm=0.090741
+[2026-04-14 22:23:58.000649] saved best BiGAT model
+[2026-04-14 22:23:58.431722] epoch=013 objective=pairwise_rank train_loss=0.6420 valid_loss=0.6473 valid_f1=0.3333 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4389 neg_score=0.4087 score_gap=0.0302 col_emb_norm=4.0204 con_emb_norm=4.0103 param_update_norm=0.098892
+[2026-04-14 22:23:58.437035] saved best BiGAT model
+[2026-04-14 22:23:58.757922] epoch=014 objective=pairwise_rank train_loss=0.6272 valid_loss=0.6402 valid_f1=0.3333 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4423 neg_score=0.4060 score_gap=0.0363 col_emb_norm=4.0257 con_emb_norm=4.0140 param_update_norm=0.100447
+[2026-04-14 22:23:58.759347] saved best BiGAT model
+[2026-04-14 22:23:59.064336] epoch=015 objective=pairwise_rank train_loss=0.6339 valid_loss=0.6327 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4453 neg_score=0.4025 score_gap=0.0427 col_emb_norm=4.0314 con_emb_norm=4.0176 param_update_norm=0.092903
+[2026-04-14 22:23:59.065842] saved best BiGAT model
+[2026-04-14 22:23:59.336369] epoch=016 objective=pairwise_rank train_loss=0.6223 valid_loss=0.6255 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4553 neg_score=0.4057 score_gap=0.0496 col_emb_norm=4.0398 con_emb_norm=4.0184 param_update_norm=0.102100
+[2026-04-14 22:23:59.337947] saved best BiGAT model
+[2026-04-14 22:23:59.656469] epoch=017 objective=pairwise_rank train_loss=0.6209 valid_loss=0.6275 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4652 neg_score=0.4157 score_gap=0.0495 col_emb_norm=4.0489 con_emb_norm=4.0173 param_update_norm=0.103761
+[2026-04-14 22:23:59.937788] epoch=018 objective=pairwise_rank train_loss=0.6247 valid_loss=0.6322 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4609 neg_score=0.4134 score_gap=0.0475 col_emb_norm=4.0511 con_emb_norm=4.0160 param_update_norm=0.112213
+[2026-04-14 22:24:00.219027] epoch=019 objective=pairwise_rank train_loss=0.6036 valid_loss=0.6282 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4529 neg_score=0.4014 score_gap=0.0515 col_emb_norm=4.0563 con_emb_norm=4.0135 param_update_norm=0.108215
+[2026-04-14 22:24:00.526775] epoch=020 objective=pairwise_rank train_loss=0.6355 valid_loss=0.6253 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4341 neg_score=0.3811 score_gap=0.0530 col_emb_norm=4.0557 con_emb_norm=4.0090 param_update_norm=0.098864
+[2026-04-14 22:24:00.528243] saved best BiGAT model
+[2026-04-14 22:24:00.829289] epoch=021 objective=pairwise_rank train_loss=0.5947 valid_loss=0.6227 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4313 neg_score=0.3752 score_gap=0.0561 col_emb_norm=4.0600 con_emb_norm=4.0062 param_update_norm=0.100422
+[2026-04-14 22:24:00.830672] saved best BiGAT model
+[2026-04-14 22:24:01.168731] epoch=022 objective=pairwise_rank train_loss=0.6074 valid_loss=0.6209 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4258 neg_score=0.3676 score_gap=0.0583 col_emb_norm=4.0641 con_emb_norm=4.0052 param_update_norm=0.089694
+[2026-04-14 22:24:01.170169] saved best BiGAT model
+[2026-04-14 22:24:01.467653] epoch=023 objective=pairwise_rank train_loss=0.6074 valid_loss=0.6249 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4240 neg_score=0.3661 score_gap=0.0579 col_emb_norm=4.0729 con_emb_norm=4.0095 param_update_norm=0.097143
+[2026-04-14 22:24:01.749228] epoch=024 objective=pairwise_rank train_loss=0.6067 valid_loss=0.6287 valid_f1=0.3333 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4279 neg_score=0.3697 score_gap=0.0582 col_emb_norm=4.0828 con_emb_norm=4.0130 param_update_norm=0.106190
+[2026-04-14 22:24:02.017825] epoch=025 objective=pairwise_rank train_loss=0.5900 valid_loss=0.6258 valid_f1=0.2857 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4395 neg_score=0.3735 score_gap=0.0660 col_emb_norm=4.0926 con_emb_norm=4.0150 param_update_norm=0.116239
+[2026-04-14 22:24:02.332519] epoch=026 objective=pairwise_rank train_loss=0.5921 valid_loss=0.6231 valid_f1=0.2857 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4343 neg_score=0.3631 score_gap=0.0713 col_emb_norm=4.0959 con_emb_norm=4.0151 param_update_norm=0.102303
+[2026-04-14 22:24:02.615737] epoch=027 objective=pairwise_rank train_loss=0.5926 valid_loss=0.6159 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4234 neg_score=0.3475 score_gap=0.0759 col_emb_norm=4.0916 con_emb_norm=4.0132 param_update_norm=0.103542
+[2026-04-14 22:24:02.617514] saved best BiGAT model
+[2026-04-14 22:24:02.904724] epoch=028 objective=pairwise_rank train_loss=0.5875 valid_loss=0.6108 valid_f1=0.3077 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4233 neg_score=0.3431 score_gap=0.0802 col_emb_norm=4.0938 con_emb_norm=4.0127 param_update_norm=0.098704
+[2026-04-14 22:24:02.906326] saved best BiGAT model
+[2026-04-14 22:24:03.205613] epoch=029 objective=pairwise_rank train_loss=0.5897 valid_loss=0.6209 valid_f1=0.2857 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4460 neg_score=0.3650 score_gap=0.0810 col_emb_norm=4.1082 con_emb_norm=4.0149 param_update_norm=0.103570
+[2026-04-14 22:24:03.479848] epoch=030 objective=pairwise_rank train_loss=0.6034 valid_loss=0.6289 valid_f1=0.4000 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4874 neg_score=0.4077 score_gap=0.0797 col_emb_norm=4.1358 con_emb_norm=4.0208 param_update_norm=0.115994
+[2026-04-14 22:24:03.804870] epoch=031 objective=pairwise_rank train_loss=0.6007 valid_loss=0.6146 valid_f1=0.4000 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4784 neg_score=0.3876 score_gap=0.0909 col_emb_norm=4.1408 con_emb_norm=4.0220 param_update_norm=0.107449
+[2026-04-14 22:24:04.077675] epoch=032 objective=pairwise_rank train_loss=0.6077 valid_loss=0.6108 valid_f1=0.4000 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4611 neg_score=0.3678 score_gap=0.0934 col_emb_norm=4.1447 con_emb_norm=4.0219 param_update_norm=0.097764
+[2026-04-14 22:24:04.079247] saved best BiGAT model
+[2026-04-14 22:24:04.345398] epoch=033 objective=pairwise_rank train_loss=0.5767 valid_loss=0.6165 valid_f1=0.4000 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4926 neg_score=0.4012 score_gap=0.0914 col_emb_norm=4.1692 con_emb_norm=4.0271 param_update_norm=0.112181
+[2026-04-14 22:24:04.617744] epoch=034 objective=pairwise_rank train_loss=0.5882 valid_loss=0.6033 valid_f1=0.4000 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4863 neg_score=0.3812 score_gap=0.1050 col_emb_norm=4.1787 con_emb_norm=4.0322 param_update_norm=0.118792
+[2026-04-14 22:24:04.619231] saved best BiGAT model
+[2026-04-14 22:24:04.975578] epoch=035 objective=pairwise_rank train_loss=0.5965 valid_loss=0.6040 valid_f1=0.4000 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4903 neg_score=0.3849 score_gap=0.1054 col_emb_norm=4.1854 con_emb_norm=4.0314 param_update_norm=0.114184
+[2026-04-14 22:24:05.250644] epoch=036 objective=pairwise_rank train_loss=0.5965 valid_loss=0.5967 valid_f1=0.4000 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4746 neg_score=0.3666 score_gap=0.1079 col_emb_norm=4.1841 con_emb_norm=4.0289 param_update_norm=0.101789
+[2026-04-14 22:24:05.252097] saved best BiGAT model
+[2026-04-14 22:24:05.515813] epoch=037 objective=pairwise_rank train_loss=0.5883 valid_loss=0.6003 valid_f1=0.4286 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4608 neg_score=0.3573 score_gap=0.1035 col_emb_norm=4.1794 con_emb_norm=4.0303 param_update_norm=0.129955
+[2026-04-14 22:24:05.811227] epoch=038 objective=pairwise_rank train_loss=0.5908 valid_loss=0.6070 valid_f1=0.4286 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4420 neg_score=0.3465 score_gap=0.0954 col_emb_norm=4.1738 con_emb_norm=4.0323 param_update_norm=0.122651
+[2026-04-14 22:24:06.100367] epoch=039 objective=pairwise_rank train_loss=0.5897 valid_loss=0.6339 valid_f1=0.5333 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4594 neg_score=0.3744 score_gap=0.0849 col_emb_norm=4.1892 con_emb_norm=4.0340 param_update_norm=0.113013
+[2026-04-14 22:24:06.366875] epoch=040 objective=pairwise_rank train_loss=0.5820 valid_loss=0.6408 valid_f1=0.4706 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4912 neg_score=0.4009 score_gap=0.0903 col_emb_norm=4.2168 con_emb_norm=4.0401 param_update_norm=0.126622
+[2026-04-14 22:24:06.661041] epoch=041 objective=pairwise_rank train_loss=0.5726 valid_loss=0.6327 valid_f1=0.4706 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4867 neg_score=0.3874 score_gap=0.0993 col_emb_norm=4.2230 con_emb_norm=4.0477 param_update_norm=0.104578
+[2026-04-14 22:24:06.928779] epoch=042 objective=pairwise_rank train_loss=0.6118 valid_loss=0.6267 valid_f1=0.4706 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4828 neg_score=0.3785 score_gap=0.1044 col_emb_norm=4.2159 con_emb_norm=4.0518 param_update_norm=0.104546
+[2026-04-14 22:24:07.195079] epoch=043 objective=pairwise_rank train_loss=0.6005 valid_loss=0.6084 valid_f1=0.5333 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4576 neg_score=0.3484 score_gap=0.1092 col_emb_norm=4.2051 con_emb_norm=4.0579 param_update_norm=0.153385
+[2026-04-14 22:24:07.508927] epoch=044 objective=pairwise_rank train_loss=0.5751 valid_loss=0.6120 valid_f1=0.4286 valid_top1=1.0000 valid_mrr=1.0000 pos_score=0.4433 neg_score=0.3397 score_gap=0.1036 col_emb_norm=4.2032 con_emb_norm=4.0653 param_update_norm=0.121221
+[2026-04-14 22:24:07.509120] early stopping
+[2026-04-14 22:24:07.645717] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-14 22:24:07.645878] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-14 23:33:23.199920] train_samples=5 valid_samples=1
+[2026-04-14 23:33:23.200194] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 6}
+[2026-04-14 23:33:23.200265] model=BiGAT device=cpu hidden_dim=16
+[2026-04-14 23:33:23.714616] epoch=001 objective=pairwise_rank train_loss=0.6957 valid_loss=0.7047 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.3333 pos_score=0.4269 neg_score=0.4321 score_gap=-0.0053 col_emb_norm=4.0041 con_emb_norm=4.0001 param_update_norm=0.186568
+[2026-04-14 23:33:23.719434] saved best BiGAT model
+[2026-04-14 23:33:24.074426] epoch=002 objective=pairwise_rank train_loss=0.6852 valid_loss=0.7119 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4400 neg_score=0.4486 score_gap=-0.0086 col_emb_norm=4.0092 con_emb_norm=4.0057 param_update_norm=0.152340
+[2026-04-14 23:33:24.522486] epoch=003 objective=pairwise_rank train_loss=0.6925 valid_loss=0.7202 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4572 neg_score=0.4696 score_gap=-0.0124 col_emb_norm=4.0167 con_emb_norm=4.0116 param_update_norm=0.133630
+[2026-04-14 23:33:24.891586] epoch=004 objective=pairwise_rank train_loss=0.6800 valid_loss=0.7244 valid_f1=0.1538 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4750 neg_score=0.4891 score_gap=-0.0141 col_emb_norm=4.0248 con_emb_norm=4.0157 param_update_norm=0.117471
+[2026-04-14 23:33:25.267389] epoch=005 objective=pairwise_rank train_loss=0.6837 valid_loss=0.7281 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.4887 neg_score=0.5039 score_gap=-0.0152 col_emb_norm=4.0320 con_emb_norm=4.0171 param_update_norm=0.110944
+[2026-04-14 23:33:25.661533] epoch=006 objective=pairwise_rank train_loss=0.6662 valid_loss=0.7301 valid_f1=0.4000 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.4995 neg_score=0.5150 score_gap=-0.0154 col_emb_norm=4.0367 con_emb_norm=4.0179 param_update_norm=0.100839
+[2026-04-14 23:33:26.041511] epoch=007 objective=pairwise_rank train_loss=0.6650 valid_loss=0.7338 valid_f1=0.4000 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.5036 neg_score=0.5201 score_gap=-0.0165 col_emb_norm=4.0308 con_emb_norm=4.0162 param_update_norm=0.103061
+[2026-04-14 23:33:26.426475] epoch=008 objective=pairwise_rank train_loss=0.6606 valid_loss=0.7403 valid_f1=0.4000 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.5049 neg_score=0.5233 score_gap=-0.0184 col_emb_norm=4.0277 con_emb_norm=4.0155 param_update_norm=0.112141
+[2026-04-14 23:33:26.821655] epoch=009 objective=pairwise_rank train_loss=0.6649 valid_loss=0.7477 valid_f1=0.4000 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.5042 neg_score=0.5244 score_gap=-0.0202 col_emb_norm=4.0290 con_emb_norm=4.0169 param_update_norm=0.107296
+[2026-04-14 23:33:26.821914] early stopping
+[2026-04-14 23:33:27.080756] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-14 23:33:27.080935] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-14 23:33:44.882749] resumed from checkpoint=GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt
+[2026-04-14 23:33:45.711911] train_samples=5 valid_samples=1
+[2026-04-14 23:33:45.712028] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 6}
+[2026-04-14 23:33:45.712081] model=BiGAT device=cpu hidden_dim=16
+[2026-04-14 23:33:46.243593] epoch=001 objective=pairwise_rank train_loss=0.6849 valid_loss=0.7122 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.4432 neg_score=0.4518 score_gap=-0.0086 col_emb_norm=4.0149 con_emb_norm=4.0083 param_update_norm=0.193636
+[2026-04-14 23:33:46.245729] saved best BiGAT model
+[2026-04-14 23:33:46.672075] epoch=002 objective=pairwise_rank train_loss=0.6787 valid_loss=0.7190 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4586 neg_score=0.4703 score_gap=-0.0117 col_emb_norm=4.0235 con_emb_norm=4.0125 param_update_norm=0.144449
+[2026-04-14 23:33:47.065444] epoch=003 objective=pairwise_rank train_loss=0.6889 valid_loss=0.7231 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.4657 neg_score=0.4791 score_gap=-0.0134 col_emb_norm=4.0276 con_emb_norm=4.0163 param_update_norm=0.122508
+[2026-04-14 23:33:47.473715] epoch=004 objective=pairwise_rank train_loss=0.6778 valid_loss=0.7283 valid_f1=0.1667 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4701 neg_score=0.4853 score_gap=-0.0152 col_emb_norm=4.0322 con_emb_norm=4.0181 param_update_norm=0.109962
+[2026-04-14 23:33:47.896558] epoch=005 objective=pairwise_rank train_loss=0.6798 valid_loss=0.7335 valid_f1=0.3077 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4739 neg_score=0.4902 score_gap=-0.0164 col_emb_norm=4.0375 con_emb_norm=4.0236 param_update_norm=0.106310
+[2026-04-14 23:33:48.265256] epoch=006 objective=pairwise_rank train_loss=0.6613 valid_loss=0.7378 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.4776 neg_score=0.4950 score_gap=-0.0174 col_emb_norm=4.0419 con_emb_norm=4.0265 param_update_norm=0.103166
+[2026-04-14 23:33:48.642528] epoch=007 objective=pairwise_rank train_loss=0.6616 valid_loss=0.7434 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4806 neg_score=0.4999 score_gap=-0.0193 col_emb_norm=4.0375 con_emb_norm=4.0262 param_update_norm=0.106610
+[2026-04-14 23:33:49.038090] epoch=008 objective=pairwise_rank train_loss=0.6569 valid_loss=0.7500 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4863 neg_score=0.5075 score_gap=-0.0212 col_emb_norm=4.0356 con_emb_norm=4.0279 param_update_norm=0.111505
+[2026-04-14 23:33:49.410310] epoch=009 objective=pairwise_rank train_loss=0.6612 valid_loss=0.7567 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4884 neg_score=0.5109 score_gap=-0.0224 col_emb_norm=4.0386 con_emb_norm=4.0296 param_update_norm=0.104411
+[2026-04-14 23:33:49.412353] early stopping
+[2026-04-14 23:33:49.629781] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-14 23:33:49.630122] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-14 23:34:27.886012] resumed from checkpoint=GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt
+[2026-04-14 23:34:28.883442] train_samples=5 valid_samples=1
+[2026-04-14 23:34:28.883602] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 6}
+[2026-04-14 23:34:28.883663] model=BiGAT device=cpu hidden_dim=16
+[2026-04-14 23:34:29.408507] epoch=001 objective=pairwise_rank train_loss=0.6776 valid_loss=0.7152 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.4487 neg_score=0.4587 score_gap=-0.0100 col_emb_norm=4.0220 con_emb_norm=4.0122 param_update_norm=0.176242
+[2026-04-14 23:34:29.412027] saved best BiGAT model
+[2026-04-14 23:34:29.823087] epoch=002 objective=pairwise_rank train_loss=0.6748 valid_loss=0.7246 valid_f1=0.0000 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4571 neg_score=0.4711 score_gap=-0.0141 col_emb_norm=4.0310 con_emb_norm=4.0175 param_update_norm=0.138183
+[2026-04-14 23:34:30.255174] epoch=003 objective=pairwise_rank train_loss=0.6864 valid_loss=0.7310 valid_f1=0.1667 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4588 neg_score=0.4752 score_gap=-0.0164 col_emb_norm=4.0354 con_emb_norm=4.0219 param_update_norm=0.119753
+[2026-04-14 23:34:30.648405] epoch=004 objective=pairwise_rank train_loss=0.6741 valid_loss=0.7372 valid_f1=0.1538 valid_top1=0.0000 valid_mrr=0.2000 pos_score=0.4654 neg_score=0.4838 score_gap=-0.0184 col_emb_norm=4.0413 con_emb_norm=4.0229 param_update_norm=0.110763
+[2026-04-14 23:34:31.046017] epoch=005 objective=pairwise_rank train_loss=0.6781 valid_loss=0.7453 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4724 neg_score=0.4930 score_gap=-0.0207 col_emb_norm=4.0479 con_emb_norm=4.0283 param_update_norm=0.106964
+[2026-04-14 23:34:31.515249] epoch=006 objective=pairwise_rank train_loss=0.6568 valid_loss=0.7511 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4746 neg_score=0.4966 score_gap=-0.0219 col_emb_norm=4.0533 con_emb_norm=4.0315 param_update_norm=0.100404
+[2026-04-14 23:34:31.941273] epoch=007 objective=pairwise_rank train_loss=0.6590 valid_loss=0.7543 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4746 neg_score=0.4974 score_gap=-0.0227 col_emb_norm=4.0496 con_emb_norm=4.0307 param_update_norm=0.108518
+[2026-04-14 23:34:32.378650] epoch=008 objective=pairwise_rank train_loss=0.6564 valid_loss=0.7607 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4788 neg_score=0.5032 score_gap=-0.0244 col_emb_norm=4.0480 con_emb_norm=4.0330 param_update_norm=0.111769
+[2026-04-14 23:34:32.780287] epoch=009 objective=pairwise_rank train_loss=0.6580 valid_loss=0.7677 valid_f1=0.2857 valid_top1=0.0000 valid_mrr=0.1667 pos_score=0.4839 neg_score=0.5094 score_gap=-0.0255 col_emb_norm=4.0499 con_emb_norm=4.0346 param_update_norm=0.111884
+[2026-04-14 23:34:32.780534] early stopping
+[2026-04-14 23:34:33.008978] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-14 23:34:33.009175] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-18 00:58:11.887090] resumed from checkpoint=/Users/trannguyenhung/Documents/THESIS/Code/Current Code/GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt
+[2026-04-18 00:58:14.522801] train_samples=3 valid_samples=1
+[2026-04-18 00:58:14.522961] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 4}
+[2026-04-18 00:58:14.523058] model=BiGAT device=cpu hidden_dim=16
+[2026-04-23 16:30:23.402739] train_samples=12 valid_samples=1
+[2026-04-23 16:30:23.404788] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 13}
+[2026-04-23 16:30:23.404851] model=BiGAT device=cpu hidden_dim=16
+[2026-04-23 16:30:23.404903] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-23 16:30:23.503299] epoch=001 objective=pairwise_rank train_loss=0.6045 valid_loss=0.5122 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.4008 score_gap=nan col_emb_norm=4.0321 con_emb_norm=3.9906 param_update_norm=0.332173
+[2026-04-23 16:30:23.538979] epoch=002 objective=pairwise_rank train_loss=0.5189 valid_loss=0.4380 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.3547 score_gap=nan col_emb_norm=4.0760 con_emb_norm=4.0054 param_update_norm=0.256155
+[2026-04-23 16:30:23.574350] epoch=003 objective=pairwise_rank train_loss=0.4884 valid_loss=0.3738 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.3119 score_gap=nan col_emb_norm=4.1248 con_emb_norm=4.0186 param_update_norm=0.201706
+[2026-04-23 16:30:23.609818] epoch=004 objective=pairwise_rank train_loss=0.4504 valid_loss=0.3174 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2719 score_gap=nan col_emb_norm=4.1763 con_emb_norm=4.0205 param_update_norm=0.187080
+[2026-04-23 16:30:23.645296] epoch=005 objective=pairwise_rank train_loss=0.3742 valid_loss=0.2747 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2402 score_gap=nan col_emb_norm=4.2191 con_emb_norm=4.0160 param_update_norm=0.166329
+[2026-04-23 16:30:23.807673] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-23 16:30:23.807796] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-23 16:40:35.254805] train_samples=12 valid_samples=1
+[2026-04-23 16:40:35.255728] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 13}
+[2026-04-23 16:40:35.255787] model=BiGAT device=cpu hidden_dim=16
+[2026-04-23 16:40:35.255835] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-23 16:40:35.352702] epoch=001 objective=pairwise_rank train_loss=0.6045 valid_loss=0.5122 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.4008 score_gap=nan col_emb_norm=4.0321 con_emb_norm=3.9906 param_update_norm=0.332173
+[2026-04-23 16:40:35.388385] epoch=002 objective=pairwise_rank train_loss=0.5189 valid_loss=0.4380 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.3547 score_gap=nan col_emb_norm=4.0760 con_emb_norm=4.0054 param_update_norm=0.256155
+[2026-04-23 16:40:35.423193] epoch=003 objective=pairwise_rank train_loss=0.4884 valid_loss=0.3738 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.3119 score_gap=nan col_emb_norm=4.1248 con_emb_norm=4.0186 param_update_norm=0.201706
+[2026-04-23 16:40:35.458084] epoch=004 objective=pairwise_rank train_loss=0.4504 valid_loss=0.3174 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2719 score_gap=nan col_emb_norm=4.1763 con_emb_norm=4.0205 param_update_norm=0.187080
+[2026-04-23 16:40:35.493443] epoch=005 objective=pairwise_rank train_loss=0.3742 valid_loss=0.2747 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2402 score_gap=nan col_emb_norm=4.2191 con_emb_norm=4.0160 param_update_norm=0.166329
+[2026-04-23 16:40:35.613815] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-23 16:40:35.613893] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-23 16:42:17.114200] train_samples=12 valid_samples=2
+[2026-04-23 16:42:17.114443] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 14}
+[2026-04-23 16:42:17.114484] model=BiGAT device=cpu hidden_dim=16
+[2026-04-23 16:42:17.114543] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-23 16:42:17.175092] epoch=001 objective=pairwise_rank train_loss=0.5327 valid_loss=0.6058 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4357 neg_score=0.3955 score_gap=0.0402 col_emb_norm=4.0357 con_emb_norm=3.9984 param_update_norm=0.360864
+[2026-04-23 16:42:17.179585] saved best BiGAT model
+[2026-04-23 16:42:17.215219] epoch=002 objective=pairwise_rank train_loss=0.4279 valid_loss=0.5776 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4258 neg_score=0.3637 score_gap=0.0621 col_emb_norm=4.0660 con_emb_norm=4.0050 param_update_norm=0.224793
+[2026-04-23 16:42:17.250401] epoch=003 objective=pairwise_rank train_loss=0.3869 valid_loss=0.5547 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4133 neg_score=0.3339 score_gap=0.0794 col_emb_norm=4.1001 con_emb_norm=4.0065 param_update_norm=0.178127
+[2026-04-23 16:42:17.284943] epoch=004 objective=pairwise_rank train_loss=0.3200 valid_loss=0.5296 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4085 neg_score=0.3053 score_gap=0.1032 col_emb_norm=4.1248 con_emb_norm=4.0132 param_update_norm=0.211602
+[2026-04-23 16:42:17.320016] epoch=005 objective=pairwise_rank train_loss=0.2517 valid_loss=0.5091 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4073 neg_score=0.2796 score_gap=0.1277 col_emb_norm=4.1536 con_emb_norm=4.0306 param_update_norm=0.255832
+[2026-04-23 16:42:17.439589] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-23 16:42:17.439711] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-23 16:42:51.489012] train_samples=12 valid_samples=1
+[2026-04-23 16:42:51.489266] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 13}
+[2026-04-23 16:42:51.489315] model=BiGAT device=cpu hidden_dim=16
+[2026-04-23 16:42:51.489354] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-23 16:42:51.542421] epoch=001 objective=pairwise_rank train_loss=0.5518 valid_loss=0.4218 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.3441 score_gap=nan col_emb_norm=4.0315 con_emb_norm=4.0190 param_update_norm=0.359377
+[2026-04-23 16:42:51.578402] epoch=002 objective=pairwise_rank train_loss=0.4308 valid_loss=0.3269 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2789 score_gap=nan col_emb_norm=4.0904 con_emb_norm=4.0542 param_update_norm=0.274035
+[2026-04-23 16:42:51.613575] epoch=003 objective=pairwise_rank train_loss=0.3560 valid_loss=0.2468 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2187 score_gap=nan col_emb_norm=4.1554 con_emb_norm=4.0759 param_update_norm=0.236832
+[2026-04-23 16:42:51.648170] epoch=004 objective=pairwise_rank train_loss=0.2788 valid_loss=0.1887 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.1720 score_gap=nan col_emb_norm=4.2159 con_emb_norm=4.0814 param_update_norm=0.250083
+[2026-04-23 16:42:51.683600] epoch=005 objective=pairwise_rank train_loss=0.2131 valid_loss=0.1430 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.1333 score_gap=nan col_emb_norm=4.2762 con_emb_norm=4.0847 param_update_norm=0.195558
+[2026-04-23 16:42:51.804630] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-23 16:42:51.804722] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-23 16:44:00.587035] train_samples=12 valid_samples=2
+[2026-04-23 16:44:00.587308] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 14}
+[2026-04-23 16:44:00.587353] model=BiGAT device=cpu hidden_dim=16
+[2026-04-23 16:44:00.587390] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-23 16:44:00.654453] epoch=001 objective=pairwise_rank train_loss=0.4810 valid_loss=0.5575 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4609 neg_score=0.3841 score_gap=0.0769 col_emb_norm=4.0345 con_emb_norm=4.0170 param_update_norm=0.409120
+[2026-04-23 16:44:00.658910] saved best BiGAT model
+[2026-04-23 16:44:00.702536] epoch=002 objective=pairwise_rank train_loss=0.3744 valid_loss=0.5023 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4538 neg_score=0.3310 score_gap=0.1228 col_emb_norm=4.0755 con_emb_norm=4.0417 param_update_norm=0.296986
+[2026-04-23 16:44:00.745889] epoch=003 objective=pairwise_rank train_loss=0.2883 valid_loss=0.4558 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4538 neg_score=0.2841 score_gap=0.1697 col_emb_norm=4.1278 con_emb_norm=4.0620 param_update_norm=0.259763
+[2026-04-23 16:44:00.788565] epoch=004 objective=pairwise_rank train_loss=0.2246 valid_loss=0.4202 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4739 neg_score=0.2513 score_gap=0.2226 col_emb_norm=4.1789 con_emb_norm=4.0869 param_update_norm=0.284418
+[2026-04-23 16:44:00.830850] epoch=005 objective=pairwise_rank train_loss=0.1391 valid_loss=0.3952 ranking_valid_mrr=1.0000 ranking_valid_top1=1.0000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.0000 binary_valid_f1=0.0000 pos_score=0.4817 neg_score=0.2237 score_gap=0.2580 col_emb_norm=4.2348 con_emb_norm=4.0937 param_update_norm=0.215513
+[2026-04-23 16:44:00.945271] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-23 16:44:00.945384] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-23 16:44:35.577467] train_samples=13 valid_samples=1
+[2026-04-23 16:44:35.578300] dataset_type=teacher data_dir=GNN/data/irplt_teacher label_sources={'teacher_rmp': 14}
+[2026-04-23 16:44:35.578353] model=BiGAT device=cpu hidden_dim=16
+[2026-04-23 16:44:35.578397] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-23 16:44:35.632689] epoch=001 objective=pairwise_rank train_loss=0.5901 valid_loss=0.4513 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.3632 score_gap=nan col_emb_norm=4.0223 con_emb_norm=4.0164 param_update_norm=0.344859
+[2026-04-23 16:44:35.669094] epoch=002 objective=pairwise_rank train_loss=0.4480 valid_loss=0.3696 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.3090 score_gap=nan col_emb_norm=4.0820 con_emb_norm=4.0308 param_update_norm=0.265738
+[2026-04-23 16:44:35.705843] epoch=003 objective=pairwise_rank train_loss=0.4697 valid_loss=0.2961 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2563 score_gap=nan col_emb_norm=4.1444 con_emb_norm=4.0380 param_update_norm=0.202280
+[2026-04-23 16:44:35.742991] epoch=004 objective=pairwise_rank train_loss=0.4048 valid_loss=0.2528 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.2234 score_gap=nan col_emb_norm=4.1922 con_emb_norm=4.0457 param_update_norm=0.171957
+[2026-04-23 16:44:35.779191] epoch=005 objective=pairwise_rank train_loss=0.3660 valid_loss=0.2154 ranking_valid_mrr=nan ranking_valid_top1=nan ranking_valid_top3=nan ranking_mean_positive_rank=nan binary_valid_f1=0.0000 pos_score=nan neg_score=0.1938 score_gap=nan col_emb_norm=4.2279 con_emb_norm=4.0484 param_update_norm=0.168554
+[2026-04-23 16:44:35.902351] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-23 16:44:35.902445] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
+[2026-04-24 10:58:34.681256] train_samples=58 valid_samples=24
+[2026-04-24 10:58:34.681890] dataset_type=teacher data_dir=/Users/trannguyenhung/Documents/THESIS/Code/Current Code/GNN/data/irplt_teacher label_sources={'teacher_rmp': 82}
+[2026-04-24 10:58:34.681950] model=BiGAT device=cpu hidden_dim=16
+[2026-04-24 10:58:34.681997] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-24 10:58:34.967300] epoch=001 objective=pairwise_rank train_loss=0.5513 valid_loss=0.3948 ranking_valid_mrr=0.9500 ranking_valid_top1=0.9000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=2.0000 binary_valid_f1=0.0000 pos_score=0.3229 neg_score=0.3165 score_gap=0.0064 col_emb_norm=4.0807 con_emb_norm=4.0473 param_update_norm=0.737020
+[2026-04-24 10:58:34.976827] saved best BiGAT model
+[2026-04-24 10:58:35.202653] epoch=002 objective=pairwise_rank train_loss=0.5011 valid_loss=0.4030 ranking_valid_mrr=0.9500 ranking_valid_top1=0.9000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=2.0000 binary_valid_f1=0.0000 pos_score=0.2597 neg_score=0.2774 score_gap=-0.0177 col_emb_norm=4.1095 con_emb_norm=4.1023 param_update_norm=0.690649
+[2026-04-24 10:58:35.428153] epoch=003 objective=pairwise_rank train_loss=0.4291 valid_loss=0.4275 ranking_valid_mrr=0.9500 ranking_valid_top1=0.9000 ranking_valid_top3=1.0000 ranking_mean_positive_rank=2.0000 binary_valid_f1=0.0000 pos_score=0.1759 neg_score=0.2186 score_gap=-0.0428 col_emb_norm=4.2134 con_emb_norm=4.1027 param_update_norm=0.780188
+[2026-04-24 10:58:35.548587] saved training history to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_history.json
+[2026-04-24 10:58:35.548701] saved training loss chart to GNN/trained_models/irplt_teacher/bigat/pairwise_rank/training_loss_curve.png
