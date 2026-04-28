@@ -70,7 +70,8 @@ DEBUG_N_SCENARIOS: int = 3   # used when --debug is passed
 
 DEFAULT_DATA_CSV   = "test data.csv"
 DEFAULT_OUTPUT_DIR = "Results/achamrah_validation"
-DEFAULT_CHECKPOINT = "Results/gnn_training/best_valid_prauc.pt"
+# Must match irp.DEFAULT_GNN_CHECKPOINT exactly so run_lt_recourse_from_baseline can load it
+DEFAULT_CHECKPOINT = "GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt"
 DIST_REL_PATH      = Path("Distance data") / "mm_megamarket_distance_matrix_clean.csv"
 
 # ======================================================================
@@ -448,9 +449,10 @@ class ThesisCRunner:
             import torch
             payload = torch.load(str(ckpt), map_location="cpu", weights_only=False)
             assert "state_dict" in payload, "Checkpoint missing state_dict"
+            prauc = payload.get("best_valid_prauc") or payload.get("valid_metrics", {}).get("pr_auc", "?")
             print(f"[ThesisC] Checkpoint OK: {ckpt.name}  "
                   f"epoch={payload.get('last_epoch', '?')}  "
-                  f"valid_pr_auc={payload.get('best_valid_prauc', '?')}")
+                  f"valid_pr_auc={prauc}")
             self._checkpoint_ok = True
             return True
         except Exception as e:
