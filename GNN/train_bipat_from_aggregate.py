@@ -542,11 +542,23 @@ def _forward_batched(
     if optimizer is not None and training:
         optimizer.zero_grad()
 
+    _col_dim = getattr(model, "column_dim", None)
+    _con_dim = getattr(model, "constraint_dim", None)
+    _skipped_dim = 0
+
     for gid, sub in by_graph:
         graph = graphs[int(gid)]
         cols = sub["col_idx"].astype(int).values
         labels = torch.from_numpy(sub["label"].astype(np.float32).values).to(device)
         n = labels.numel()
+
+        # Skip graphs whose feature dimensions don't match the model to avoid crashes
+        if _col_dim is not None and graph["column_features"].shape[1:] and graph["column_features"].shape[1] != _col_dim:
+            _skipped_dim += 1
+            continue
+        if _con_dim is not None and graph["constraint_features"].shape[1:] and graph["constraint_features"].shape[1] != _con_dim:
+            _skipped_dim += 1
+            continue
 
         gtens = _to_tensor_graph(graph, device)
         logits_all = model(
@@ -573,6 +585,10 @@ def _forward_batched(
     if training and optimizer is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
+
+    if _skipped_dim > 0:
+        print(f"[forward] WARNING: skipped {_skipped_dim} graphs with mismatched feature dims "
+              f"(expected col={_col_dim} con={_con_dim}). Stale CSV? Run teacher generation again.")
 
     mean_loss = total_loss / max(1, total_n)
     probs_arr = np.concatenate(all_probs) if all_probs else np.zeros(0, dtype=np.float32)
