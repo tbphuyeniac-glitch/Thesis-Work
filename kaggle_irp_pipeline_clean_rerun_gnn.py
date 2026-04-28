@@ -1024,7 +1024,7 @@ offline_test_dir = gnn_dir / "offline_test"
 offline_test_dir.mkdir(parents=True, exist_ok=True)
 offline_test_csv = offline_test_dir / "test_per_sample.csv"
 
-if CHECKPOINT_BENCHMARK_C_ONLY or CHECKPOINT_BENCHMARK_A0_ONLY or BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE:
+if (CHECKPOINT_BENCHMARK_C_ONLY or CHECKPOINT_BENCHMARK_A0_ONLY or BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE) and not FRESH_GNN_TRAINING:
     print("\n[Step 7] checkpoint benchmark-only mode — skipping graph build, GNN training, and offline GNN test.")
     if (CHECKPOINT_BENCHMARK_C_ONLY or BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE) and not checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint required for C-only benchmark rerun: {checkpoint}")
