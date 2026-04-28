@@ -7,3 +7,5 @@ Results/
 
 Results/
 *.log
+Results_Kaggle/
+*.pt
