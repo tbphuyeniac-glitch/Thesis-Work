@@ -1358,7 +1358,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_arg_parser()
-    args   = parser.parse_args()
+    args, _ = parser.parse_known_args()  # ignore Jupyter/Papermill kernel args
 
     # Kaggle env-var overrides
     data_csv    = os.environ.get("VALIDATE_DATA_CSV",    args.data_csv)
