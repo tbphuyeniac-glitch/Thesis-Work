@@ -552,6 +552,7 @@ class ThesisCRunner:
                 data.holding_cost_wh[p] = 0.0
             data.vehicle_fixed_cost = 0.0
 
+
             # ── Distance override for fair comparison ────────────────────
             # The mapper loads real Vietnam highway distances (100-1000 km)
             # from matrix-format CSV. SharedDataBuilder fails to parse that
@@ -887,11 +888,13 @@ class AchamrahRunner:
         time_limit: int = ACHAMRAH_TIME_LIMIT,
         mip_gap: float = ACHAMRAH_MIP_GAP,
         threads: int = 4,
+        allow_direct_shipment: bool = True,
     ):
         self.vehicle_indexed_lt = vehicle_indexed_lt
         self.time_limit         = time_limit
         self.mip_gap            = mip_gap
         self.threads            = threads
+        self.allow_direct_shipment = allow_direct_shipment
         self.source_name = (
             "Achamrah_Matheuristic_VehicleLT"
             if vehicle_indexed_lt
@@ -1027,7 +1030,7 @@ class AchamrahRunner:
                 cluster_mipgap=self.mip_gap,
                 fmilp_mipgap=self.mip_gap,
             )
-            math_solver = AchamrahIRPTSolver(instance, params=params)
+            math_solver = AchamrahIRPTSolver(instance, params=params, allow_direct_shipment=self.allow_direct_shipment)
             math_result = math_solver.solve_full_matheuristic()
 
             best_routes = math_result.best_routes
