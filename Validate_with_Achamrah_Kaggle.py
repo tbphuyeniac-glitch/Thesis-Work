@@ -432,7 +432,7 @@ class ThesisCRunner:
         self,
         checkpoint_path: str,
         repo_root: Optional[str] = None,
-        cg_iterations: int = 50,
+        cg_iterations: int = 1,
         time_limit: int = THESIS_C_TIME_LIMIT,
         gnn_selection_mode: str = "adaptive_gap",
         allow_gnn_fallback: bool = ALLOW_GNN_FALLBACK,
@@ -679,6 +679,7 @@ class ThesisCRunner:
                         gnn_checkpoint=self.checkpoint_path,
                         use_gnn=True,
                         runtime_gnn_mode=True,
+                        collect_teacher_mode=False,
                         gnn_selection_mode=self.gnn_selection_mode,
                         use_classical_fallback=False,
                         gnn_max_keep=100,
@@ -1440,7 +1441,7 @@ class ValidationOrchestrator:
         self.thesis_runner = ThesisCRunner(
             checkpoint_path=checkpoint_path,
             repo_root=repo_root,
-            cg_iterations=50,
+            cg_iterations=1,
             time_limit=THESIS_C_TIME_LIMIT,
         )
         self.achamrah_runner = AchamrahRunner(
