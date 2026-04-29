@@ -627,7 +627,7 @@ class ThesisCRunner:
 
                 # Helper: one full pass = MIP routing → ALNS refine → CG/LT
                 def _one_pass():
-                    # Phase 1: Gurobi MIP for routing+inventory (no LT)
+                    # Phase 1: Gurobi MIP for routing+inventory (no LT).
                     mip_sol = None
                     try:
                         mip_sol = irp.AchamrahFullIRPTModel(data).solve(
@@ -712,15 +712,25 @@ class ThesisCRunner:
                     results_v1["lt_plan"] = (pd.DataFrame(columns=lt_cols)
                                              if lt_cols else pd.DataFrame())
 
-                # ===== ITER 2: feedback loop runs if LT plan exists =====
-                # (regardless of iter1 LT helpfulness — the LT plan signals
-                # which stores need rebalancing in iter2's ALNS routing).
+                # ===== ITER 2: feedback loop only when there's real shortage =====
+                # If iter1 already achieves ~0 shortage (e.g., MIP Phase 1
+                # found feasible delivery for all demand), iter2 is wasted
+                # work — there's nothing for the ALNS↔CG feedback to improve.
+                # Skip iter2 to save ~300-450s per scenario.
                 results_v2 = None
                 cost_with_lt_v2 = float("inf")
                 iter2_run = False
-                if isinstance(lt_plan_v1_full, pd.DataFrame) and not lt_plan_v1_full.empty:
+                shortage_units_v1 = float(
+                    no_lt_breakdown_v1.get("total_realized_shortage_units", 0.0)
+                )
+                should_try_iter2 = (
+                    shortage_units_v1 > 1.0
+                    and isinstance(lt_plan_v1_full, pd.DataFrame)
+                    and not lt_plan_v1_full.empty
+                )
+                if should_try_iter2:
                     lt_plan_v1 = lt_plan_v1_full
-                    if True:  # was: if lt_helped_v1:
+                    if True:  # gated above by should_try_iter2
                         # Effective demand for ALNS_v2:
                         #   recipient (to_store) demand reduced by LT inflow
                         #   donor     (from_store) demand increased to keep surplus
