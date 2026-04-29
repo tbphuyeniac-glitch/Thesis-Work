@@ -47,7 +47,11 @@ DIST_REL_PATH   = Path("Distance data") / "mm_megamarket_distance_matrix_clean.c
 TRAIN_DATA_PATH = REPO_ROOT / TRAIN_DATA_FILE
 TEST_DATA_PATH  = REPO_ROOT / TEST_DATA_FILE
 DIST_PATH       = REPO_ROOT / DIST_REL_PATH
-RESULTS_DIR     = Path("/kaggle/working/Results")
+# Honor IRP_RESULTS_DIR if set BEFORE the pipeline launches. This lets the
+# E1/E2 runner scripts route output into separate folders without editing
+# the pipeline. Falls back to the legacy hardcoded Kaggle path when unset.
+RESULTS_DIR     = Path(os.environ.get("IRP_RESULTS_DIR_OVERRIDE", "").strip()
+                       or "/kaggle/working/Results")
 
 # ── Master reproducibility seed ──────────────────────────
 MASTER_SEED = 42
@@ -87,7 +91,11 @@ MULTI_SCENARIO_MODE   = True
 # Use more base topologies and more shock realizations per base so the teacher
 # dataset has enough distinct source_instance values for GNN training.
 SCENARIOS_PER_BASE    = 5       # scenarios per base dataset
-CG_ITERATIONS_TEACHER = 10      # more complete teacher rows per scenario
+# Safety cap on CG iterations per (scenario, B&P node). The actual stop
+# condition is stopping_mode="convergence" — CG terminates the moment it
+# finds no negative reduced-cost column (LP optimum). Override via
+# IRP_CG_ITERATIONS_TEACHER if a deeper safety budget is needed.
+CG_ITERATIONS_TEACHER = int(os.environ.get("IRP_CG_ITERATIONS_TEACHER", "50"))
 TIME_LIMIT_TEACHER    = 300     # seconds per scenario run
 # Validation gate: graph builder raises if more than this fraction of teacher
 # groups had to be dropped for missing constraint features.  Tighten on full
@@ -209,7 +217,11 @@ RUN_ONLINE_LEARNING  = False
 ONLINE_LEARNING_EPOCHS = 2
 RUN_BENCHMARK        = True
 # Final clean run: wipe old Results/ before any artifacts or logs are written.
-CLEAR_RESULTS_DIR    = True
+# Env override IRP_CLEAR_RESULTS_DIR=0 lets external runners (E1/E2) request
+# preservation of an existing folder (used when resuming a Kaggle session).
+CLEAR_RESULTS_DIR    = (
+    os.environ.get("IRP_CLEAR_RESULTS_DIR", "1").lower() not in {"0", "false", "no", ""}
+)
 # Final clean run: always train from scratch inside this run.
 REUSE_EXISTING_CHECKPOINT = False
 BENCHMARK_N_REPEATS  = 3        # thesis comparison: run 3 repeats per A0/A/B/C variant

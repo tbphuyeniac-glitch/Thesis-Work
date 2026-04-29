@@ -78,6 +78,64 @@ GroupKey = Tuple[str, str, str, str, str, str]  # matches build_teacher_graph_da
 EASY_END_EPOCH = 30
 HARD_START_EPOCH = 121
 
+# Module-level switches set by main() before _build_graphs_from_rows runs.
+# Defaults preserve the LEGACY behaviour bit-identically:
+#   _LABEL_MODE      = "selected_in_rmp"  → label = teacher_label > 0.5
+#   _RC_TOP_K        = 1                  → unused under "selected_in_rmp"
+#   _OBJECTIVE       = "binary"           → BCE-with-logits (legacy)
+#   _RANKING_TARGET  = "teacher_label"    → graded-target falls back to binary
+_LABEL_MODE: str = "selected_in_rmp"
+_RC_TOP_K: int = 1
+_OBJECTIVE: str = "binary"
+_RANKING_TARGET: str = "teacher_label"
+_RANK_K_VALUES: Tuple[int, ...] = (1, 3, 5, 10)
+
+
+# Indices into utilities.COLUMN_FEATURE_NAMES that correspond to "rc-only"
+# information. The full list is:
+#   0  reduced_cost
+#   1  total_flow
+#   2  n_pairs
+#   3  total_need_covered
+#   4  total_surplus_consumed
+#   5  avg_shortage_ratio       ← service-level
+#   6  avg_surplus_ratio        ← service-level
+#   7  avg_time_urgency         ← service-level
+#   8  avg_negative_reduced_cost
+#   9  acceptance_score
+#  10  compensation_mean
+#  11  column_cost
+# rc_only keeps indices 0 and 8 (the two RC-derived features) and zeroes the rest.
+_RC_ONLY_ACTIVE_INDICES = (0, 8)
+
+
+def _resolve_column_feature_mask(spec: str, column_dim: int) -> Optional[List[float]]:
+    """Translate --column-feature-mask CLI value into a length-`column_dim`
+    list[0/1]. Returns None for "all" (the default → BiGAT uses all-ones,
+    bit-identical to legacy)."""
+    spec = (spec or "").strip().lower()
+    if spec in {"", "all", "none", "full"}:
+        return None
+    if spec in {"rc", "rc_only", "rc-only"}:
+        mask = [0.0] * column_dim
+        for idx in _RC_ONLY_ACTIVE_INDICES:
+            if 0 <= idx < column_dim:
+                mask[idx] = 1.0
+        return mask
+    parts = [chunk.strip() for chunk in spec.split(",") if chunk.strip()]
+    if len(parts) != column_dim:
+        raise ValueError(
+            f"--column-feature-mask='{spec}' has {len(parts)} entries; expected {column_dim}"
+        )
+    out: List[float] = []
+    for chunk in parts:
+        try:
+            v = float(chunk)
+        except ValueError:
+            raise ValueError(f"--column-feature-mask entry '{chunk}' is not numeric")
+        out.append(1.0 if v >= 0.5 else 0.0)
+    return out
+
 
 # =====================================================================
 # I/O helpers
@@ -324,15 +382,66 @@ def _build_graphs(rows: List[Dict[str, Any]]) -> Tuple[
         graphs.append(sample)
 
         # Record row → (graph_id, col_idx). We use the same sort order used above.
+        # When label_mode == 'rc_top_in_group', overwrite label so that the K
+        # rows with the most-negative reduced_cost in this graph (per
+        # (product, period) group) get label=1, and all others get label=0.
+        # This isolates "does the GNN learn rc-ranking?" from any label
+        # noise in selected_in_rmp. K is controlled by --rc-top-k (default 1).
+        if _LABEL_MODE == "rc_top_in_group":
+            # Sub-group by (product, period) within this graph for fair ranking.
+            from collections import defaultdict as _dd
+            sub_groups = _dd(list)
+            for col_idx, r in enumerate(group_rows):
+                key = (str(r.get("product") or ""), str(r.get("period") or ""))
+                try:
+                    rc = float(r.get("reduced_cost") or 0.0)
+                except (TypeError, ValueError):
+                    rc = 0.0
+                sub_groups[key].append((col_idx, rc))
+            chosen_top: set = set()
+            for key, items in sub_groups.items():
+                items.sort(key=lambda pair: pair[1])  # ascending: most negative first
+                for col_idx, rc in items[: max(1, int(_RC_TOP_K))]:
+                    if rc < -1e-9:
+                        chosen_top.add(col_idx)
+        else:
+            chosen_top = None  # signals legacy "selected_in_rmp" mode below
+
         for col_idx, r in enumerate(group_rows):
+            if chosen_top is not None:
+                label_int = 1 if col_idx in chosen_top else 0
+            else:
+                try:
+                    label_val = float(r.get("teacher_label") or 0.0)
+                except (TypeError, ValueError):
+                    label_val = 0.0
+                label_int = int(label_val > 0.5)
+            # Compute the per-row ranking target. Picked once at row-build time
+            # so downstream sampling/forward passes can read it cheaply. The
+            # default `teacher_label` keeps target == binary label (legacy);
+            # `teacher_score` and `neg_reduced_cost` produce graded targets so
+            # pairwise_rank / score_regression have a non-trivial gradient.
             try:
-                label_val = float(r.get("teacher_label") or 0.0)
+                _rc = float(r.get("reduced_cost") or 0.0)
             except (TypeError, ValueError):
-                label_val = 0.0
+                _rc = 0.0
+            try:
+                _ts = float(r.get("teacher_score") or 0.0)
+            except (TypeError, ValueError):
+                _ts = 0.0
+            if _RANKING_TARGET == "teacher_score":
+                target_score = max(0.0, _ts)
+            elif _RANKING_TARGET == "neg_reduced_cost":
+                target_score = max(0.0, -_rc)
+            else:  # teacher_label (default, backward compat)
+                target_score = float(label_int)
             row_index.append({
                 "graph_id": graph_id,
                 "col_idx": col_idx,
-                "label": int(label_val > 0.5),
+                "label": label_int,
+                "target_score": float(target_score),
+                "reduced_cost": float(_rc),
+                "teacher_score_raw": float(_ts),
                 "source_instance": str(r.get("source_instance") or ""),
                 "shock_profile": str(r.get("shock_profile") or ""),
                 "store_limit": _coerce_int(r.get("store_limit")) or 0,
@@ -581,6 +690,89 @@ def _sample_with_curriculum(
 
 
 # =====================================================================
+# Loss functions (binary BCE, pairwise ranking, score regression)
+# =====================================================================
+
+def _binary_bce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Legacy BCE-with-logits (per-column independent classification)."""
+    return F.binary_cross_entropy_with_logits(logits, labels, reduction="mean")
+
+
+def _pairwise_ranking_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    target_scores: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Softplus-based pairwise ranking loss.
+
+    When `target_scores` is provided AND has graded values (not all in {0, 1}),
+    we form pairs (i, j) such that target_scores[i] > target_scores[j] and
+    penalise logits[i] < logits[j]. This produces a graded ranking signal
+    suitable for `--ranking-target teacher_score / neg_reduced_cost`.
+
+    Otherwise we fall back to the binary positive-vs-negative formulation
+    (matches GNN/03_train_bigat.py:pairwise_ranking_loss). Backward compatible
+    when called with `--ranking-target teacher_label`.
+    """
+    if logits.numel() < 2:
+        return logits.sum() * 0.0
+    is_graded = (
+        target_scores is not None
+        and target_scores.numel() == logits.numel()
+        and bool((target_scores > 1e-6).any())
+        and bool(((target_scores > 1e-6) & (target_scores < 1.0 - 1e-6)).any())
+    )
+    if is_graded:
+        diff_t = target_scores.unsqueeze(0) - target_scores.unsqueeze(1)
+        mask = diff_t > 1e-6
+        if not bool(mask.any()):
+            return logits.sum() * 0.0
+        diff_p = logits.unsqueeze(0) - logits.unsqueeze(1)
+        return F.softplus(-diff_p[mask]).mean()
+    # Binary fallback — same as GNN/03_train_bigat.py
+    pos_idx = torch.nonzero(labels > 0.5, as_tuple=False).flatten()
+    neg_idx = torch.nonzero(labels <= 0.5, as_tuple=False).flatten()
+    if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+        return logits.sum() * 0.0
+    pos_scores = logits[pos_idx][:, None]
+    neg_scores = logits[neg_idx][None, :]
+    return F.softplus(-(pos_scores - neg_scores)).mean()
+
+
+def _score_regression_loss(
+    logits: torch.Tensor,
+    target_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Smooth-L1 between sigmoid(logit) and the [0, 1]-normalised target.
+
+    Per-graph normalisation done at call site; this function only consumes the
+    already-normalised target.
+    """
+    return F.smooth_l1_loss(torch.sigmoid(logits), target_scores.float())
+
+
+def _compute_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    target_scores: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Dispatch loss based on module-global _OBJECTIVE."""
+    obj = _OBJECTIVE
+    if obj == "pairwise_rank":
+        return _pairwise_ranking_loss(logits, labels, target_scores)
+    if obj == "score_regression":
+        if target_scores is None or target_scores.numel() == 0:
+            return _binary_bce_loss(logits, labels)
+        # Per-graph normalise to [0, 1] so smooth_l1 stays well-scaled when
+        # different graphs have very different teacher_score magnitudes.
+        norm = target_scores.float()
+        max_t = norm.max().clamp_min(1e-12)
+        return _score_regression_loss(logits, norm / max_t)
+    # Default = binary BCE (backward compat with legacy training).
+    return _binary_bce_loss(logits, labels)
+
+
+# =====================================================================
 # Forward pass + masked loss
 # =====================================================================
 
@@ -603,17 +795,21 @@ def _forward_batched(
     *,
     training: bool,
     optimizer: Optional[torch.optim.Optimizer] = None,
-) -> Tuple[float, np.ndarray, np.ndarray]:
-    """Forward sampled rows grouped by graph_id, returning (loss, probs, labels).
+) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Forward sampled rows grouped by graph_id.
 
-    Loss is BCEWithLogitsLoss computed only on the columns selected by
-    `sampled_rows_df` within each graph.
+    Returns (loss, probs, labels, target_scores, graph_ids). The latter two are
+    needed for ranking metrics (MRR, NDCG, P@K, R@K) which are computed
+    per-graph then averaged. Loss is dispatched via `_compute_loss` based on
+    the module-global _OBJECTIVE.
     """
     model.train(training)
     total_loss = 0.0
     total_n = 0
     all_probs: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+    all_graph_ids: List[np.ndarray] = []
 
     by_graph = sampled_rows_df.groupby("graph_id", sort=False)
     if optimizer is not None and training:
@@ -622,11 +818,18 @@ def _forward_batched(
     _col_dim = getattr(model, "column_dim", None)
     _con_dim = getattr(model, "constraint_dim", None)
     _skipped_dim = 0
+    _has_target_score = "target_score" in sampled_rows_df.columns
 
     for gid, sub in by_graph:
         graph = graphs[int(gid)]
         cols = sub["col_idx"].astype(int).values
         labels = torch.from_numpy(sub["label"].astype(np.float32).values).to(device)
+        if _has_target_score:
+            target_arr = sub["target_score"].astype(np.float32).values
+            target_scores = torch.from_numpy(target_arr).to(device)
+        else:
+            target_arr = sub["label"].astype(np.float32).values
+            target_scores = labels
         n = labels.numel()
 
         # Skip graphs whose feature dimensions don't match the model to avoid crashes
@@ -648,7 +851,7 @@ def _forward_batched(
         if logits_all.numel() == 0:
             continue
         logits = logits_all[torch.from_numpy(cols).long().to(device)]
-        loss = F.binary_cross_entropy_with_logits(logits, labels, reduction="mean")
+        loss = _compute_loss(logits, labels, target_scores)
 
         if training and optimizer is not None:
             (loss * (n / max(1, len(sampled_rows_df)))).backward()
@@ -658,6 +861,8 @@ def _forward_batched(
         with torch.no_grad():
             all_probs.append(torch.sigmoid(logits).detach().cpu().numpy())
             all_labels.append(labels.detach().cpu().numpy())
+            all_targets.append(target_arr.astype(np.float32))
+            all_graph_ids.append(np.full(n, int(gid), dtype=np.int64))
 
     if training and optimizer is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -670,7 +875,110 @@ def _forward_batched(
     mean_loss = total_loss / max(1, total_n)
     probs_arr = np.concatenate(all_probs) if all_probs else np.zeros(0, dtype=np.float32)
     labels_arr = np.concatenate(all_labels) if all_labels else np.zeros(0, dtype=np.float32)
-    return mean_loss, probs_arr, labels_arr
+    targets_arr = np.concatenate(all_targets) if all_targets else np.zeros(0, dtype=np.float32)
+    graph_ids_arr = np.concatenate(all_graph_ids) if all_graph_ids else np.zeros(0, dtype=np.int64)
+    return mean_loss, probs_arr, labels_arr, targets_arr, graph_ids_arr
+
+
+def _ranking_metrics(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    target_scores: Optional[np.ndarray] = None,
+    graph_ids: Optional[np.ndarray] = None,
+    k_values: Tuple[int, ...] = (1, 3, 5, 10),
+) -> Dict[str, float]:
+    """Per-graph then macro-averaged ranking metrics.
+
+    Computes:
+      mrr, top1_acc, top1_score_match (graded equivalent of top-1),
+      ndcg_at_k, prec_at_k, rec_at_k for each k in k_values.
+
+    "Relevant" = label > 0.5 (binary). NDCG uses graded `target_scores` if
+    provided, else falls back to binary labels. Graphs with no positive label
+    are skipped from MRR/Prec/Rec (NDCG would be 0/0 — undefined). For Top-1
+    accuracy a graph with no positive contributes 0.
+    """
+    nan_out = {
+        "mrr": float("nan"),
+        "top1_acc": float("nan"),
+        "top1_score_match": float("nan"),
+        "n_graphs_with_positive": 0,
+    }
+    for k in k_values:
+        nan_out[f"ndcg_at_{k}"] = float("nan")
+        nan_out[f"prec_at_{k}"] = float("nan")
+        nan_out[f"rec_at_{k}"] = float("nan")
+    if probs.size == 0 or graph_ids is None or graph_ids.size == 0:
+        return nan_out
+
+    if target_scores is None or target_scores.size != probs.size:
+        target_scores = labels.astype(np.float32)
+
+    metrics_list: Dict[str, List[float]] = defaultdict(list)
+    n_graphs_with_pos = 0
+    unique_gids = np.unique(graph_ids)
+    for gid in unique_gids:
+        mask = graph_ids == gid
+        if not mask.any():
+            continue
+        scores_g = probs[mask]
+        truths_g = labels[mask]
+        targets_g = target_scores[mask]
+        n_g = scores_g.size
+        if n_g == 0:
+            continue
+
+        # Sort columns within this graph by predicted score (descending).
+        order = np.argsort(-scores_g, kind="mergesort")
+        sorted_truths = truths_g[order]
+        sorted_targets = targets_g[order]
+
+        # Top-1 metrics — defined for any graph
+        metrics_list["top1_acc"].append(float(sorted_truths[0] > 0.5))
+        # graded top-1: predicted top vs ground-truth top
+        ideal_top = float(np.max(targets_g))
+        if ideal_top > 1e-9:
+            metrics_list["top1_score_match"].append(float(sorted_targets[0]) / max(ideal_top, 1e-9))
+        else:
+            metrics_list["top1_score_match"].append(1.0)
+
+        has_positive = bool((truths_g > 0.5).any())
+        if has_positive:
+            n_graphs_with_pos += 1
+            # MRR — reciprocal rank of first relevant
+            rel_mask = sorted_truths > 0.5
+            first_rel_pos = int(np.argmax(rel_mask)) + 1
+            metrics_list["mrr"].append(1.0 / float(first_rel_pos))
+
+        # K-based metrics
+        total_positive = float((truths_g > 0.5).sum())
+        ideal_targets = np.sort(targets_g)[::-1]
+        for k in k_values:
+            kk = int(min(max(1, k), n_g))
+            top_k_truths = sorted_truths[:kk]
+            top_k_targets = sorted_targets[:kk]
+            n_rel_in_topk = float((top_k_truths > 0.5).sum())
+            metrics_list[f"prec_at_{k}"].append(n_rel_in_topk / kk)
+            if total_positive > 0:
+                metrics_list[f"rec_at_{k}"].append(n_rel_in_topk / total_positive)
+            # NDCG@k uses graded targets for both DCG and IDCG. We use the
+            # *linear* gain formulation ( gain(rel) = rel ) instead of the
+            # exponential ( 2^rel - 1 ) because teacher_score values can run
+            # into the hundreds-thousands (λ·|rc|) and 2^large overflows to
+            # +inf. Linear gain keeps NDCG well-defined for unbounded
+            # continuous targets and is also the standard choice for
+            # learning-to-rank with real-valued relevance.
+            log_pos = np.log2(np.arange(2, kk + 2))
+            dcg = (top_k_targets / log_pos).sum()
+            idcg = (ideal_targets[:kk] / log_pos).sum()
+            if idcg > 1e-9:
+                metrics_list[f"ndcg_at_{k}"].append(float(dcg / idcg))
+
+    out: Dict[str, float] = {}
+    for key, vals in metrics_list.items():
+        out[key] = float(np.mean(vals)) if vals else float("nan")
+    out["n_graphs_with_positive"] = int(n_graphs_with_pos)
+    return out
 
 
 def _binary_metrics(probs: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
@@ -742,7 +1050,73 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # Ablation: which label to predict.
+    #   selected_in_rmp  — teacher_label from CG (rmp-selected columns), legacy default
+    #   rc_top_in_group  — top-K most-negative-RC columns per (graph, product, period)
+    parser.add_argument("--label-mode", choices=["selected_in_rmp", "rc_top_in_group"],
+                        default="selected_in_rmp",
+                        help="Label generation strategy. Default preserves legacy behaviour.")
+    parser.add_argument("--rc-top-k", type=int, default=1,
+                        help="K for rc_top_in_group label mode (top-K negative-RC = positive).")
+    # Ablation: which input features the model can see (rc-only ablation uses
+    # a binary mask to disable service-level features without changing the
+    # architecture). Default = "all" → all-ones mask → bit-identical to legacy.
+    # Aliases supported:
+    #   "all"          → all 12 features active
+    #   "rc_only"      → only [reduced_cost, avg_negative_reduced_cost] active
+    #   "1,0,1,0,..."  → explicit comma-separated 0/1 mask of length 12
+    parser.add_argument("--column-feature-mask", default="all",
+                        help="Input feature gating: 'all', 'rc_only', or comma-separated 0/1.")
+    # GPU pinning helper for parallel runs on T4×2 (one variant per GPU).
+    parser.add_argument("--cuda-device-index", type=int, default=None,
+                        help="If set and device starts with 'cuda', pins to cuda:<index>.")
+    parser.add_argument("--resume-from", default="",
+                        help="Path to a checkpoint (last.pt) to warm-start from.")
+    # ── Objective / ranking-target / metrics ────────────────────────
+    # `binary`  (legacy) → per-column BCE-with-logits on the binary `label`.
+    # `pairwise_rank`   → softplus(-(score_i − score_j)) over column pairs
+    #                     within a graph; pair ordering uses --ranking-target.
+    # `score_regression`→ smooth_l1(sigmoid(score), normalized target).
+    parser.add_argument("--objective",
+                        choices=["binary", "pairwise_rank", "score_regression"],
+                        default="binary",
+                        help="Loss function. Default 'binary' preserves legacy training.")
+    # `teacher_label`     → use the binary label (0/1) as target; backward compat.
+    # `teacher_score`     → λ·max(0, −rc) read from the teacher CSV (recommended
+    #                       for pairwise_rank under the SLA-penalty regime).
+    # `neg_reduced_cost`  → max(0, −reduced_cost) — pure ranking by RC magnitude.
+    parser.add_argument("--ranking-target",
+                        choices=["teacher_label", "teacher_score", "neg_reduced_cost"],
+                        default="teacher_label",
+                        help="Per-row scalar used as the ranking target for "
+                             "pairwise_rank / score_regression objectives.")
+    parser.add_argument("--rank-k-values", default="1,3,5,10",
+                        help="Comma-separated K values for NDCG@K, P@K, R@K.")
     args = parser.parse_args()
+    # Push CLI choices into module-level globals BEFORE _build_graphs_from_rows
+    # is called so the label transformation picks them up.
+    global _LABEL_MODE, _RC_TOP_K, _OBJECTIVE, _RANKING_TARGET, _RANK_K_VALUES
+    _LABEL_MODE = str(args.label_mode)
+    _RC_TOP_K = max(1, int(args.rc_top_k))
+    _OBJECTIVE = str(args.objective)
+    _RANKING_TARGET = str(args.ranking_target)
+    try:
+        _RANK_K_VALUES = tuple(
+            int(v) for v in str(args.rank_k_values).split(",") if v.strip()
+        ) or (1, 3, 5, 10)
+    except ValueError:
+        _RANK_K_VALUES = (1, 3, 5, 10)
+    print(f"[label-mode] {_LABEL_MODE}  (rc_top_k={_RC_TOP_K})")
+    print(f"[objective]  {_OBJECTIVE}  ranking_target={_RANKING_TARGET}  "
+          f"rank_k={_RANK_K_VALUES}")
+    if _OBJECTIVE in {"pairwise_rank", "score_regression"} \
+            and _RANKING_TARGET == "teacher_label":
+        print(f"[objective]  WARNING: {_OBJECTIVE} with binary teacher_label target "
+              f"falls back to pos/neg pair sampling — for graded ranking pass "
+              f"--ranking-target teacher_score (or neg_reduced_cost).")
+    if args.cuda_device_index is not None and str(args.device).startswith("cuda"):
+        args.device = f"cuda:{int(args.cuda_device_index)}"
+        print(f"[device] pinned to {args.device}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -831,13 +1205,22 @@ def main() -> None:
     # 4) Build model
     # ------------------------------------------------------------------
     sample0 = graphs[0]
+    column_dim = int(sample0["column_features"].shape[1])
+    feature_mask = _resolve_column_feature_mask(args.column_feature_mask, column_dim)
+    if feature_mask is not None:
+        active = [i for i, v in enumerate(feature_mask) if v > 0.5]
+        print(f"[feature-mask] {args.column_feature_mask}  active_indices={active} "
+              f"({sum(feature_mask):.0f}/{column_dim} features)")
+    else:
+        print(f"[feature-mask] all (default)")
     model = BiGATColumnScorer(
-        column_dim=int(sample0["column_features"].shape[1]),
+        column_dim=column_dim,
         constraint_dim=int(sample0["constraint_features"].shape[1]),
         edge_dim=int(sample0["edge_attr_col_to_con"].shape[1])
             if sample0["edge_attr_col_to_con"].size else len(utilities.EDGE_FEATURE_NAMES),
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        column_feature_mask=feature_mask,
     ).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     print(f"[model] BiGAT hidden_dim={args.hidden_dim} dropout={args.dropout}")
@@ -849,17 +1232,67 @@ def main() -> None:
     sampling_log: List[Dict[str, Any]] = []
     best_val_loss = float("inf")
     best_val_prauc = -float("inf")
+    best_val_mrr = -float("inf")  # primary metric for pairwise_rank / score_regression
     bad_epochs = 0
     has_prauc = False  # set True after first valid epoch produces a finite PR-AUC
     rng = random.Random(args.seed)
 
     best_loss_path = out_dir / "best_valid_loss.pt"
     best_prauc_path = out_dir / "best_valid_prauc.pt"
+    best_mrr_path = out_dir / "best_valid_mrr.pt"  # ranking-objective primary
     last_path = out_dir / "last.pt"
     history_csv = out_dir / "training_log.csv"
     sampling_csv = out_dir / "sampling_log.csv"
 
-    for epoch in range(1, args.max_epochs + 1):
+    # ── Resume support ──────────────────────────────────────────────
+    # Reload weights, optimizer, best-tracker, history, and start_epoch.
+    # `--resume-from` points at the checkpoint to load; if not set but
+    # last.pt exists in --out-dir, auto-resume from there. Either way the
+    # next iteration of the for-loop continues from `start_epoch`.
+    start_epoch = 1
+    resume_path = Path(args.resume_from) if args.resume_from else last_path
+    if resume_path.exists() and resume_path.stat().st_size > 0:
+        try:
+            ckpt = torch.load(resume_path, map_location=args.device, weights_only=False)
+            model.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+            opt_state = ckpt.get("optimizer_state")
+            if opt_state is not None:
+                try:
+                    optimizer.load_state_dict(opt_state)
+                except Exception as opt_exc:
+                    print(f"[resume] WARNING: optimizer state load failed: {opt_exc}")
+            prior_history = ckpt.get("history") or []
+            if isinstance(prior_history, list) and prior_history:
+                history.extend(prior_history)
+            elif history_csv.exists() and history_csv.stat().st_size > 0:
+                # Fallback: rebuild history from on-disk training_log.csv if
+                # the checkpoint was written before we started persisting it.
+                try:
+                    csv_history = pd.read_csv(history_csv).to_dict("records")
+                    history.extend(csv_history)
+                    print(f"[resume] recovered {len(csv_history)} history rows from {history_csv.name}")
+                except Exception as csv_exc:
+                    print(f"[resume] WARNING: could not parse {history_csv.name}: {csv_exc}")
+            best_val_loss = float(ckpt.get("best_valid_loss", best_val_loss) or best_val_loss)
+            best_val_prauc = float(ckpt.get("best_valid_prauc", best_val_prauc) or best_val_prauc)
+            try:
+                best_val_mrr = float(ckpt.get("best_valid_mrr", best_val_mrr) or best_val_mrr)
+            except (TypeError, ValueError):
+                best_val_mrr = best_val_mrr
+            last_epoch_in_ckpt = int(ckpt.get("last_epoch", 0) or 0)
+            start_epoch = max(1, last_epoch_in_ckpt + 1)
+            print(f"[resume] loaded {resume_path.name}: start_epoch={start_epoch} "
+                  f"best_loss={best_val_loss:.4f} best_prauc={best_val_prauc:.4f} "
+                  f"history_rows={len(history)}")
+        except Exception as exc:
+            print(f"[resume] WARNING: failed to load {resume_path}: {exc}")
+    else:
+        print(f"[resume] no checkpoint at {resume_path} — starting fresh")
+
+    if start_epoch > args.max_epochs:
+        print(f"[resume] start_epoch={start_epoch} > max_epochs={args.max_epochs} — nothing to do.")
+
+    for epoch in range(start_epoch, args.max_epochs + 1):
         ep_rng = random.Random(args.seed + epoch)
         t_epoch = time.time()
 
@@ -874,11 +1307,14 @@ def main() -> None:
         train_batch = df_train.loc[train_idx].reset_index(drop=True)
 
         # --- Train one pass over the sampled rows ---
-        train_loss, train_probs, train_labels = _forward_batched(
+        train_loss, train_probs, train_labels, train_targets, train_gids = _forward_batched(
             model, graphs, train_batch, args.device,
             training=True, optimizer=optimizer,
         )
         train_metrics = _binary_metrics(train_probs, train_labels)
+        train_rank = _ranking_metrics(
+            train_probs, train_labels, train_targets, train_gids, _RANK_K_VALUES,
+        )
 
         # --- Validation: fast every epoch, full every K epochs ---
         if not df_valid.empty:
@@ -889,29 +1325,37 @@ def main() -> None:
             )
             valid_batch = df_valid.loc[valid_idx].reset_index(drop=True) if valid_idx else df_valid.iloc[:0]
             with torch.no_grad():
-                v_loss, v_probs, v_labels = _forward_batched(
+                v_loss, v_probs, v_labels, v_targets, v_gids = _forward_batched(
                     model, graphs, valid_batch, args.device,
                     training=False, optimizer=None,
                 )
             v_metrics = _binary_metrics(v_probs, v_labels)
             v_metrics["loss"] = v_loss
+            v_rank = _ranking_metrics(v_probs, v_labels, v_targets, v_gids, _RANK_K_VALUES)
+            for k, val in v_rank.items():
+                v_metrics[k] = val
 
             full_valid = (epoch % max(1, args.full_valid_every) == 0)
             if full_valid:
                 with torch.no_grad():
-                    fv_loss, fv_probs, fv_labels = _forward_batched(
+                    fv_loss, fv_probs, fv_labels, fv_targets, fv_gids = _forward_batched(
                         model, graphs, df_valid, args.device,
                         training=False, optimizer=None,
                     )
                 fv_metrics = _binary_metrics(fv_probs, fv_labels)
                 fv_metrics["loss"] = fv_loss
+                fv_rank = _ranking_metrics(
+                    fv_probs, fv_labels, fv_targets, fv_gids, _RANK_K_VALUES,
+                )
+                for k, val in fv_rank.items():
+                    fv_metrics[k] = val
             else:
                 fv_metrics = None
         else:
             v_loss = float("nan")
             v_metrics = {"loss": float("nan"), "accuracy": float("nan"), "precision": float("nan"),
                          "recall": float("nan"), "f1": float("nan"), "roc_auc": float("nan"),
-                         "pr_auc": float("nan")}
+                         "pr_auc": float("nan"), "mrr": float("nan"), "top1_acc": float("nan")}
             fv_metrics = None
             valid_sampling_stats = {"pos": 0, "neg": 0, "by_source_instance": {}}
 
@@ -922,11 +1366,16 @@ def main() -> None:
         row = {
             "epoch": epoch,
             "regime": train_sampling_stats.get("regime", ""),
+            "objective": _OBJECTIVE,
+            "ranking_target": _RANKING_TARGET,
             "train_loss": train_loss,
             "train_acc": train_metrics["accuracy"],
             "train_f1": train_metrics["f1"],
             "train_roc_auc": train_metrics["roc_auc"],
             "train_pr_auc": train_metrics["pr_auc"],
+            "train_mrr": train_rank.get("mrr", float("nan")),
+            "train_top1_acc": train_rank.get("top1_acc", float("nan")),
+            "train_ndcg_at_5": train_rank.get("ndcg_at_5", float("nan")),
             "valid_loss": v_metrics["loss"],
             "valid_acc": v_metrics["accuracy"],
             "valid_precision": v_metrics["precision"],
@@ -934,10 +1383,23 @@ def main() -> None:
             "valid_f1": v_metrics["f1"],
             "valid_roc_auc": v_metrics["roc_auc"],
             "valid_pr_auc": v_metrics["pr_auc"],
+            "valid_mrr": v_metrics.get("mrr", float("nan")),
+            "valid_top1_acc": v_metrics.get("top1_acc", float("nan")),
+            "valid_top1_score_match": v_metrics.get("top1_score_match", float("nan")),
+            "valid_ndcg_at_1": v_metrics.get("ndcg_at_1", float("nan")),
+            "valid_ndcg_at_3": v_metrics.get("ndcg_at_3", float("nan")),
+            "valid_ndcg_at_5": v_metrics.get("ndcg_at_5", float("nan")),
+            "valid_ndcg_at_10": v_metrics.get("ndcg_at_10", float("nan")),
+            "valid_prec_at_5": v_metrics.get("prec_at_5", float("nan")),
+            "valid_rec_at_5": v_metrics.get("rec_at_5", float("nan")),
+            "valid_n_graphs_with_positive": v_metrics.get("n_graphs_with_positive", 0),
             "full_valid_loss": fv_metrics["loss"] if fv_metrics else "",
             "full_valid_pr_auc": fv_metrics["pr_auc"] if fv_metrics else "",
             "full_valid_f1": fv_metrics["f1"] if fv_metrics else "",
             "full_valid_roc_auc": fv_metrics["roc_auc"] if fv_metrics else "",
+            "full_valid_mrr": fv_metrics.get("mrr", float("nan")) if fv_metrics else "",
+            "full_valid_top1_acc": fv_metrics.get("top1_acc", float("nan")) if fv_metrics else "",
+            "full_valid_ndcg_at_5": fv_metrics.get("ndcg_at_5", float("nan")) if fv_metrics else "",
             "epoch_seconds": time.time() - t_epoch,
         }
         history.append(row)
@@ -985,6 +1447,20 @@ def main() -> None:
         )
 
         # --- Checkpointing ---
+        # Read SLA penalty config from env so we can persist it into the
+        # checkpoint metadata (helps reproducibility — every saved model
+        # records exactly which penalty regime its teacher rows came from).
+        _sla_penalty_on = os.environ.get("IRP_SLA_PENALTY", "off").lower() in {
+            "1", "on", "true", "yes",
+        }
+        try:
+            _sla_mu = float(os.environ.get("IRP_SLA_MU", "0.0") or "0.0")
+        except ValueError:
+            _sla_mu = 0.0
+        try:
+            _sla_nu = float(os.environ.get("IRP_SLA_NU", "0.0") or "0.0")
+        except ValueError:
+            _sla_nu = 0.0
         ckpt_payload = {
             "state_dict": model.state_dict(),
             "config": {
@@ -993,6 +1469,9 @@ def main() -> None:
                 "edge_dim": model.edge_dim,
                 "hidden_dim": model.hidden_dim,
                 "dropout": args.dropout,
+                "column_feature_mask": [
+                    float(v) for v in model.column_feature_mask.tolist()
+                ],
             },
             "normalization": norm_stats,
             "feature_names": {
@@ -1006,26 +1485,57 @@ def main() -> None:
             "optimizer_state": optimizer.state_dict(),
             "best_valid_loss": best_val_loss,
             "best_valid_prauc": best_val_prauc,
+            "best_valid_mrr": best_val_mrr,
             "last_epoch": epoch,
-            "objective": "binary",
+            # Persist history list inside checkpoint so resume can recover
+            # training_log.csv even if the on-disk CSV gets clobbered (e.g.
+            # a new run overwriting the file with only post-resume rows).
+            "history": list(history),
+            # Experiment metadata — every checkpoint records the recipe.
+            "objective": _OBJECTIVE,
+            "ranking_target": _RANKING_TARGET,
+            "label_mode": _LABEL_MODE,
+            "feature_mode": str(args.column_feature_mask),
+            "rank_k_values": list(_RANK_K_VALUES),
+            "sla_penalty": {
+                "enabled": bool(_sla_penalty_on),
+                "mu": _sla_mu,
+                "nu": _sla_nu,
+            },
             "dataset_type": "aggregate_teacher_rows",
             "args": config_dict,
         }
         _atomic_torch_save(ckpt_payload, last_path)
 
         improved = False
+        # Best-by-loss is always tracked (even for pairwise_rank loss).
         if v_metrics["loss"] < best_val_loss - 1e-6:
             best_val_loss = v_metrics["loss"]
             ckpt_payload["best_valid_loss"] = best_val_loss
             _atomic_torch_save(ckpt_payload, best_loss_path)
-            if not has_prauc:
+            if _OBJECTIVE == "binary" and not has_prauc:
                 improved = True
+            elif _OBJECTIVE != "binary":
+                # For ranking objectives, treat loss-improvement as progress
+                # until the primary ranking metric (MRR) settles.
+                improved = improved or (not math.isfinite(best_val_mrr))
         cur_pr = v_metrics.get("pr_auc", float("nan"))
         if math.isfinite(cur_pr) and cur_pr > best_val_prauc + 1e-6:
             best_val_prauc = cur_pr
             ckpt_payload["best_valid_prauc"] = best_val_prauc
             _atomic_torch_save(ckpt_payload, best_prauc_path)
-            improved = True
+            if _OBJECTIVE == "binary":
+                improved = True
+        # Track best MRR — primary ranking metric for pairwise_rank /
+        # score_regression. Save under a separate file name so it never
+        # collides with the legacy best_valid_prauc.pt path.
+        cur_mrr = v_metrics.get("mrr", float("nan"))
+        if math.isfinite(cur_mrr) and cur_mrr > best_val_mrr + 1e-6:
+            best_val_mrr = cur_mrr
+            ckpt_payload["best_valid_mrr"] = best_val_mrr
+            _atomic_torch_save(ckpt_payload, best_mrr_path)
+            if _OBJECTIVE in {"pairwise_rank", "score_regression"}:
+                improved = True
 
         if improved:
             bad_epochs = 0
@@ -1048,8 +1558,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 6) Final full validation + test using best checkpoint
     # ------------------------------------------------------------------
-    primary_ckpt = best_prauc_path if (has_prauc and best_prauc_path.exists()) else best_loss_path
-    if not primary_ckpt.exists():
+    # Pick primary checkpoint based on objective:
+    #   ranking objectives (pairwise_rank, score_regression) → best MRR
+    #   binary                                               → best PR-AUC
+    #   fallback                                             → best loss / last
+    if _OBJECTIVE in {"pairwise_rank", "score_regression"} and best_mrr_path.exists():
+        primary_ckpt = best_mrr_path
+    elif has_prauc and best_prauc_path.exists():
+        primary_ckpt = best_prauc_path
+    elif best_loss_path.exists():
+        primary_ckpt = best_loss_path
+    else:
         primary_ckpt = last_path
 
     print(f"\n[final] loading best checkpoint: {primary_ckpt.name}")
@@ -1060,33 +1579,54 @@ def main() -> None:
         "best_checkpoint": str(primary_ckpt),
         "best_valid_loss": best_val_loss,
         "best_valid_prauc": best_val_prauc if math.isfinite(best_val_prauc) else None,
+        "best_valid_mrr": best_val_mrr if math.isfinite(best_val_mrr) else None,
+        "objective": _OBJECTIVE,
+        "ranking_target": _RANKING_TARGET,
+        "label_mode": _LABEL_MODE,
+        "feature_mode": str(args.column_feature_mask),
     }
 
     if not df_valid.empty:
         with torch.no_grad():
-            fv_loss, fv_probs, fv_labels = _forward_batched(
+            fv_loss, fv_probs, fv_labels, fv_targets, fv_gids = _forward_batched(
                 model, graphs, df_valid, args.device,
                 training=False, optimizer=None,
             )
         fv = _binary_metrics(fv_probs, fv_labels)
         fv["loss"] = fv_loss
+        fv_rank = _ranking_metrics(fv_probs, fv_labels, fv_targets, fv_gids, _RANK_K_VALUES)
+        for k, val in fv_rank.items():
+            fv[k] = val
         final_results["full_valid"] = fv
         print(f"[final-valid] loss={fv_loss:.4f} F1={fv['f1']:.4f} "
               f"PR-AUC={fv['pr_auc']:.4f} ROC-AUC={fv['roc_auc']:.4f} "
               f"P={fv['precision']:.4f} R={fv['recall']:.4f}")
+        print(f"[final-valid-rank] MRR={fv.get('mrr', float('nan')):.4f} "
+              f"top1={fv.get('top1_acc', float('nan')):.4f} "
+              f"NDCG@5={fv.get('ndcg_at_5', float('nan')):.4f} "
+              f"P@5={fv.get('prec_at_5', float('nan')):.4f} "
+              f"R@5={fv.get('rec_at_5', float('nan')):.4f}")
 
     if not df_test.empty:
         with torch.no_grad():
-            t_loss, t_probs, t_labels = _forward_batched(
+            t_loss, t_probs, t_labels, t_targets, t_gids = _forward_batched(
                 model, graphs, df_test, args.device,
                 training=False, optimizer=None,
             )
         tm = _binary_metrics(t_probs, t_labels)
         tm["loss"] = t_loss
+        t_rank = _ranking_metrics(t_probs, t_labels, t_targets, t_gids, _RANK_K_VALUES)
+        for k, val in t_rank.items():
+            tm[k] = val
         final_results["test"] = tm
         print(f"[final-test ] loss={t_loss:.4f} F1={tm['f1']:.4f} "
               f"PR-AUC={tm['pr_auc']:.4f} ROC-AUC={tm['roc_auc']:.4f} "
               f"P={tm['precision']:.4f} R={tm['recall']:.4f}")
+        print(f"[final-test-rank ] MRR={tm.get('mrr', float('nan')):.4f} "
+              f"top1={tm.get('top1_acc', float('nan')):.4f} "
+              f"NDCG@5={tm.get('ndcg_at_5', float('nan')):.4f} "
+              f"P@5={tm.get('prec_at_5', float('nan')):.4f} "
+              f"R@5={tm.get('rec_at_5', float('nan')):.4f}")
 
     _atomic_json_save(final_results, out_dir / "final_test_metrics.json")
     print(f"\n[done] artifacts written to {out_dir}")

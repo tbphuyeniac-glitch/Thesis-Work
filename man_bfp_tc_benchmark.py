@@ -207,9 +207,12 @@ class ManBFPTCRunner:
                     d = self.distance_fallback
                 cij[i][j] = float(d)
 
-        # Vehicle parameters: bk = Q/10 follows Man's data generator.
+        # Vehicle capacity; fixed dispatch cost set to 0 to match Thesis C
+        # (data.vehicle_fixed_cost = 0.0 in ThesisCRunner._build_irp_data).
+        # Man's paper uses bk = Q/10 but that inflates Man's routing cost by
+        # ~300–2400 per period vs Thesis C which has no fixed cost — unfair comparison.
         Qk = [self.vehicle_capacity for _ in range(self.vehicle_count)]
-        bk = [self.vehicle_capacity / 10.0 for _ in range(self.vehicle_count)]
+        bk = [0.0 for _ in range(self.vehicle_count)]
 
         # Product value & volume: defaults; uniform across stores.
         pim = [[self.product_value_default for _ in range(M)] for _ in range(N)]
@@ -288,7 +291,16 @@ class ManBFPTCRunner:
         scenario,                                  # ScenarioSpec, duck-typed
         df_slice: pd.DataFrame,
         dist_dict: Dict[Tuple[str, str], float],
+        demand_shock: Optional[Dict[Tuple[str, str, int], float]] = None,
     ) -> Tuple[ManBFPTCResult, List[Dict[str, Any]]]:
+        """Run Man-BFP-TC in rolling-horizon mode.
+
+        demand_shock: optional {(store_name, sku_name, period_int): multiplier}.
+            Stage-1 (routing) always uses forecast demand (dim_forecast = sale_qty).
+            Stage-2 (LT) uses dim_real = sale_qty * shock, simulating the scenario
+            where actual demand deviates from the plan — matching Man et al.'s
+            two-stage stochastic design.  If None, dim_real = dim_forecast (deterministic).
+        """
         t0 = time.time()
         scenario_id = getattr(scenario, "scenario_id", "")
         lt_moves_out: List[Dict[str, Any]] = []
@@ -339,7 +351,23 @@ class ManBFPTCRunner:
                 dim_actual = self._period_demand(
                     df_slice, period_date, store_to_idx, sku_to_idx, N, M,
                 )
-                dim_forecast = [list(row) for row in dim_actual]  # forecast = actual
+                # Stage-1 always plans with forecast (= historical sale_qty).
+                dim_forecast = [list(row) for row in dim_actual]
+
+                # Stage-2 sees realized demand: apply shock if provided, else
+                # realized = forecast (deterministic baseline).
+                if demand_shock:
+                    dim_real = [
+                        [
+                            dim_actual[i][m] * demand_shock.get(
+                                (id_to_store[i], id_to_sku[m], t_idx), 1.0
+                            )
+                            for m in range(M)
+                        ]
+                        for i in range(N)
+                    ]
+                else:
+                    dim_real = [list(row) for row in dim_actual]
 
                 # Iim0 in Man's layout: index 0 = DC, 1..N = stores
                 Iim0 = [list(Iim0_dc)] + [list(row) for row in Iim0_stores]
@@ -356,7 +384,7 @@ class ManBFPTCRunner:
                     vim=static["vim"],
                     him=static["him"],
                     Iim0=Iim0,
-                    dim_real=dim_actual,
+                    dim_real=dim_real,
                     dim=dim_forecast,
                     shortage_penalty_stage1=self.shortage_cost_rate,
                     shortage_penalty_stage2=self.shortage_cost_rate,

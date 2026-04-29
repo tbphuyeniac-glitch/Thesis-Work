@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -71,12 +71,32 @@ class BiGATColumnScorer(nn.Module):
         edge_dim: int = 3,
         hidden_dim: int = 64,
         dropout: float = 0.1,
+        column_feature_mask: Optional[Iterable[float]] = None,
     ):
         super().__init__()
         self.column_dim = int(column_dim)
         self.constraint_dim = int(constraint_dim)
         self.edge_dim = int(edge_dim)
         self.hidden_dim = int(hidden_dim)
+
+        # Per-column-feature gating mask. When None, all features are active
+        # (legacy behaviour, bit-identical to previous checkpoints). When
+        # provided, must be length column_dim with values in {0, 1}; the
+        # mask is registered as a non-trainable buffer so it travels with
+        # `state_dict()` and `to(device)`. Used by the rc-only ablation
+        # variant to disable service-level features (shortage_ratio,
+        # surplus_ratio, time_urgency, ...) at the input layer without
+        # changing model architecture.
+        if column_feature_mask is None:
+            mask_tensor = torch.ones(self.column_dim, dtype=torch.float32)
+        else:
+            mask_list = [float(value) for value in column_feature_mask]
+            if len(mask_list) != self.column_dim:
+                raise ValueError(
+                    f"column_feature_mask length {len(mask_list)} != column_dim {self.column_dim}"
+                )
+            mask_tensor = torch.tensor(mask_list, dtype=torch.float32)
+        self.register_buffer("column_feature_mask", mask_tensor, persistent=True)
 
         self.column_encoder = nn.Sequential(
             nn.Linear(self.column_dim, hidden_dim),
@@ -132,7 +152,10 @@ class BiGATColumnScorer(nn.Module):
         edge_attr_col_to_con: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return final column and constraint embeddings before scoring."""
-        h_col = self.column_norm0(self.column_encoder(column_features.float()))
+        # Apply per-feature gating mask. Default mask is all ones, so this is
+        # a no-op for legacy checkpoints (preserves bit-identical inference).
+        masked_features = column_features.float() * self.column_feature_mask.to(column_features.device)
+        h_col = self.column_norm0(self.column_encoder(masked_features))
         h_con = self.constraint_norm0(self.constraint_encoder(constraint_features.float()))
 
         edge_index_col_to_con = edge_index_col_to_con.long()
@@ -165,6 +188,12 @@ class BiGATColumnScorer(nn.Module):
                 "constraint_dim": self.constraint_dim,
                 "edge_dim": self.edge_dim,
                 "hidden_dim": self.hidden_dim,
+                # Persisted alongside state_dict so reloads honor the same
+                # ablation mask the checkpoint was trained under. Stored as
+                # a list of floats (json-friendly) for portability.
+                "column_feature_mask": [
+                    float(v) for v in self.column_feature_mask.tolist()
+                ],
             },
             "metadata": metadata,
         }, path)
@@ -172,7 +201,10 @@ class BiGATColumnScorer(nn.Module):
     @classmethod
     def load(cls, path: str | Path, map_location: str | torch.device = "cpu") -> "BiGATColumnScorer":
         checkpoint = torch.load(path, map_location=map_location)
-        model = cls(**checkpoint.get("config", {}))
+        config = dict(checkpoint.get("config", {}))
+        # Backward compat: legacy checkpoints have no mask field. cls() will
+        # default to an all-ones mask matching column_dim.
+        model = cls(**config)
         model.load_state_dict(checkpoint["state_dict"], strict=False)
         return model
 

@@ -34,6 +34,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -74,15 +75,210 @@ from Validate_with_Achamrah_Kaggle import (
 # -- Man-BFP-TC adapter ------------------------------------------------------ #
 from man_bfp_tc_benchmark import ManBFPTCRunner, ManBFPTCResult
 
+# -- Man-Joint-TC (Oracle) adapter ------------------------------------------- #
+from tsrfp_runner import JointTCRunner, JointTCResult
+
+
+# ======================================================================
+# DEMAND-SHOCKED DATA PROXY  (used by ManThesisCRunner only)
+# ======================================================================
+
+class _ShockedDataProxy:
+    """Wraps an IRPData object and intercepts `realized_demand` assignment.
+
+    When ThesisCRunner does `data.realized_demand = dict(data.demand)` inside
+    run_scenario(), this proxy applies the per-(store,sku,period) shock
+    multipliers before storing the value, so Stage-2 (CG/LT) evaluates cost
+    against shocked demand while Stage-1 routing still planned with forecast.
+
+    All other attribute reads/writes are forwarded transparently to the wrapped
+    IRPData, so duck-typed IRP solver code is unaffected.
+    """
+
+    def __init__(self, wrapped, shock: Dict[Tuple[str, str, int], float]):
+        object.__setattr__(self, "_w", wrapped)
+        object.__setattr__(self, "_shock", shock)
+        object.__setattr__(self, "_realized", None)
+
+    @property
+    def realized_demand(self):
+        return object.__getattribute__(self, "_realized")
+
+    @realized_demand.setter
+    def realized_demand(self, value: Dict):
+        shock = object.__getattribute__(self, "_shock")
+        object.__setattr__(
+            self, "_realized",
+            {k: v * shock.get(k, 1.0) for k, v in value.items()} if shock else value,
+        )
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_w"), name)
+
+    def __setattr__(self, name: str, value):
+        if name in ("_w", "_shock", "_realized"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_w"), name, value)
+
+
+# ======================================================================
+# THESIS-C RUNNER WITH SHOCK SUPPORT  (Man-validator-only subclass)
+# ======================================================================
+
+class ManThesisCRunner(ThesisCRunner):
+    """Thin subclass of ThesisCRunner that supports per-scenario demand shock.
+
+    Only `_build_irp_data` is overridden — it wraps the returned IRPData with
+    `_ShockedDataProxy` when a shock dict is active.  All other behaviour
+    (MIP/ALNS routing, CG/LT column generation) is unchanged.
+
+    Usage:
+        runner.set_shock(shock_dict)      # before run_scenario()
+        result = runner.run_scenario(...) # shock applied to realized_demand
+        runner.set_shock(None)            # reset to deterministic
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._active_shock: Optional[Dict] = None
+
+    def set_shock(self, shock: Optional[Dict]):
+        self._active_shock = shock or None
+
+    def _build_irp_data(self, scenario, df_slice, dist_dict):
+        data = super()._build_irp_data(scenario, df_slice, dist_dict)
+        shock = self._active_shock
+        if shock:
+            return _ShockedDataProxy(data, shock)
+        return data
+
+
+# ======================================================================
+# SCENARIO GENERATOR — relaxed minimum-period guard
+# ======================================================================
+
+class ManScenarioGenerator(ScenarioGenerator):
+    """Same as ScenarioGenerator but allows n_periods >= 1 (not >= 2).
+
+    Required so --window_length 1 doesn't produce an empty scenario list.
+    The parent hard-codes `if n_periods < 2: continue`; this subclass
+    replaces that check with `if n_periods < 1: continue`.
+    """
+
+    MIN_PERIODS: int = 1
+
+    def generate(self) -> List["ScenarioSpec"]:
+        df         = self._load_and_aggregate()
+        top_skus   = self._select_top_skus(df, self.sku_limit)
+        all_stores = sorted(df["store"].unique())
+        windows    = self._get_windows(df)
+
+        if not windows:
+            raise ValueError("[ScenarioGen] No valid period windows found in data.")
+
+        scenarios: list = []
+        size_labels = {5: "small", 8: "medium", 10: "large"}
+
+        for store_limit in self.store_limits:
+            if store_limit > len(all_stores):
+                print(f"[ScenarioGen] WARNING: store_limit={store_limit} > available stores "
+                      f"({len(all_stores)}); using {len(all_stores)}")
+                store_limit = len(all_stores)
+
+            size_label = size_labels.get(store_limit, f"size{store_limit}")
+
+            for scenario_idx in range(self.scenarios_per_size):
+                rng  = random.Random(self.base_seed + store_limit * 1000 + scenario_idx)
+                seed = self.base_seed + store_limit * 1000 + scenario_idx
+
+                selected_stores = sorted(
+                    rng.sample(list(all_stores), k=min(store_limit, len(all_stores)))
+                )
+                selected_skus = top_skus[: self.sku_limit]
+
+                win_idx             = scenario_idx % len(windows)
+                start_date, end_date = windows[win_idx]
+
+                mask = (
+                    df["store"].isin(selected_stores)
+                    & df["sku"].isin(selected_skus)
+                    & (df["period_date"].astype(str) >= start_date)
+                    & (df["period_date"].astype(str) <= end_date)
+                )
+                n_periods = df[mask]["period_date"].nunique()
+
+                if n_periods < self.MIN_PERIODS:
+                    print(
+                        f"[ScenarioGen] WARNING: scenario {scenario_idx} for size "
+                        f"{store_limit} has only {n_periods} periods; skipping."
+                    )
+                    continue
+
+                scenario_id = f"{size_label}_s{store_limit:02d}_sc{scenario_idx:02d}"
+
+                scenarios.append(
+                    ScenarioSpec(
+                        scenario_id=scenario_id,
+                        store_limit=store_limit,
+                        sku_limit=len(selected_skus),
+                        selected_stores=selected_stores,
+                        selected_skus=selected_skus,
+                        start_date=start_date,
+                        end_date=end_date,
+                        period_granularity=self.period_granularity,
+                        n_periods=n_periods,
+                        random_seed=seed,
+                        size_label=size_label,
+                        window_index=win_idx,
+                    )
+                )
+
+        print(
+            f"[ScenarioGen] Generated {len(scenarios)} scenarios "
+            f"({self.scenarios_per_size} per store size × {len(self.store_limits)} sizes)"
+        )
+        return scenarios
+
 
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
 
-MAN_TIME_LIMIT: int = int(os.environ.get("MAN_TIME_LIMIT", "1200"))
-MAN_MIP_GAP:   float = float(os.environ.get("MAN_MIP_GAP",  "0.01"))
+MAN_TIME_LIMIT:        int   = int(os.environ.get("MAN_TIME_LIMIT",        "1200"))
+MAN_MIP_GAP:           float = float(os.environ.get("MAN_MIP_GAP",           "0.01"))
+DEMAND_SHOCK_SIGMA:    float = float(os.environ.get("DEMAND_SHOCK_SIGMA",    "0.20"))
 
 DEFAULT_OUTPUT_DIR = "Results/man_validation"
+
+
+# ======================================================================
+# DEMAND SHOCK GENERATOR
+# ======================================================================
+
+def generate_demand_shock(
+    scenario: "ScenarioSpec",
+    n_periods: int,
+    sigma: float,
+) -> Dict[Tuple[str, str, int], float]:
+    """Return {(store, sku, period_int): multiplier} where period_int is 1-based.
+
+    Each multiplier is drawn from N(1, sigma^2), clipped to [0.5, 2.0].
+    sigma=0 returns {} (no shock — deterministic baseline).
+    The RNG is seeded deterministically so the same scenario always gets the
+    same shock regardless of run order.
+    """
+    if sigma <= 0.0:
+        return {}
+    rng = random.Random(scenario.random_seed ^ 0xF00DCAFE)
+    shock: Dict[Tuple[str, str, int], float] = {}
+    for t in range(1, n_periods + 1):
+        for store in scenario.selected_stores:
+            for sku in scenario.selected_skus:
+                eps = rng.gauss(1.0, sigma)
+                eps = max(0.5, min(2.0, eps))
+                shock[(store, sku, t)] = eps
+    return shock
 
 
 # ======================================================================
@@ -124,8 +320,47 @@ class ManRunner:
         scenario: ScenarioSpec,
         df_slice: pd.DataFrame,
         dist_dict: Dict[Tuple[str, str], float],
+        demand_shock: Optional[Dict[Tuple[str, str, int], float]] = None,
     ) -> Tuple[ManBFPTCResult, List[Dict[str, Any]]]:
-        return self._runner.run_scenario(scenario, df_slice, dist_dict)
+        return self._runner.run_scenario(scenario, df_slice, dist_dict,
+                                         demand_shock=demand_shock)
+
+
+# ======================================================================
+# JOINT-TC RUNNER WRAPPER
+# ======================================================================
+
+class JointRunner:
+    """Thin wrapper around JointTCRunner matching the ManRunner interface."""
+
+    METHOD_NAME = "Man-Joint-TC"
+
+    def __init__(
+        self,
+        time_limit: int = MAN_TIME_LIMIT,
+        mip_gap: float = MAN_MIP_GAP,
+        threads: int = 4,
+    ):
+        self._runner = JointTCRunner(
+            time_limit=time_limit,
+            mip_gap=mip_gap,
+            threads=threads,
+            vehicle_count=VEHICLE_COUNT,
+            vehicle_capacity=VEHICLE_CAPACITY,
+            holding_cost_rate=HOLDING_COST_RATE,
+            shortage_cost_rate=SHORTAGE_COST_RATE,
+        )
+        self.source_name = self.METHOD_NAME
+
+    def run_scenario(
+        self,
+        scenario: ScenarioSpec,
+        df_slice: pd.DataFrame,
+        dist_dict: Dict[Tuple[str, str], float],
+        demand_shock: Optional[Dict[Tuple[str, str, int], float]] = None,
+    ) -> Tuple[JointTCResult, List[Dict[str, Any]]]:
+        return self._runner.run_scenario(scenario, df_slice, dist_dict,
+                                         demand_shock=demand_shock)
 
 
 # ======================================================================
@@ -185,6 +420,55 @@ class ManComparisonEngine:
                 "runtime_C", "runtime_Man", "runtime_ratio_C_vs_Man",
                 "thesis_service_level", "man_service_level", "service_level_diff",
                 "lt_qty_diff", "shortage_cost_diff",
+            ]:
+                row[k] = float("nan")
+            row["interpretation"] = "comparison not possible (one or both methods failed)"
+        return row
+
+    @staticmethod
+    def compute_per_scenario_gaps_joint(
+        thesis_result: ScenarioResult,
+        joint_result:  "JointTCResult",
+    ) -> Dict[str, Any]:
+        """Same structure as compute_per_scenario_gaps but for C vs Man-Joint-TC."""
+        row: Dict[str, Any] = {
+            "scenario_id":       thesis_result.scenario_id,
+            "thesis_success":    thesis_result.success,
+            "joint_success":     joint_result.success,
+            "thesis_status":     thesis_result.status,
+            "joint_status":      joint_result.status,
+        }
+        if thesis_result.success and joint_result.success:
+            tc = thesis_result.total_cost
+            jc = joint_result.total_cost
+            gap = (tc - jc) / max(abs(jc), 1e-9) * 100.0
+            row.update({
+                "thesis_total_cost":          tc,
+                "joint_total_cost":           jc,
+                "cost_gap_pct":               round(gap, 4),
+                "cost_gap_abs":               round(tc - jc, 4),
+                "runtime_C":                  thesis_result.runtime_seconds,
+                "runtime_Joint":              joint_result.runtime_seconds,
+                "runtime_ratio_C_vs_Joint":   round(
+                    thesis_result.runtime_seconds / max(joint_result.runtime_seconds, 1e-3), 4
+                ),
+                "thesis_service_level":       thesis_result.service_level,
+                "joint_service_level":        joint_result.service_level,
+                "service_level_diff":         round(
+                    thesis_result.service_level - joint_result.service_level, 6
+                ),
+                "interpretation": (
+                    "C cheaper than Oracle" if gap < -0.5
+                    else "Oracle cheaper than C" if gap > 0.5
+                    else "C and Oracle within 0.5%"
+                ),
+            })
+        else:
+            for k in [
+                "thesis_total_cost", "joint_total_cost",
+                "cost_gap_pct", "cost_gap_abs",
+                "runtime_C", "runtime_Joint", "runtime_ratio_C_vs_Joint",
+                "thesis_service_level", "joint_service_level", "service_level_diff",
             ]:
                 row[k] = float("nan")
             row["interpretation"] = "comparison not possible (one or both methods failed)"
@@ -315,6 +599,9 @@ class ManOutputWriter:
         df = pd.DataFrame([s.to_dict() for s in scenarios])
         return self._save(df, "validate_man_vs_C_scenario_manifest.csv")
 
+    def write_joint_gaps(self, gap_rows: List[Dict]) -> Path:
+        return self._save(pd.DataFrame(gap_rows), "validate_man_vs_C_joint_gaps.csv")
+
 
 # ======================================================================
 # VALIDATION ORCHESTRATOR
@@ -338,27 +625,31 @@ class ManValidationOrchestrator:
         repo_root: Optional[str] = None,
         store_limits: Optional[List[int]] = None,
         scenarios_per_size: int = SCENARIOS_PER_SIZE,
+        window_length: int = WINDOW_LENGTH_PERIODS,
+        demand_shock_sigma: float = DEMAND_SHOCK_SIGMA,
         debug: bool = False,
         seed: int = 42,
     ):
-        self.data_csv   = data_csv
-        self.checkpoint = checkpoint_path
-        self.output_dir = output_dir
-        self.dist_path  = dist_path
-        self.repo_root  = repo_root
-        self.debug      = debug
-        self.seed       = seed
+        self.data_csv           = data_csv
+        self.checkpoint         = checkpoint_path
+        self.output_dir         = output_dir
+        self.dist_path          = dist_path
+        self.repo_root          = repo_root
+        self.window_length      = int(window_length)
+        self.demand_shock_sigma = float(demand_shock_sigma)
+        self.debug              = debug
+        self.seed               = seed
 
         _scenarios_per_size = DEBUG_N_SCENARIOS if debug else scenarios_per_size
         _store_limits       = store_limits or STORE_LIMITS
 
-        self.scenario_gen = ScenarioGenerator(
+        self.scenario_gen = ManScenarioGenerator(
             data_csv=data_csv,
             store_limits=_store_limits,
             scenarios_per_size=_scenarios_per_size,
             sku_limit=SKU_LIMIT,
             period_granularity=PERIOD_GRANULARITY,
-            window_length=WINDOW_LENGTH_PERIODS,
+            window_length=self.window_length,
             base_seed=seed,
         )
         self.data_builder = SharedDataBuilder(
@@ -366,7 +657,7 @@ class ManValidationOrchestrator:
             dist_path=dist_path,
             period_granularity=PERIOD_GRANULARITY,
         )
-        self.thesis_runner = ThesisCRunner(
+        self.thesis_runner = ManThesisCRunner(
             checkpoint_path=checkpoint_path,
             repo_root=repo_root,
             cg_iterations=1,
@@ -402,7 +693,8 @@ class ManValidationOrchestrator:
             "scenarios_per_size":     SCENARIOS_PER_SIZE,
             "sku_limit":              SKU_LIMIT,
             "period_granularity":     PERIOD_GRANULARITY,
-            "window_length_periods":  WINDOW_LENGTH_PERIODS,
+            "window_length_periods":  self.window_length,
+            "demand_shock_sigma":     self.demand_shock_sigma,
             "man_time_limit":         MAN_TIME_LIMIT,
             "man_mip_gap":            MAN_MIP_GAP,
             "thesis_c_time_limit":    THESIS_C_TIME_LIMIT,
@@ -445,15 +737,28 @@ class ManValidationOrchestrator:
                 print(f"  WARNING: empty data slice; skipping scenario.")
                 continue
 
+            # ─ Demand shock — generated once, shared by both methods ─────
+            shock = generate_demand_shock(scenario, scenario.n_periods,
+                                          self.demand_shock_sigma)
+            if shock:
+                print(f"  [Shock]  σ={self.demand_shock_sigma}  "
+                      f"mean_ε={sum(shock.values())/len(shock):.3f}")
+
             # ─ Run Thesis C ─────────────────────────────────────────────
             print(f"  [Thesis C]  running...")
-            c_result = self.thesis_runner.run_scenario(scenario, df_slice, dist_dict)
+            self.thesis_runner.set_shock(shock)
+            try:
+                c_result = self.thesis_runner.run_scenario(scenario, df_slice, dist_dict)
+            finally:
+                self.thesis_runner.set_shock(None)
             print(f"  [Thesis C]  status={c_result.status}  "
                   f"cost={c_result.total_cost:.2f}  runtime={c_result.runtime_seconds:.1f}s")
 
             # ─ Run Man-BFP-TC ───────────────────────────────────────────
             print(f"  [Man-BFP-TC]  running...")
-            man_result, lt_moves = self.man_runner.run_scenario(scenario, df_slice, dist_dict)
+            man_result, lt_moves = self.man_runner.run_scenario(
+                scenario, df_slice, dist_dict, demand_shock=shock or None
+            )
             print(f"  [Man-BFP-TC]  status={man_result.status}  "
                   f"cost={man_result.total_cost:.2f}  "
                   f"mip_gap={man_result.mip_gap:.4f}  runtime={man_result.runtime_seconds:.1f}s")
@@ -556,6 +861,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Store counts to benchmark (default: 5 8 10)")
     p.add_argument("--scenarios_per_size", type=int, default=SCENARIOS_PER_SIZE,
                    help="Scenarios per store size (default: 10)")
+    p.add_argument("--window_length", type=int, default=WINDOW_LENGTH_PERIODS,
+                   help=("Number of consecutive periods per scenario window "
+                         f"(default: {WINDOW_LENGTH_PERIODS}). "
+                         "Set to 1 to test single-period rolling — Man-BFP-TC's "
+                         "native scope, where the multi-period horizon advantage "
+                         "of Thesis C disappears."))
+    p.add_argument("--demand_shock_sigma", type=float, default=DEMAND_SHOCK_SIGMA,
+                   help=("Std-dev of the N(1,σ²) demand shock applied between "
+                         "Stage-1 (routing) and Stage-2 (LT/CG) for BOTH methods "
+                         f"(default: {DEMAND_SHOCK_SIGMA}). "
+                         "Set to 0 for deterministic baseline (no shock)."))
     p.add_argument("--debug",       action="store_true",
                    help="Quick debug run: 3 scenarios per size instead of 10")
     p.add_argument("--seed",        type=int, default=42)
@@ -611,6 +927,10 @@ def main() -> None:
     print(f"  repo_root:          {repo_root or 'current dir'}")
     print(f"  store_limits:       {args.store_limits}")
     print(f"  scenarios_per_size: {args.scenarios_per_size}")
+    print(f"  window_length:      {args.window_length}  "
+          f"({'single-period (Man native scope)' if args.window_length == 1 else 'multi-period'})")
+    print(f"  demand_shock_sigma: {args.demand_shock_sigma}"
+          f"  ({'no shock — deterministic' if args.demand_shock_sigma == 0 else 'N(1,σ²) shock active'})")
     print(f"  debug:              {args.debug}")
     print(f"  man_time_limit:     {MAN_TIME_LIMIT}s")
     print(f"  man_mip_gap:        {MAN_MIP_GAP}")
@@ -625,6 +945,8 @@ def main() -> None:
         repo_root=repo_root,
         store_limits=args.store_limits,
         scenarios_per_size=args.scenarios_per_size,
+        window_length=args.window_length,
+        demand_shock_sigma=args.demand_shock_sigma,
         debug=args.debug,
         seed=args.seed,
     )

@@ -318,6 +318,67 @@ def _integer_final_outputs_enabled() -> bool:
     return os.environ.get("IRP_INTEGER_FINAL_OUTPUTS", "1").lower() not in {"0", "false", "no", ""}
 
 
+# ----------------------------------------------------------------------
+# SLA penalty (L1) configuration. DEFAULT OFF — completely transparent for
+# any code path that does not opt in. Validate_with_*.py and other legacy
+# scripts continue to behave bit-identically when the env vars are unset.
+#
+# Activation: set IRP_SLA_PENALTY=on (or 1/true/yes). Then:
+#   IRP_SLA_MU    = shortage penalty weight (default 0)
+#   IRP_SLA_NU    = surplus-leftover penalty weight (default 0)
+#   IRP_SLA_ALPHA = scale on time_urgency for omega(j,p,t)  (default 4)
+#   IRP_SLA_BETA  = scale on surplus_ratio  for rho(i,p,t)  (default 2)
+#
+# When mu==0 AND nu==0 the helper returns enabled=False so callers can
+# short-circuit any new code-paths and remain bit-identical to the
+# original objective.
+# ----------------------------------------------------------------------
+def _get_sla_penalty_config() -> Tuple[bool, float, float, float, float]:
+    enabled = os.environ.get("IRP_SLA_PENALTY", "off").lower() in {"1", "on", "true", "yes"}
+    if not enabled:
+        return False, 0.0, 0.0, 0.0, 0.0
+    try:
+        mu = float(os.environ.get("IRP_SLA_MU", "0.0") or "0.0")
+    except (TypeError, ValueError):
+        mu = 0.0
+    try:
+        nu = float(os.environ.get("IRP_SLA_NU", "0.0") or "0.0")
+    except (TypeError, ValueError):
+        nu = 0.0
+    try:
+        alpha = float(os.environ.get("IRP_SLA_ALPHA", "4.0") or "4.0")
+    except (TypeError, ValueError):
+        alpha = 4.0
+    try:
+        beta = float(os.environ.get("IRP_SLA_BETA", "2.0") or "2.0")
+    except (TypeError, ValueError):
+        beta = 2.0
+    if mu <= 0.0 and nu <= 0.0:
+        return False, 0.0, 0.0, alpha, beta
+    return True, mu, nu, alpha, beta
+
+
+def _sla_time_urgency(t, periods) -> float:
+    """time_urgency in [0, 1]. 0 at the start of the horizon, 1 in the last
+    period. Used as omega weight scale: omega = 1 + alpha * time_urgency.
+    """
+    if not periods:
+        return 1.0
+    period_list = list(periods)
+    if t not in period_list:
+        return 1.0
+    n = len(period_list)
+    if n <= 1:
+        return 1.0
+    return float(period_list.index(t)) / float(n - 1)
+
+
+def _sla_surplus_ratio(donor_surplus: float, total_surplus: float) -> float:
+    if total_surplus <= 1e-9:
+        return 0.0
+    return float(min(1.0, max(0.0, donor_surplus / total_surplus)))
+
+
 def _is_quiet() -> bool:
     """Suppress per-iteration pricing/RMP/pattern prints when IRP_QUIET=1.
 
@@ -3524,8 +3585,18 @@ class LateralTransshipmentCG:
             int(exact_pricing_time_limit) if exact_pricing_time_limit is not None else None
         )
         if self.exact_full_mode:
-            # Exact mode overrides all heuristic filters unconditionally.
-            self.collect_teacher_mode = False
+            # Exact mode overrides heuristic filters that *replace* pricing
+            # (Stackelberg, GNN runtime, top-k). Teacher collection is allowed
+            # to coexist: when both flags are on, we run exact pricing but
+            # ALSO export per-column teacher rows so the GNN can be trained on
+            # exact-pricing labels (matching A0 ground truth) instead of
+            # classical CG heuristic labels.
+            allow_collect_with_exact = (
+                os.environ.get("IRP_ALLOW_COLLECT_WITH_EXACT", "1").lower()
+                not in {"0", "false", "no", ""}
+            )
+            if not (self.collect_teacher_mode and allow_collect_with_exact):
+                self.collect_teacher_mode = False
             self.runtime_gnn_mode = False
             self.use_gnn = False
             self.heuristic_top_k_mode = False
@@ -5129,6 +5200,16 @@ class LateralTransshipmentCG:
             ) * q[(i, j)]
             for (i, j) in pairs
         )
+        # NOTE on SLA penalty (IRP_SLA_PENALTY=on):
+        #   The L1 penalty terms live in solve_rmp() — see _get_sla_penalty_config.
+        #   When the master objective contains  μ·ω·residual_need + ν·ρ·surplus_unused,
+        #   the corresponding RMP duals (dual_need, dual_surplus passed in here)
+        #   already encode the marginal value of inflow / outflow under that
+        #   penalised objective. Adding penalty terms again to the pricing
+        #   objective would double-count and bias column generation.  Pricing is
+        #   therefore left unchanged structurally: per-iteration runtime for A0
+        #   is similar; A0 slowdown vs C comes from (i) the larger RMP, (ii)
+        #   more CG iterations needed to balance the new penalty terms.
         mdl.setObjective(obj_expr, GRB.MINIMIZE)
         mdl.optimize()
 
@@ -5399,10 +5480,61 @@ class LateralTransshipmentCG:
             for s, p, t in residual_need_keys
         }
 
+        # ── SLA penalty (L1) ─────────────────────────────────────────────
+        # Default OFF (env IRP_SLA_PENALTY=off). When on, adds
+        #   + μ · ω(s,p,t) · residual_need[s,p,t]
+        #   + ν · ρ(s,p,t) · surplus_unused[s,p,t]
+        # to the master objective, where:
+        #   ω(s,p,t) = 1 + α · time_urgency(t)        (urgency in [0,1])
+        #   ρ(s,p,t) = 1 + β · surplus_ratio(s,p,t)   (donor share in [0,1])
+        # surplus_unused is a NEW non-negative variable bound by the per-store
+        # outbound flow:  surplus_unused = surplus(s,p,t) - outbound.
+        # This penalty is ABSENT (no vars / no terms) when sla_on=False, so the
+        # objective is bit-identical to the legacy formulation in that branch.
+        sla_on, sla_mu, sla_nu, sla_alpha, sla_beta = _get_sla_penalty_config()
+        sla_extra_terms = []
+        sla_surplus_unused: Dict[Tuple[Store, Product, Period], gp.Var] = {}
+        sla_omega: Dict[Tuple[Store, Product, Period], float] = {}
+        sla_rho: Dict[Tuple[Store, Product, Period], float] = {}
+        if sla_on:
+            for (s, p, t) in residual_need_keys:
+                urgency_t = _sla_time_urgency(t, d.periods)
+                sla_omega[(s, p, t)] = 1.0 + sla_alpha * urgency_t
+            for (p, t) in active_product_periods:
+                total_surplus_pt = sum(float(surplus.get((ss, p, t), 0.0)) for ss in d.stores)
+                for s in d.stores:
+                    donor_surplus_q = float(surplus.get((s, p, t), 0.0))
+                    sla_rho[(s, p, t)] = (
+                        1.0 + sla_beta * _sla_surplus_ratio(donor_surplus_q, total_surplus_pt)
+                    )
+                    if donor_surplus_q > 0.0:
+                        var = mdl.addVar(
+                            lb=0.0,
+                            ub=donor_surplus_q,
+                            vtype=GRB.CONTINUOUS,
+                            name=f"surplus_unused__{s}__{p}__{t}",
+                        )
+                        sla_surplus_unused[(s, p, t)] = var
+            if sla_mu > 0.0:
+                sla_extra_terms.append(
+                    gp.quicksum(
+                        sla_mu * sla_omega[(s, p, t)] * residual_need[(s, p, t)]
+                        for (s, p, t) in residual_need_keys
+                    )
+                )
+            if sla_nu > 0.0 and sla_surplus_unused:
+                sla_extra_terms.append(
+                    gp.quicksum(
+                        sla_nu * sla_rho[key] * sla_surplus_unused[key]
+                        for key in sla_surplus_unused
+                    )
+                )
+
         mdl.setObjective(
             baseline_without_shortage
             + gp.quicksum(pat.column_cost * lam[pat.pattern_id] for pat in pattern_map.values())
-            + gp.quicksum(need_penalty[(s, p, t)] * residual_need[(s, p, t)] for s, p, t in residual_need_keys),
+            + gp.quicksum(need_penalty[(s, p, t)] * residual_need[(s, p, t)] for s, p, t in residual_need_keys)
+            + (gp.quicksum(sla_extra_terms) if sla_extra_terms else 0.0),
             GRB.MINIMIZE,
         )
 
@@ -5433,7 +5565,22 @@ class LateralTransshipmentCG:
                 for (i, j), qty in pat.pattern_flows.items()
                 if i == s
             )
-            con = mdl.addConstr(outbound <= surplus[(s, p, t)], name=f"surplus_cap__{len(surplus_constraints)}")
+            # When SLA penalty is ON and surplus_unused exists for this (s,p,t):
+            # tighten the surplus capacity to an EQUALITY linking surplus_unused
+            # to the unused capacity. Otherwise (default OFF, or no surplus
+            # available at this store), keep the original ≤ form to remain
+            # bit-identical with legacy code paths.
+            unused_var = sla_surplus_unused.get((s, p, t)) if sla_on else None
+            if unused_var is not None:
+                con = mdl.addConstr(
+                    outbound + unused_var == surplus[(s, p, t)],
+                    name=f"surplus_balance__{len(surplus_constraints)}",
+                )
+            else:
+                con = mdl.addConstr(
+                    outbound <= surplus[(s, p, t)],
+                    name=f"surplus_cap__{len(surplus_constraints)}",
+                )
             surplus_constraints[(s, p, t)] = con
 
         if infeasible_branch:
@@ -5715,9 +5862,23 @@ class LateralTransshipmentCG:
                 rc_tol=rc_tol,
                 episode=self.current_episode,
             )
+            # If teacher collection is requested ALONGSIDE exact pricing, export
+            # the exact-pricing column pool as teacher rows so the GNN learns
+            # from the SAME ground-truth columns that A0 generates. This is the
+            # path used during E1/E2 teacher generation (see kaggle pipeline
+            # IRP_TEACHER_USE_EXACT=1). When collect_teacher_mode=False the
+            # call below is a no-op so A0 runtime / outputs are unchanged.
+            if self.collect_teacher_mode and selected_patterns:
+                self._collect_teacher_batch_without_gnn_prefilter(
+                    patterns=selected_patterns,
+                    need=need,
+                    surplus=surplus,
+                    dual_need=master_solution.dual_need,
+                    dual_surplus=master_solution.dual_surplus,
+                )
             self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
             self._last_pricing_summary["patterns_kept_after_gnn"] = len(selected_patterns)
-            self._last_pricing_summary["collect_teacher_mode"] = False
+            self._last_pricing_summary["collect_teacher_mode"] = bool(self.collect_teacher_mode)
             self._last_pricing_summary["runtime_gnn_mode"] = False
             return selected_patterns
         if self.stackelberg_aware_scoring:
@@ -6473,6 +6634,46 @@ def build_realized_operating_cost_breakdown(
         data.shortage_cost[(s, p)] * shortage
         for (s, p, _), shortage in realized_shortage_after_lt.items()
     )
+
+    # ── SLA penalty (L1) — default OFF for backward compatibility ────────
+    # Validate_with_Man_Kaggle.py / Validate_with_Achamrah_Kaggle.py and any
+    # other caller of build_realized_operating_cost_breakdown remain
+    # bit-identical when IRP_SLA_PENALTY is unset (sla_on=False short-circuit).
+    sla_on, sla_mu, sla_nu, sla_alpha, sla_beta = _get_sla_penalty_config()
+    sla_shortage_penalty = 0.0
+    sla_surplus_penalty = 0.0
+    if sla_on:
+        # ω(s,p,t) = 1 + α · time_urgency(t)
+        urgency_by_t: Dict[Period, float] = {
+            tt: _sla_time_urgency(tt, data.periods) for tt in data.periods
+        }
+        if sla_mu > 0.0:
+            sla_shortage_penalty = float(sla_mu) * sum(
+                (1.0 + sla_alpha * urgency_by_t.get(t, 1.0))
+                * float(realized_shortage_after_lt.get((s, p, t), 0.0))
+                for s in data.stores
+                for p in data.products
+                for t in data.periods
+            )
+        if sla_nu > 0.0:
+            # Realized "surplus_unused" is the excess store inventory carried
+            # above its baseline DC plan inventory (i.e. inventory not consumed
+            # to mitigate a stockout elsewhere). Approximated by the realized
+            # inventory level itself, which is the natural per-store quantity
+            # that the master's surplus_unused variable tracks.
+            for p in data.products:
+                # ρ(s,p,t) = 1 + β · surplus_ratio   — relative share of stocked
+                # surplus this store contributes for product p in period t.
+                for t in data.periods:
+                    total_inv_pt = sum(
+                        float(realized_inventory_after_lt.get((s, p, t), 0.0))
+                        for s in data.stores
+                    )
+                    for s in data.stores:
+                        store_inv = float(realized_inventory_after_lt.get((s, p, t), 0.0))
+                        rho = 1.0 + sla_beta * _sla_surplus_ratio(store_inv, total_inv_pt)
+                        sla_surplus_penalty += float(sla_nu) * rho * store_inv
+
     realized_operating_cost = (
         direct_cw_unit_cost
         + store_holding_cost
@@ -6481,8 +6682,10 @@ def build_realized_operating_cost_breakdown(
         + vehicle_fixed_cost
         + lateral_transshipment_cost
         + shortage_cost
+        + sla_shortage_penalty
+        + sla_surplus_penalty
     )
-    return {
+    breakdown = {
         "direct_cw_unit_cost_executed_plan": round(direct_cw_unit_cost, 6),
         "store_holding_cost_realized": round(store_holding_cost, 6),
         "warehouse_holding_cost_executed_plan": round(warehouse_holding_cost, 6),
@@ -6494,6 +6697,13 @@ def build_realized_operating_cost_breakdown(
         "total_realized_shortage_units": round(sum(realized_shortage_after_lt.values()), 6),
         "total_realized_store_inventory_units": round(sum(realized_inventory_after_lt.values()), 6),
     }
+    if sla_on:
+        breakdown["sla_shortage_penalty"] = round(sla_shortage_penalty, 6)
+        breakdown["sla_surplus_penalty"] = round(sla_surplus_penalty, 6)
+        breakdown["sla_penalty_enabled"] = True
+        breakdown["sla_mu"] = float(sla_mu)
+        breakdown["sla_nu"] = float(sla_nu)
+    return breakdown
 
 
 def print_cost_breakdown(title: str, cost_breakdown: Dict[str, float]) -> None:

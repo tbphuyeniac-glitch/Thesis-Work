@@ -403,6 +403,15 @@ def _run_scenario_inprocess(
             seed=shock_seed,
         )
 
+        # Honor IRP_TEACHER_USE_EXACT_PRICING=1 to switch the teacher-row
+        # source from classical CG pricing (default) to A0-style exact MIP
+        # pricing. The matheuristic is patched (see _allow_collect_with_exact)
+        # to permit collect_teacher_mode + exact_full_mode together so the GNN
+        # learns from the same column pool A0 generates. Default OFF preserves
+        # legacy teacher generation behaviour.
+        _use_exact_pricing = os.environ.get(
+            "IRP_TEACHER_USE_EXACT_PRICING", "0"
+        ).lower() not in {"0", "false", "no", ""}
         cg_engine = irp.LateralTransshipmentCG(
             data=data,
             baseline_solution=baseline_sol,
@@ -413,13 +422,41 @@ def _run_scenario_inprocess(
             collect_teacher_mode=True,
             runtime_gnn_mode=False,
             heuristic_top_k_mode=False,
-            exact_full_mode=False,
+            exact_full_mode=_use_exact_pricing,
         )
-        cg_sol = cg_engine.run_column_generation(
-            max_iter=cg_iterations,
-            msg=False,
-            stopping_mode="convergence",
-        )
+        # Honor IRP_USE_BRANCH_AND_PRICE=1 to enable B&P during teacher
+        # collection. B&P explores integer-feasibility branches after the
+        # root LP converges, contributing additional CG iterations + diverse
+        # constraint states. Real-data audit on the legacy 150-scenario
+        # dataset shows B&P → ~3x more teacher rows / ~2.5x more graph
+        # groups / ~22% hash repetition (vs 0% without B&P), at ~1.5-2x
+        # extra wall-clock per scenario.
+        # Default OFF to preserve existing scenario-gen behaviour; bench
+        # pipelines that want richness should set IRP_USE_BRANCH_AND_PRICE=1.
+        _use_bp = os.environ.get("IRP_USE_BRANCH_AND_PRICE", "0").lower() not in {
+            "0", "false", "no", ""
+        }
+        if _use_bp:
+            try:
+                _bp_max_nodes = int(os.environ.get("IRP_BP_MAX_NODES", "15"))
+            except ValueError:
+                _bp_max_nodes = 15
+            try:
+                _bp_max_depth = int(os.environ.get("IRP_BP_MAX_DEPTH", "6"))
+            except ValueError:
+                _bp_max_depth = 6
+            cg_sol = cg_engine.run_branch_and_price(
+                max_iter=cg_iterations,
+                max_nodes=_bp_max_nodes,
+                max_depth=_bp_max_depth,
+                msg=False,
+            )
+        else:
+            cg_sol = cg_engine.run_column_generation(
+                max_iter=cg_iterations,
+                msg=False,
+                stopping_mode="convergence",
+            )
 
         rows: List[Dict[str, Any]] = list(cg_engine.teacher_dataset_rows or [])
         # Tag every row with identity AND its dataset_split so the graph
