@@ -142,12 +142,11 @@ class AchamrahIRPTSolver:
     3) The code is written for clarity and reproducibility rather than extreme speed.
     """
 
-    def __init__(self, inst: IRPTInstance, params: Optional[HeuristicParams] = None, allow_direct_shipment: bool = True):
+    def __init__(self, inst: IRPTInstance, params: Optional[HeuristicParams] = None):
         self.inst = inst
         self.inst.validate()
         self.params = params or HeuristicParams()
         self.rng = random.Random(self.params.seed)
-        self.allow_direct_shipment = allow_direct_shipment
 
     # ------------------------------------------------------------------
     # Public API
@@ -196,7 +195,6 @@ class AchamrahIRPTSolver:
         use_valid_16_19: bool = True,
         use_valid_20: bool = True,
         allow_lateral_transshipment: bool = True,
-        allow_direct_shipment: bool = True,
         add_lazy_21_placeholder: bool = False,
         model_name: str = "IRPT",
     ) -> Tuple[gp.Model, Dict[str, Any]]:
@@ -223,9 +221,6 @@ class AchamrahIRPTSolver:
         if not allow_lateral_transshipment:
             for key in y.keys():
                 y[key].ub = 0.0
-        if not allow_direct_shipment:
-            for key in Qdir.keys():
-                Qdir[key].ub = 0.0
         S = m.addVars(P, N, H, vtype=GRB.CONTINUOUS, lb=0.0, name="S")
         x = m.addVars(N0, N0, V, H, vtype=int_type, lb=0.0, ub=1.0, name="x")
         u = m.addVars(V, H, vtype=int_type, lb=0.0, ub=1.0, name="u")
@@ -464,7 +459,6 @@ class AchamrahIRPTSolver:
         time_limit: Optional[float] = None,
         mip_gap: Optional[float] = None,
         allow_lateral_transshipment: bool = True,
-        allow_direct_shipment: bool = True,
         model_name: str = "IRPT",
     ) -> SolveArtifacts:
         # Disable O(H²) valid_20 automatically when H is large to avoid OOM.
@@ -477,7 +471,6 @@ class AchamrahIRPTSolver:
             fixed_routes=fixed_routes,
             active_nodes_by_period=active_nodes_by_period,
             allow_lateral_transshipment=allow_lateral_transshipment,
-            allow_direct_shipment=allow_direct_shipment,
             use_valid_20=use_v20,
             model_name=model_name,
         )
@@ -525,7 +518,6 @@ class AchamrahIRPTSolver:
             relaxed=True,
             time_limit=self.params.constructive_time_limit,
             mip_gap=self.params.rmilp_mipgap,
-            allow_direct_shipment=self.allow_direct_shipment,
             model_name="RMILP",
         )
 
@@ -537,7 +529,6 @@ class AchamrahIRPTSolver:
                     fixed_routes=rmilp.routes,
                     time_limit=max(30.0, 0.25 * self.params.constructive_time_limit),
                     mip_gap=self.params.cluster_mipgap,
-                    allow_direct_shipment=self.allow_direct_shipment,
                     model_name="ConstructiveDirectFMILP",
                 )
                 if fixed_eval.status in (GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL) and math.isfinite(fixed_eval.objective):
@@ -551,7 +542,6 @@ class AchamrahIRPTSolver:
                     fixed_routes=merged_routes,
                     time_limit=max(30.0, 0.5 * self.params.constructive_time_limit),
                     mip_gap=self.params.cluster_mipgap,
-                    allow_direct_shipment=self.allow_direct_shipment,
                     model_name="ClusteredFMILP",
                 )
                 if clustered.status in (GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL) and math.isfinite(clustered.objective):
@@ -621,7 +611,6 @@ class AchamrahIRPTSolver:
                     active_nodes_by_period=active_nodes,
                     time_limit=max(10.0, self.params.constructive_time_limit / max(1, len(clusters_by_period))),
                     mip_gap=self.params.cluster_mipgap,
-                    allow_direct_shipment=self.allow_direct_shipment,
                     model_name=f"Cluster_t{t}_v{v}",
                 )
                 cluster_route = self._pick_best_route_for_period(sub.routes, t)
@@ -825,7 +814,6 @@ class AchamrahIRPTSolver:
             fixed_routes=routes,
             time_limit=time_limit,
             mip_gap=self.params.fmilp_mipgap,
-            allow_direct_shipment=self.allow_direct_shipment,
             model_name="FMILP",
         )
         if sol.status in (GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL) and math.isfinite(sol.objective):
