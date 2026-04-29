@@ -60,7 +60,17 @@ ALLOW_GNN_FALLBACK: bool = (
 )
 
 VEHICLE_COUNT:    int   = 2
-VEHICLE_CAPACITY: float = 500.0
+VEHICLE_CAPACITY: float = 1500.0
+
+
+def vehicle_count_for_stores(n_stores: int) -> int:
+    """Scale fleet size with network size so capacity tracks demand.
+    5 stores → 2 vehicles, 8 → 3, 10+ → 4."""
+    if n_stores <= 5:
+        return 2
+    if n_stores <= 8:
+        return 3
+    return 4
 
 # Cost parameters — must be IDENTICAL for both methods.
 # CRITICAL: shortage_cost MUST exceed LT_COST_FLAT (0.6) for LT to be
@@ -531,7 +541,7 @@ class ThesisCRunner:
                 sku_limit=None,
             )
             data, *_ = mapper.build_irp_data(
-                vehicle_count=VEHICLE_COUNT,
+                vehicle_count=vehicle_count_for_stores(len(scenario.selected_stores)),
                 vehicle_capacity=VEHICLE_CAPACITY,
                 shortage_cost_rate=SHORTAGE_COST_RATE,
                 holding_cost_rate=HOLDING_COST_RATE,
@@ -623,7 +633,8 @@ class ThesisCRunner:
                 # Mirrors Achamrah Phase 2 (GA/SA) — heuristic refinement of an
                 # exact-method initial solution.
                 from gurobipy import GRB as _GRB
-                mip_time_budget = max(30, self.time_limit // 4)
+                mip_time_budget = max(15, self.time_limit // 8)
+                alns_time_budget = max(10, self.time_limit // 16)
 
                 # Helper: one full pass = MIP routing → ALNS refine → CG/LT
                 def _one_pass():
@@ -648,10 +659,10 @@ class ThesisCRunner:
                     # fall back to ALNS with greedy initial.
                     bsol = irp.BaselineALNSModel(data).solve(
                         msg=False,
-                        time_limit=max(30, self.time_limit // 8),
+                        time_limit=alns_time_budget,
                         allow_lateral_transshipment=False,
                         cw_dispatch_cycle=1,
-                        max_iterations=10000,
+                        max_iterations=5000,
                         seed=42,
                         initial_solution=mip_sol if mip_ok else None,
                     )
@@ -669,6 +680,24 @@ class ThesisCRunner:
                         if (alns_br["total_realized_operating_cost"]
                                 > mip_br["total_realized_operating_cost"] + 1e-6):
                             bsol = mip_sol
+
+                    # Phase 3 gating: skip CG/GNN if baseline already shortage-free.
+                    # When vehicle capacity is enough to meet demand, no LT recourse
+                    # is needed. Saves ~10-30s per scenario.
+                    bsol_br = irp.build_realized_operating_cost_breakdown(
+                        data, bsol, lt_plan_df=None,
+                    )
+                    bsol_shortage = float(bsol_br.get("total_realized_shortage_units", 0.0))
+                    if bsol_shortage <= 1.0:
+                        res = {
+                            "realized_no_lt_cost_breakdown": bsol_br,
+                            "realized_with_lt_cost_breakdown": bsol_br,
+                            "lt_plan": pd.DataFrame(),
+                            "cg_solution": None,
+                            "cg_episode_history": [],
+                        }
+                        return bsol, res
+
                     pipe = irp.IRPResearchPipeline(data)
                     res = pipe.run_lt_recourse_from_baseline(
                         bsol,
@@ -918,7 +947,7 @@ class AchamrahRunner:
         sku_to_id   = {p: i     for i, p in enumerate(skus)}
         N = list(store_to_id.values())
         P = list(sku_to_id.values())
-        V = list(range(1, VEHICLE_COUNT + 1))
+        V = list(range(1, vehicle_count_for_stores(len(stores)) + 1))
 
         # Build demand D[p, i, t]
         D: Dict = {}
