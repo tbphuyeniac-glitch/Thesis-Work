@@ -8,7 +8,7 @@ This is the teacher dataset that will train the multi-feature C variant.
   IRP_SLA_PENALTY = on
   IRP_SLA_MU      = <mu*>           (default 0.005)
   IRP_SLA_NU      = <mu*>           (default 0.005)
-  IRP_TEACHER_USE_EXACT_PRICING = 1
+  IRP_TEACHER_USE_PRUNED_EXACT_PRICING = 1
   IRP_ALLOW_COLLECT_WITH_EXACT  = 1
 
 Output: under RESULTS_DIR_E2 = /kaggle/working/Results_E2_with_penalty/.
@@ -35,7 +35,10 @@ def main() -> int:
     env["IRP_SLA_NU"] = os.environ.get("IRP_SLA_NU", "0.005")
     env["IRP_SLA_ALPHA"] = os.environ.get("IRP_SLA_ALPHA", "4.0")
     env["IRP_SLA_BETA"] = os.environ.get("IRP_SLA_BETA", "2.0")
-    env["IRP_TEACHER_USE_EXACT_PRICING"] = "1"
+    # E2 learns the multi-feature regime: first screen candidate pairs by the
+    # four pricing features, then solve exact pricing over that screened set.
+    env["IRP_TEACHER_USE_EXACT_PRICING"] = "0"
+    env["IRP_TEACHER_USE_PRUNED_EXACT_PRICING"] = "1"
     env["IRP_ALLOW_COLLECT_WITH_EXACT"] = "1"
     # B&P enabled by default for teacher generation richness — same rationale
     # as run_e1_teacher_gen.py. Disable via IRP_USE_BRANCH_AND_PRICE=0 if needed.

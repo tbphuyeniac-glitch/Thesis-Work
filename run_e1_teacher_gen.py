@@ -43,6 +43,7 @@ def main() -> int:
     # Tell the engine to use A0 exact pricing during teacher generation
     # (so columns match A0's ground truth) AND to export per-column rows.
     env["IRP_TEACHER_USE_EXACT_PRICING"] = "1"
+    env["IRP_TEACHER_USE_PRUNED_EXACT_PRICING"] = "0"
     env["IRP_ALLOW_COLLECT_WITH_EXACT"] = "1"
     # Enable B&P for teacher collection — adds ~50-100% wall-clock per
     # scenario but yields ~3x more teacher rows + ~2.5x more graph groups

@@ -442,15 +442,24 @@ def _run_scenario_inprocess(
             seed=shock_seed,
         )
 
-        # Honor IRP_TEACHER_USE_EXACT_PRICING=1 to switch the teacher-row
-        # source from classical CG pricing (default) to A0-style exact MIP
-        # pricing. The matheuristic is patched (see _allow_collect_with_exact)
-        # to permit collect_teacher_mode + exact_full_mode together so the GNN
-        # learns from the same column pool A0 generates. Default OFF preserves
-        # legacy teacher generation behaviour.
+        # Honor exact-pricing teacher modes:
+        #   IRP_TEACHER_USE_EXACT_PRICING=1
+        #       A0-style full exact MIP pricing (no feature pruning).
+        #   IRP_TEACHER_USE_PRUNED_EXACT_PRICING=1
+        #       E2 mode: four-feature pruning first, then exact MIP pricing
+        #       restricted to the surviving donor-receiver pairs.
+        # Default OFF preserves legacy teacher generation behaviour.
         _use_exact_pricing = os.environ.get(
             "IRP_TEACHER_USE_EXACT_PRICING", "0"
         ).lower() not in {"0", "false", "no", ""}
+        _use_pruned_exact_pricing = os.environ.get(
+            "IRP_TEACHER_USE_PRUNED_EXACT_PRICING", "0"
+        ).lower() not in {"0", "false", "no", ""}
+        if _use_exact_pricing and _use_pruned_exact_pricing:
+            raise ValueError(
+                "IRP_TEACHER_USE_EXACT_PRICING and "
+                "IRP_TEACHER_USE_PRUNED_EXACT_PRICING are mutually exclusive."
+            )
         cg_engine = irp.LateralTransshipmentCG(
             data=data,
             baseline_solution=baseline_sol,
@@ -462,6 +471,7 @@ def _run_scenario_inprocess(
             runtime_gnn_mode=False,
             heuristic_top_k_mode=False,
             exact_full_mode=_use_exact_pricing,
+            pruned_exact_mode=_use_pruned_exact_pricing,
         )
         # Honor IRP_USE_BRANCH_AND_PRICE=1 to enable B&P during teacher
         # collection. B&P explores integer-feasibility branches after the
@@ -660,7 +670,7 @@ def main() -> None:
     aggregate_csv = out_dir / "aggregate_teacher_rows.csv"
     if aggregate_csv.exists():
         aggregate_rows = read_csv_rows(aggregate_csv)
-        print(f"[generate] resuming — aggregate already has {len(aggregate_rows)} rows")
+        print(f"[generate] resuming: aggregate already has {len(aggregate_rows)} rows", flush=True)
     done_sources = {row.get("source_instance", "") for row in aggregate_rows if row.get("source_instance")}
     aggregate_rows = [row for row in aggregate_rows if row.get("source_instance") in done_sources]
 
@@ -668,37 +678,39 @@ def main() -> None:
     # Phase 1: solve ALNS baseline ONCE per base spec.
     # Skip bases whose scenarios are all already done.
     # ------------------------------------------------------------------
-    print(f"\n[generate] Phase 1 — ALNS baseline  ({n_bases} base spec(s))")
+    print(f"\n[generate] Phase 1 - ALNS baseline ({n_bases} base spec(s))", flush=True)
     base_cache: Dict[str, Tuple[Optional[Any], Optional[Any]]] = {}
-    for base in bases:
+    for base_idx, base in enumerate(bases, start=1):
         base_id = base["base_dataset_id"]
         if base_id in base_cache:
             continue
         base_scenarios = [s for s in scenarios if s["base_dataset_id"] == base_id]
         pending = [s for s in base_scenarios if s["source_instance"] not in done_sources]
         if not pending:
-            print(f"  [baseline] {base_id}: all {len(base_scenarios)} scenario(s) done — skip ALNS")
+            print(f"  [baseline {base_idx:02d}/{n_bases:02d}] {base_id}: all {len(base_scenarios)} done - skip ALNS",
+                  flush=True)
             base_cache[base_id] = (None, None)
             continue
         print(
-            f"  [baseline] {base_id}: {len(pending)}/{len(base_scenarios)} pending — "
-            f"solving ALNS baseline..."
+            f"  [baseline {base_idx:02d}/{n_bases:02d}] {base_id}: {len(pending)}/{len(base_scenarios)} pending - "
+            f"solving ALNS baseline...",
+            flush=True,
         )
         try:
             base_data, baseline_sol = _build_base_instance(irp, args.master_csv, base, args.time_limit)
             base_cache[base_id] = (base_data, baseline_sol)
         except Exception as exc:
-            print(f"  [baseline] {base_id} FAILED: {exc}")
+            print(f"  [baseline] {base_id} FAILED: {exc}", flush=True)
             traceback.print_exc()
             base_cache[base_id] = (None, None)
             if not args.continue_on_failure:
-                print("[generate] aborting — pass --continue-on-failure to skip failed bases.")
+                print("[generate] aborting - pass --continue-on-failure to skip failed bases.", flush=True)
                 return
 
     # ------------------------------------------------------------------
     # Phase 2: fan out scenarios in-process, reusing cached baselines.
     # ------------------------------------------------------------------
-    print(f"\n[generate] Phase 2 — CG teacher collection  ({n_scenarios} scenario(s))")
+    print(f"\n[generate] Phase 2 - CG teacher collection ({n_scenarios} scenario(s))", flush=True)
     for idx, scenario in enumerate(scenarios, start=1):
         safe_id = (
             f"{scenario['base_dataset_id']}__{scenario['scenario_id']}"
@@ -729,7 +741,11 @@ def main() -> None:
                     aggregate_rows.extend(existing)
                     done_sources.add(source_instance)
                     write_csv_rows(aggregate_csv, aggregate_rows)
-            print(f"[generate] skip idx={idx} {source_instance} (already done)")
+            print(
+                f"[generate] scenario {idx:03d}/{n_scenarios:03d} SKIP - "
+                f"{source_instance} (already done)",
+                flush=True,
+            )
             manifest["scenarios"].append({
                 **scenario,
                 "run_idx": idx,
@@ -749,8 +765,9 @@ def main() -> None:
         base_data, baseline_sol = base_cache.get(scenario["base_dataset_id"], (None, None))
         if base_data is None:
             print(
-                f"[generate] skip idx={idx} {source_instance}: "
-                f"baseline unavailable (base failed or all done)"
+                f"[generate] scenario {idx:03d}/{n_scenarios:03d} SKIP - "
+                f"{source_instance}: baseline unavailable (base failed or all done)",
+                flush=True,
             )
             manifest["scenarios"].append({
                 **scenario,
@@ -766,9 +783,28 @@ def main() -> None:
             manifest_path = out_dir / "scenarios_manifest.json"
             _atomic_write_json(manifest_path, manifest)
             if not args.continue_on_failure:
-                print("[generate] aborting — pass --continue-on-failure to skip failed scenarios.")
+                print("[generate] aborting - pass --continue-on-failure to skip failed scenarios.", flush=True)
                 return
             continue
+
+        # ---------- per-scenario START log ----------
+        # Always print regardless of IRP_QUIET so Kaggle / log monitors can
+        # see live progress through the 150-scenario run.  Includes the
+        # base/sku topology + shock profile so the operator can spot any
+        # particularly large instances early.
+        n_done = len(done_sources)
+        n_pending_total = n_scenarios - n_done
+        print(
+            f"\n[generate] scenario {idx:03d}/{n_scenarios:03d} START - generating teacher rows "
+            f"({n_pending_total} pending, {n_done} done)\n"
+            f"           source_instance={source_instance}\n"
+            f"           base={scenario.get('base_dataset_id')}  "
+            f"store_limit={scenario.get('store_limit')}  "
+            f"sku_limit={scenario.get('sku_limit')}  "
+            f"shock={scenario.get('shock_profile')}  "
+            f"split={split_assignment.get(source_instance, '?')}",
+            flush=True,
+        )
 
         ok, rows, runtime = _run_scenario_inprocess(
             irp, base_data, baseline_sol, scenario, run_dir, args.cg_iterations,
@@ -780,6 +816,15 @@ def main() -> None:
             aggregate_rows.extend(str_rows)
             done_sources.add(source_instance)
             write_csv_rows(aggregate_csv, aggregate_rows)
+
+        # ---------- per-scenario FINISH log ----------
+        status_badge = "OK" if ok else "FAILED"
+        print(
+            f"[generate] scenario {idx:03d}/{n_scenarios:03d} DONE - status={status_badge}  "
+            f"rows={len(str_rows):>4d}  runtime={runtime:>5.1f}s  "
+            f"aggregate_total={len(aggregate_rows):,} rows",
+            flush=True,
+        )
 
         manifest["scenarios"].append({
             **scenario,
@@ -794,7 +839,7 @@ def main() -> None:
         manifest_path = out_dir / "scenarios_manifest.json"
         _atomic_write_json(manifest_path, manifest)
         if not ok and not args.continue_on_failure:
-            print("[generate] aborting — pass --continue-on-failure to skip failed scenarios.")
+            print("[generate] aborting - pass --continue-on-failure to skip failed scenarios.", flush=True)
             return
 
     # ------------------------------------------------------------------

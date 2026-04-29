@@ -3466,6 +3466,7 @@ class LateralTransshipmentCG:
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
+        pruned_exact_mode: bool = False,
         exact_pricing_pool_size: int = 3,
         exact_pricing_time_limit: Optional[int] = 30,
         # ── Follower-aware LT column pricing ──────────────────────────────
@@ -3584,6 +3585,11 @@ class LateralTransshipmentCG:
         self.exact_pricing_time_limit = (
             int(exact_pricing_time_limit) if exact_pricing_time_limit is not None else None
         )
+        # E2 teacher mode — keep the existing four-feature candidate screen,
+        # then solve the exact pricing MIP over only the surviving pairs. This
+        # is intentionally separate from exact_full_mode, which means A0-style
+        # no-pruning exact pricing.
+        self.pruned_exact_mode = bool(pruned_exact_mode)
         if self.exact_full_mode:
             # Exact mode overrides heuristic filters that *replace* pricing
             # (Stackelberg, GNN runtime, top-k). Teacher collection is allowed
@@ -3591,6 +3597,17 @@ class LateralTransshipmentCG:
             # ALSO export per-column teacher rows so the GNN can be trained on
             # exact-pricing labels (matching A0 ground truth) instead of
             # classical CG heuristic labels.
+            allow_collect_with_exact = (
+                os.environ.get("IRP_ALLOW_COLLECT_WITH_EXACT", "1").lower()
+                not in {"0", "false", "no", ""}
+            )
+            if not (self.collect_teacher_mode and allow_collect_with_exact):
+                self.collect_teacher_mode = False
+            self.runtime_gnn_mode = False
+            self.use_gnn = False
+            self.heuristic_top_k_mode = False
+            self.pruned_exact_mode = False
+        elif self.pruned_exact_mode:
             allow_collect_with_exact = (
                 os.environ.get("IRP_ALLOW_COLLECT_WITH_EXACT", "1").lower()
                 not in {"0", "false", "no", ""}
@@ -5124,6 +5141,7 @@ class LateralTransshipmentCG:
         dual_surplus: Dict[Tuple[Store, Product, Period], float],
         rc_tol: float,
         episode: int,
+        allowed_pairs: Optional[Set[Tuple[Store, Store]]] = None,
     ) -> List[LTPattern]:
         """Exact CG pricing subproblem solved by Gurobi for one (product, period).
 
@@ -5142,13 +5160,20 @@ class LateralTransshipmentCG:
         classical CG (which generates many columns per iteration via enumerate-
         and-filter), making the runtime comparison fair.
 
-        NO heuristic filter (pruning / Stackelberg / GNN / top-k) is applied
-        anywhere in this path.
+        When `allowed_pairs` is provided, the exact MIP is restricted to that
+        caller-supplied screened pair set. Otherwise no heuristic filter
+        (pruning / Stackelberg / GNN / top-k) is applied in this path.
         """
         d = self.data
         donors = [s for s in d.stores if float(surplus.get((s, p, t), 0.0)) > 1e-9]
         receivers = [s for s in d.stores if float(need.get((s, p, t), 0.0)) > 1e-9]
-        pairs = [(i, j) for i in donors for j in receivers if i != j]
+        allowed_set = set(allowed_pairs) if allowed_pairs is not None else None
+        pairs = [
+            (i, j)
+            for i in donors
+            for j in receivers
+            if i != j and (allowed_set is None or (i, j) in allowed_set)
+        ]
         if not pairs:
             return []
 
@@ -5235,6 +5260,7 @@ class LateralTransshipmentCG:
                     ) * q_val
             if not flows:
                 continue
+            pruning_used = allowed_set is not None
             results.append(
                 LTPattern(
                     pattern_id=f"EXACT_E{episode}_{p}_T{t}_P{sol_idx}",
@@ -5243,14 +5269,15 @@ class LateralTransshipmentCG:
                     pattern_flows=flows,
                     column_cost=round(pattern_cost, 6),
                     metadata={
-                        "source": "exact_pricing_gurobi",
+                        "source": "exact_pruned_feature_pricing" if pruning_used else "exact_pricing_gurobi",
                         "reduced_cost": round(sol_obj, 6),
-                        "pruning_used": False,
+                        "pruning_used": pruning_used,
                         "stackelberg_used": False,
                         "gnn_used": False,
                         "heuristic_top_k_used": False,
-                        "feature_name": "exact_full",
+                        "feature_name": "feature_pruned_exact" if pruning_used else "exact_full",
                         "exact_pool_index": sol_idx,
+                        "allowed_pair_count": len(pairs) if pruning_used else None,
                     },
                 )
             )
@@ -5306,6 +5333,131 @@ class LateralTransshipmentCG:
             "exact_full_mode": True,
             "exact_subproblems_with_negative_rc": subproblems_with_negative_rc,
             "exact_subproblems_solved": len(active_product_periods),
+        }
+        return new_patterns
+
+    def _candidate_patterns_pruned_exact(
+        self,
+        need,
+        surplus,
+        active_product_periods: Set[Tuple[Product, Period]],
+        dual_need: Dict[Tuple[Store, Product, Period], float],
+        dual_surplus: Dict[Tuple[Store, Product, Period], float],
+        rc_tol: float,
+        episode: int,
+    ) -> List[LTPattern]:
+        """Generate E2 teacher candidates via four-feature pruning, then exact MIP pricing.
+
+        This keeps the same feature-screening surface as the multi-feature
+        classical path, but replaces heuristic pattern construction with the
+        exact fixed-charge pricing subproblem restricted to surviving
+        donor-receiver pairs.
+        """
+        new_patterns: List[LTPattern] = []
+        candidate_pairs_before_pruning = 0
+        pairs_after_pruning = 0
+        pairs_after_pruning_unique = 0
+        subproblems_with_negative_rc = 0
+        subproblems_solved = 0
+
+        if self.adaptive_pruning_enabled and self.adaptive_pruner is not None:
+            self._adaptive_pending_candidates = []
+
+        for p, t in sorted(active_product_periods):
+            pruned_pairs_by_feature = self._prune_pairs_by_feature(
+                p=p,
+                t=t,
+                need=need,
+                surplus=surplus,
+                dual_need=dual_need,
+                dual_surplus=dual_surplus,
+                episode=episode,
+            )
+            candidate_pairs_before_pruning += self._last_candidate_pair_count
+            pairs_after_pruning += sum(len(rows) for rows in pruned_pairs_by_feature.values())
+            allowed_pairs = {
+                tuple(row["pair"])
+                for rows in pruned_pairs_by_feature.values()
+                for row in rows
+                if row.get("pair") is not None
+            }
+            pairs_after_pruning_unique += len(allowed_pairs)
+            if not allowed_pairs:
+                continue
+            subproblems_solved += 1
+            priced = self._solve_exact_pricing_subproblem(
+                p=p,
+                t=t,
+                need=need,
+                surplus=surplus,
+                dual_need=dual_need,
+                dual_surplus=dual_surplus,
+                rc_tol=rc_tol,
+                episode=episode,
+                allowed_pairs=allowed_pairs,
+            )
+            if priced:
+                subproblems_with_negative_rc += 1
+            new_patterns.extend(priced)
+
+        if (
+            self.adaptive_pruning_enabled
+            and self.adaptive_pruner is not None
+            and self._adaptive_pending_candidates
+        ):
+            update_record = self.adaptive_pruner.update(
+                self._adaptive_pending_candidates,
+                iteration=int(episode or self.current_episode or 0),
+                phase="lt",
+                lb=self._adaptive_pruning_lb,
+                ub=self._adaptive_pruning_ub,
+            )
+            if self._log_candidate_pairs:
+                self.column_pool_diagnostics.append({
+                    "episode": episode,
+                    "stage": "adaptive_pruning_update",
+                    "product": "",
+                    "period": "",
+                    "feature_name": "_adaptive_windows",
+                    "donor_store": "",
+                    "receiver_store": "",
+                    "qty_cap": 0.0,
+                    "reduced_cost_proxy": None,
+                    "stackelberg_accepted": None,
+                    "acceptance_score": None,
+                    "compensation": None,
+                    "pattern_id": "",
+                    "pattern_reduced_cost": None,
+                    "gnn_score": None,
+                    "gnn_combined_score": None,
+                    "gnn_selected": None,
+                    "gnn_selected_by_fallback": None,
+                    "adaptive_k_star": None,
+                    "duplicate_id_reject": False,
+                    "duplicate_signature_reject": False,
+                    "empty_flow_reject": False,
+                    "added_to_pool": False,
+                    "signature": json.dumps(update_record, default=str),
+                })
+            self._adaptive_pending_candidates = []
+
+        patterns_built_before_dedup = len(new_patterns)
+        new_patterns = self._deduplicate_priced_patterns(new_patterns, episode=episode)
+        self._last_pricing_summary = {
+            "candidate_pairs_before_pruning": candidate_pairs_before_pruning,
+            "pairs_after_pruning": pairs_after_pruning,
+            "pairs_after_pruning_unique": pairs_after_pruning_unique,
+            "pairs_accepted_stackelberg": 0,
+            "pairs_recovered_stackelberg_fallback": 0,
+            "patterns_built_before_dedup": patterns_built_before_dedup,
+            "patterns_deduplicated_before_gnn": patterns_built_before_dedup - len(new_patterns),
+            "patterns_removed_by_product_period_cap": 0,
+            "patterns_built_before_gnn": len(new_patterns),
+            "max_columns_per_product_period": self.max_columns_per_product_period,
+            "exact_full_mode": False,
+            "pruned_exact_mode": True,
+            "exact_subproblems_with_negative_rc": subproblems_with_negative_rc,
+            "exact_subproblems_solved": subproblems_solved,
         }
         return new_patterns
 
@@ -5878,6 +6030,30 @@ class LateralTransshipmentCG:
                 )
             self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
             self._last_pricing_summary["patterns_kept_after_gnn"] = len(selected_patterns)
+            self._last_pricing_summary["collect_teacher_mode"] = bool(self.collect_teacher_mode)
+            self._last_pricing_summary["runtime_gnn_mode"] = False
+            return selected_patterns
+        if self.pruned_exact_mode:
+            # E2 teacher generation: four-feature pruning first, then exact
+            # Gurobi pricing over the surviving donor-receiver pairs.
+            selected_patterns = self._candidate_patterns_pruned_exact(
+                need=need,
+                surplus=surplus,
+                active_product_periods=active_product_periods,
+                dual_need=master_solution.dual_need,
+                dual_surplus=master_solution.dual_surplus,
+                rc_tol=rc_tol,
+                episode=self.current_episode,
+            )
+            if self.collect_teacher_mode and selected_patterns:
+                self._collect_teacher_batch_without_gnn_prefilter(
+                    patterns=selected_patterns,
+                    need=need,
+                    surplus=surplus,
+                    dual_need=master_solution.dual_need,
+                    dual_surplus=master_solution.dual_surplus,
+                )
+            self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
             self._last_pricing_summary["collect_teacher_mode"] = bool(self.collect_teacher_mode)
             self._last_pricing_summary["runtime_gnn_mode"] = False
             return selected_patterns
@@ -7572,6 +7748,7 @@ class IRPResearchPipeline:
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
+        pruned_exact_mode: bool = False,
         stackelberg_aware_scoring: bool = False,
         stackelberg_exact_follower: bool = False,
         stackelberg_min_lateral_qty: Optional[float] = None,
@@ -7655,6 +7832,7 @@ class IRPResearchPipeline:
             heuristic_top_k_mode=heuristic_top_k_mode,
             heuristic_top_k=heuristic_top_k,
             exact_full_mode=exact_full_mode,
+            pruned_exact_mode=pruned_exact_mode,
             stackelberg_aware_scoring=stackelberg_aware_scoring,
             stackelberg_exact_follower=stackelberg_exact_follower,
             stackelberg_min_lateral_qty=stackelberg_min_lateral_qty,
@@ -7805,6 +7983,7 @@ class IRPResearchPipeline:
         heuristic_top_k_mode: bool = False,
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
+        pruned_exact_mode: bool = False,
         stackelberg_aware_scoring: bool = False,
         stackelberg_exact_follower: bool = False,
         stackelberg_min_lateral_qty: Optional[float] = None,
@@ -7886,6 +8065,7 @@ class IRPResearchPipeline:
             heuristic_top_k_mode=heuristic_top_k_mode,
             heuristic_top_k=heuristic_top_k,
             exact_full_mode=exact_full_mode,
+            pruned_exact_mode=pruned_exact_mode,
             stackelberg_aware_scoring=stackelberg_aware_scoring,
             stackelberg_exact_follower=stackelberg_exact_follower,
             stackelberg_min_lateral_qty=stackelberg_min_lateral_qty,
