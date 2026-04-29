@@ -157,6 +157,27 @@ def _atomic_torch_save(payload: dict, target: Path) -> None:
                 pass
 
 
+def _atomic_dataframe_to_csv(df: "pd.DataFrame", target: Path) -> None:
+    """Atomic CSV write for training_log / sampling_log so an interruption
+    mid-write cannot corrupt the human-readable log files. The model's
+    primary persistence is still last.pt (which already includes a copy of
+    `history`); this is purely so the on-disk CSVs always round-trip cleanly.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        df.to_csv(tmp_path, index=False)
+        tmp_path.replace(target)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
 def _atomic_json_save(obj: Any, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
@@ -1403,7 +1424,7 @@ def main() -> None:
             "epoch_seconds": time.time() - t_epoch,
         }
         history.append(row)
-        pd.DataFrame(history).to_csv(history_csv, index=False)
+        _atomic_dataframe_to_csv(pd.DataFrame(history), history_csv)
 
         # --- Sampling log row + per-epoch graph cache diagnostics ---
         sampled_graph_ids = set(train_batch["graph_id"].unique().tolist())
@@ -1431,7 +1452,7 @@ def main() -> None:
                 default=str,
             ),
         })
-        pd.DataFrame(sampling_log).to_csv(sampling_csv, index=False)
+        _atomic_dataframe_to_csv(pd.DataFrame(sampling_log), sampling_csv)
 
         primary_str = (f"PR-AUC={v_metrics['pr_auc']:.4f}"
                        if has_prauc else f"loss={v_metrics['loss']:.4f}")

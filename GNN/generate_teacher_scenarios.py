@@ -100,8 +100,46 @@ def read_csv_rows(path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def write_csv_rows(path: Path, rows: List[Dict[str, str]]) -> None:
+def _atomic_write_text(path: Path, write_fn) -> None:
+    """Write atomically via tempfile + os.replace.
+
+    Guarantees:
+    - If the process dies BEFORE the rename, the original file is untouched.
+    - If the process dies AFTER the rename, the new file is fully on disk.
+    - There is no observable intermediate "partial write" state.
+
+    Used for aggregate_teacher_rows.csv and scenarios_manifest.json so a
+    Kaggle session timeout / SIGKILL between scenarios cannot truncate the
+    file and lose the teacher rows of all previously-completed scenarios.
+    """
+    import tempfile as _tempfile
     path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = _tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+            write_fn(f)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # some filesystems don't support fsync (e.g., Kaggle ramdisk)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    """JSON-flavoured wrapper over _atomic_write_text — same crash-safety."""
+    _atomic_write_text(path, lambda f: json.dump(payload, f, indent=2))
+
+
+def write_csv_rows(path: Path, rows: List[Dict[str, str]]) -> None:
     fieldnames: List[str] = []
     seen: set = set()
     for row in rows:
@@ -109,17 +147,17 @@ def write_csv_rows(path: Path, rows: List[Dict[str, str]]) -> None:
             if key not in seen:
                 fieldnames.append(key)
                 seen.add(key)
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    def _write(f):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+    _atomic_write_text(path, _write)
 
 
 def _write_typed_rows_to_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     """Like write_csv_rows but accepts mixed-type values (converts to str)."""
     if not rows:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames: List[str] = []
     seen: set = set()
     for row in rows:
@@ -127,11 +165,12 @@ def _write_typed_rows_to_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             if k not in seen:
                 fieldnames.append(k)
                 seen.add(k)
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    def _write(f):
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow({k: ("" if v is None else str(v)) for k, v in row.items()})
+    _atomic_write_text(path, _write)
 
 
 def _rows_to_str_dicts(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
@@ -600,8 +639,7 @@ def main() -> None:
 
     if args.dry_run:
         manifest_path = out_dir / "scenarios_manifest.json"
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
+        _atomic_write_json(manifest_path, manifest)
         print(f"\n[generate] dry-run — wrote plan to {manifest_path}")
         return
 
@@ -705,8 +743,7 @@ def main() -> None:
                 "split": split_assignment[source_instance],
             })
             manifest_path = out_dir / "scenarios_manifest.json"
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2)
+            _atomic_write_json(manifest_path, manifest)
             continue
 
         base_data, baseline_sol = base_cache.get(scenario["base_dataset_id"], (None, None))
@@ -727,8 +764,7 @@ def main() -> None:
                 "split": split_assignment[source_instance],
             })
             manifest_path = out_dir / "scenarios_manifest.json"
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2)
+            _atomic_write_json(manifest_path, manifest)
             if not args.continue_on_failure:
                 print("[generate] aborting — pass --continue-on-failure to skip failed scenarios.")
                 return
@@ -756,8 +792,7 @@ def main() -> None:
             "split": split_assignment[source_instance],
         })
         manifest_path = out_dir / "scenarios_manifest.json"
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
+        _atomic_write_json(manifest_path, manifest)
         if not ok and not args.continue_on_failure:
             print("[generate] aborting — pass --continue-on-failure to skip failed scenarios.")
             return
@@ -772,8 +807,7 @@ def main() -> None:
     manifest["aggregate_sha1"] = sha.hexdigest()
     manifest["aggregate_rows"] = len(aggregate_rows)
     manifest_path = out_dir / "scenarios_manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+    _atomic_write_json(manifest_path, manifest)
 
     n_done = sum(1 for s in manifest["scenarios"] if s.get("ok"))
     print(f"\n[generate] done.  {len(aggregate_rows)} teacher rows  "
