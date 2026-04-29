@@ -4071,6 +4071,7 @@ class LateralTransshipmentCG:
         if not patterns:
             return patterns
         model_available = self._load_gnn_if_needed()
+        episode = self.current_episode or (len(self.gnn_selection_history) + 1)
 
         try:
             if self._gnn_build_graph is None:
@@ -4145,7 +4146,6 @@ class LateralTransshipmentCG:
                 if float(pat.metadata.get("reduced_cost", 0.0) or 0.0) < -1e-6
             )
 
-            episode = self.current_episode or (len(self.gnn_selection_history) + 1)
             selected_rows = []
             for idx, pat in enumerate(patterns):
                 score = float(score_rows[idx]["gnn_prob"])

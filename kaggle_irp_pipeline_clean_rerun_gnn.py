@@ -78,7 +78,7 @@ CG_STOPPING_MODE = "convergence"
 BP_MAX_NODES     = 20
 BP_MAX_DEPTH     = 8
 PHASE1_BASELINE_ALNS_TIME_LIMIT = int(os.environ.get("IRP_PHASE1_BASELINE_ALNS_TIME_LIMIT", "900"))
-GNN_TRAIN_EPOCHS = int(os.environ.get("IRP_GNN_TRAIN_EPOCHS", "100"))
+GNN_TRAIN_EPOCHS = int(os.environ.get("IRP_GNN_TRAIN_EPOCHS", "300"))
 LT_COST_MULTIPLIER = 1.0        # sensitivity: 5, 10, 25, 50 for thesis
 
 # ── Step 7b trainer selection ─────────────────────────────
@@ -97,6 +97,25 @@ AGG_TRAIN_WEIGHT_DECAY           = float(os.environ.get("IRP_AGG_WEIGHT_DECAY", 
 AGG_TRAIN_PATIENCE               = int(os.environ.get("IRP_AGG_PATIENCE", "20"))
 AGG_TRAIN_FULL_VALID_EVERY       = int(os.environ.get("IRP_AGG_FULL_VALID_EVERY", "10"))
 AGG_TRAIN_OUT_DIRNAME            = os.environ.get("IRP_AGG_OUT_DIRNAME", "gnn_training")
+
+# ── Runtime GNN-guided CG selection knobs ─────────────────
+# These are also propagated via env because LateralTransshipmentCG applies
+# env overrides after constructor arguments. Keeping defaults here makes Kaggle
+# reruns reproducible even when the setup cell is not executed.
+os.environ.setdefault("IRP_GNN_SELECTION_MODE", "adaptive_gap")
+os.environ.setdefault("IRP_GNN_MIN_KEEP", "5")
+os.environ.setdefault("IRP_GNN_MIN_KEEP_FRAC", "0.05")
+os.environ.setdefault("IRP_GNN_MAX_KEEP_FRAC", "0.50")
+os.environ.setdefault("IRP_GNN_DISABLE_FALLBACK", "0")
+GNN_SELECTION_MODE = os.environ.get("IRP_GNN_SELECTION_MODE", "adaptive_gap").strip() or "adaptive_gap"
+GNN_MIN_KEEP = int(os.environ.get("IRP_GNN_MIN_KEEP", "5"))
+GNN_MIN_KEEP_FRAC = float(os.environ.get("IRP_GNN_MIN_KEEP_FRAC", "0.05"))
+GNN_MAX_KEEP_FRAC = float(os.environ.get("IRP_GNN_MAX_KEEP_FRAC", "0.50"))
+GNN_DISABLE_FALLBACK = (
+    os.environ.get("IRP_GNN_DISABLE_FALLBACK", "0").strip().lower()
+    not in {"0", "false", "no", ""}
+)
+GNN_USE_CLASSICAL_FALLBACK = not GNN_DISABLE_FALLBACK
 
 
 # ── Teacher / scenario generation ────────────────────────
@@ -334,9 +353,9 @@ if CHECKPOINT_BENCHMARK_A0_ONLY:
     RUN_PHASE_2 = False
 if BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE:
     FORCE_GNN_RETRAIN = False
-    # Respect explicit IRP_FRESH_GNN_TRAINING=1 — only override if user did not set it
-    if os.environ.get("IRP_FRESH_GNN_TRAINING", "0").strip().lower() not in {"1", "true", "yes"}:
-        FRESH_GNN_TRAINING = False
+    if FRESH_GNN_TRAINING:
+        print("[Config] benchmark-from-cache mode ignores IRP_FRESH_GNN_TRAINING=1 to avoid deleting restored checkpoints.")
+    FRESH_GNN_TRAINING = False
     FORCE_RERUN_OFFLINE_GNN_TEST = False
     FORCE_RERUN_PHASE2 = False
     FORCE_RERUN_BENCHMARK = True
@@ -354,8 +373,12 @@ RESUME_EXISTING_RUN = os.environ.get("IRP_RESUME_EXISTING_RUN", "0").strip().low
 #   Results/run_state.json
 #   Results/scenarios/aggregate_teacher_rows.csv[.gz]
 #   Thesis-Work/GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt
+# Or, for an interrupted aggregate-trainer run:
+#   Results/gnn_training/best_valid_prauc.pt
+#   Results/gnn_training/best_valid_loss.pt
+#   Results/gnn_training/last.pt
 RESUME_BUNDLE_DIR = os.environ.get("IRP_RESUME_BUNDLE_DIR", "").strip()
-if RESUME_EXISTING_RUN:
+if RESUME_EXISTING_RUN or RESUME_BUNDLE_DIR:
     REFRESH_WORKING_REPO = False
     CLEAR_RESULTS_DIR = False
     REUSE_EXISTING_CHECKPOINT = True
@@ -469,7 +492,8 @@ def restore_previous_checkpoint_from_bundle(default_checkpoint: str) -> None:
         src_dir = matches[0].parent if matches else None
 
     if src_dir is None:
-        print(f"[Resume restore] No best_model.pt found in {search_root}; GNN may retrain if checkpoint is missing.")
+        print(f"[Resume restore] No best_model.pt found in {search_root}; checking aggregate trainer checkpoints.")
+        restore_aggregate_checkpoint_from_bundle(default_checkpoint, search_root=search_root)
         return
 
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -478,6 +502,119 @@ def restore_previous_checkpoint_from_bundle(default_checkpoint: str) -> None:
         if src.exists():
             shutil.copy2(src, dst_dir / name)
             print(f"[Resume restore] checkpoint artifact restored: {dst_dir / name}")
+
+    restore_aggregate_checkpoint_from_bundle(default_checkpoint, search_root=search_root)
+
+
+def restore_aggregate_checkpoint_from_bundle(
+    default_checkpoint: str,
+    search_root: Optional[Path] = None,
+) -> bool:
+    """Mirror interrupted aggregate-trainer checkpoints into the default GNN path.
+
+    `training_log.csv` is useful for reporting, but it does not contain model
+    weights. For benchmark C we need a `.pt` checkpoint with `state_dict`.
+    """
+    if search_root is None:
+        bundle = _resolve_resume_bundle_dir()
+        if bundle is None:
+            return False
+        search_root = bundle.parent if (bundle / "run_state.json").exists() else bundle
+
+    checkpoint_dst = REPO_ROOT / default_checkpoint
+    dst_dir = checkpoint_dst.parent
+    agg_candidates = [
+        search_root / "Results" / AGG_TRAIN_OUT_DIRNAME,
+        search_root / AGG_TRAIN_OUT_DIRNAME,
+        RESULTS_DIR / AGG_TRAIN_OUT_DIRNAME,
+    ]
+    agg_dir = next(
+        (
+            p for p in agg_candidates
+            if any((p / name).exists() for name in ("best_valid_prauc.pt", "best_valid_loss.pt", "last.pt"))
+        ),
+        None,
+    )
+    if agg_dir is None:
+        matches = sorted(
+            list(search_root.rglob("best_valid_prauc.pt"))
+            + list(search_root.rglob("best_valid_loss.pt"))
+            + list(search_root.rglob("last.pt"))
+        )
+        agg_dir = matches[0].parent if matches else None
+
+    if agg_dir is None:
+        log_matches = sorted(list(search_root.rglob("training_log.csv")) + list(RESULTS_DIR.rglob("training_log.csv")))
+        if log_matches:
+            print("[Resume restore] Found aggregate training_log.csv but no aggregate .pt checkpoint.")
+            print("  training_log.csv has metrics only; it cannot be used as a GNN model for benchmark C.")
+            for p in log_matches[:5]:
+                print(f"  - {p}")
+        return False
+
+    best_src = next(
+        (
+            agg_dir / name for name in ("best_valid_prauc.pt", "best_valid_loss.pt", "last.pt")
+            if (agg_dir / name).exists()
+        ),
+        None,
+    )
+    if best_src is None:
+        return False
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(best_src, checkpoint_dst)
+    print(f"[Resume restore] mirrored aggregate checkpoint {best_src} -> {checkpoint_dst}")
+
+    last_src = agg_dir / "last.pt"
+    if last_src.exists():
+        shutil.copy2(last_src, dst_dir / "last_model.pt")
+        print(f"[Resume restore] aggregate last checkpoint restored: {dst_dir / 'last_model.pt'}")
+
+    gnn_dir = RESULTS_DIR / "gnn"
+    gnn_dir.mkdir(parents=True, exist_ok=True)
+    for src_name, dst_name in [
+        ("training_log.csv",         "training_history.csv"),
+        ("final_test_metrics.json",  "training_summary.json"),
+        ("sampling_log.csv",         "sampling_log.csv"),
+        ("split_summary.csv",        "split_summary.csv"),
+        ("config.json",              "training_config.json"),
+    ]:
+        src = agg_dir / src_name
+        if src.exists():
+            shutil.copy2(src, gnn_dir / dst_name)
+            print(f"[Resume restore] aggregate artifact restored: {gnn_dir / dst_name}")
+    return True
+
+
+def require_checkpoint_for_gnn_benchmark(default_checkpoint: str) -> None:
+    """Fail early with an actionable message when benchmark C has no weights."""
+    checkpoint = REPO_ROOT / default_checkpoint
+    if checkpoint.exists():
+        return
+
+    restore_aggregate_checkpoint_from_bundle(default_checkpoint)
+    if checkpoint.exists():
+        return
+
+    agg_dir = RESULTS_DIR / AGG_TRAIN_OUT_DIRNAME
+    log_hint = ""
+    if (agg_dir / "training_log.csv").exists() or (RESULTS_DIR / "gnn" / "training_history.csv").exists():
+        log_hint = (
+            "\nFound a training CSV/log, but that file stores metrics only. "
+            "It cannot reconstruct model weights."
+        )
+    raise FileNotFoundError(
+        "Benchmark C_gnn_guided_cg requires a GNN checkpoint .pt file, but none was found.\n"
+        f"Expected default checkpoint: {checkpoint}\n"
+        f"Also checked aggregate trainer outputs under: {agg_dir}\n"
+        "Upload one of these from the interrupted Kaggle run if available:\n"
+        f"  - Results/{AGG_TRAIN_OUT_DIRNAME}/best_valid_prauc.pt\n"
+        f"  - Results/{AGG_TRAIN_OUT_DIRNAME}/best_valid_loss.pt\n"
+        f"  - Results/{AGG_TRAIN_OUT_DIRNAME}/last.pt\n"
+        "A0 can run without GNN weights; C cannot."
+        f"{log_hint}"
+    )
 
 
 def prepare_working_repo() -> None:
@@ -733,12 +870,12 @@ def run_phase(irp: Any, data: Any, *, use_gnn: bool, collect_teacher: bool,
         collect_teacher_mode=collect_teacher,
         runtime_gnn_mode=use_gnn,
         gnn_checkpoint=irp.DEFAULT_GNN_CHECKPOINT,
-        use_classical_fallback=use_gnn,
-        gnn_selection_mode="cumulative_mass",
+        use_classical_fallback=use_gnn and GNN_USE_CLASSICAL_FALLBACK,
+        gnn_selection_mode=GNN_SELECTION_MODE,
         gnn_mass_threshold=0.55,
         gnn_relative_threshold=0.85,
         gnn_max_keep=150,
-        gnn_max_keep_fraction=0.30,
+        gnn_max_keep_fraction=GNN_MAX_KEEP_FRAC,
         heuristic_top_k_mode=heuristic_top_k_mode,
         heuristic_top_k=HEURISTIC_TOP_K,
         use_branch_and_price=True,
@@ -790,10 +927,13 @@ print(f"  use_aggregate_trainer={USE_AGGREGATE_TRAINER}  "
       f"agg_rows/epoch={AGG_TRAIN_ROWS_PER_EPOCH}  agg_valid_rows/epoch={AGG_TRAIN_VALID_ROWS_PER_EPOCH}  "
       f"agg_max_rows/source={AGG_TRAIN_MAX_ROWS_PER_INSTANCE}  agg_full_valid_every={AGG_TRAIN_FULL_VALID_EVERY}  "
       f"agg_lr={AGG_TRAIN_LR}  agg_patience={AGG_TRAIN_PATIENCE}")
+print(f"  gnn_selection_mode={GNN_SELECTION_MODE}  gnn_min_keep={GNN_MIN_KEEP}  "
+      f"gnn_min_keep_frac={GNN_MIN_KEEP_FRAC}  gnn_max_keep_frac={GNN_MAX_KEEP_FRAC}  "
+      f"gnn_use_classical_fallback={GNN_USE_CLASSICAL_FALLBACK}")
 print(f"  lt_min_units={LT_MIN_UNITS}  integer_outputs={INTEGER_FINAL_OUTPUTS}  benchmark_fixed_shock={BENCHMARK_FIXED_SHOCK}")
 print(f"  resume_existing_run={RESUME_EXISTING_RUN}  refresh_working_repo={REFRESH_WORKING_REPO}")
 print(f"  clear_results_dir={CLEAR_RESULTS_DIR}  reuse_existing_checkpoint={REUSE_EXISTING_CHECKPOINT}")
-print(f"  resume_bundle_dir={RESUME_BUNDLE_DIR or 'auto' if RESUME_EXISTING_RUN else 'none'}")
+print(f"  resume_bundle_dir={RESUME_BUNDLE_DIR or ('auto' if RESUME_EXISTING_RUN else 'none')}")
 print(f"  force_gnn_retrain={FORCE_GNN_RETRAIN}  fresh_gnn_training={FRESH_GNN_TRAINING}")
 print(f"  force_rerun_offline_gnn_test={FORCE_RERUN_OFFLINE_GNN_TEST}  "
       f"force_rerun_phase2={FORCE_RERUN_PHASE2}  force_rerun_benchmark={FORCE_RERUN_BENCHMARK}")
@@ -844,7 +984,7 @@ if not verify_gurobi():
 
 import irp_gurobi_converted as irp
 irp = importlib.reload(irp)
-if RESUME_EXISTING_RUN:
+if RESUME_EXISTING_RUN or RESUME_BUNDLE_DIR:
     restore_previous_checkpoint_from_bundle(irp.DEFAULT_GNN_CHECKPOINT)
 
 # --- Kaggle robustness wiring -------------------------------------------------
@@ -1028,8 +1168,8 @@ offline_test_csv = offline_test_dir / "test_per_sample.csv"
 
 if (CHECKPOINT_BENCHMARK_C_ONLY or CHECKPOINT_BENCHMARK_A0_ONLY or BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE) and not FRESH_GNN_TRAINING:
     print("\n[Step 7] checkpoint benchmark-only mode — skipping graph build, GNN training, and offline GNN test.")
-    if (CHECKPOINT_BENCHMARK_C_ONLY or BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE) and not checkpoint.exists():
-        raise FileNotFoundError(f"Checkpoint required for C-only benchmark rerun: {checkpoint}")
+    if CHECKPOINT_BENCHMARK_C_ONLY or BENCHMARK_CG_ONLY_FROM_CACHE or BENCHMARK_SLICED_CG_ONLY_FROM_CACHE:
+        require_checkpoint_for_gnn_benchmark(irp.DEFAULT_GNN_CHECKPOINT)
     if checkpoint.exists():
         gnn_history = irp.load_gnn_training_history(irp.DEFAULT_GNN_CHECKPOINT)
         pd.DataFrame(gnn_history).to_csv(train_hist_csv, index=False)
@@ -1579,18 +1719,31 @@ def _benchmark_shared_state_meta(
     }
 
 
+def _load_pickle_maybe_gzip(path: Path) -> Any:
+    with open(path, "rb") as probe:
+        magic = probe.read(2)
+    opener = gzip.open if magic == b"\x1f\x8b" or path.suffix == ".gz" else open
+    with opener(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _dump_pickle_maybe_gzip(obj: Any, path: Path) -> None:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def _load_benchmark_shared_state(
     results_dir: Path,
     expected_meta: Dict[str, Any],
 ) -> Optional[Tuple[Any, List[Tuple[Any, Dict[str, Any], int]], float]]:
     if os.environ.get("IRP_USE_BENCHMARK_BASELINE_CACHE", "1").strip().lower() in {"0", "false", "no"}:
         return None
-    cache_path = results_dir / "benchmark" / "shared_benchmark_state.pkl.gz"
+    cache_path = _resolve_benchmark_baseline_cache_path(results_dir)
     if not cache_path.exists():
         return None
     try:
-        with gzip.open(cache_path, "rb") as f:
-            payload = pickle.load(f)
+        payload = _load_pickle_maybe_gzip(cache_path)
         if payload.get("meta") != expected_meta:
             print(f"[Benchmark cache] found {cache_path}, but metadata does not match current run; recomputing baseline.")
             return None
@@ -1615,9 +1768,8 @@ def _save_benchmark_shared_state(
 ) -> None:
     if os.environ.get("IRP_SAVE_BENCHMARK_BASELINE_CACHE", "1").strip().lower() in {"0", "false", "no"}:
         return
-    cache_dir = results_dir / "benchmark"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / "shared_benchmark_state.pkl.gz"
+    cache_path = _resolve_benchmark_baseline_cache_save_path(results_dir)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "meta": meta,
         "shared_baseline_sol": shared_baseline_sol,
@@ -1626,8 +1778,9 @@ def _save_benchmark_shared_state(
         "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    with gzip.open(tmp_path, "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    _dump_pickle_maybe_gzip(payload, tmp_path if cache_path.suffix != ".gz" else cache_path.with_suffix(cache_path.suffix + ".tmp.gz"))
+    if cache_path.suffix == ".gz":
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp.gz")
     tmp_path.replace(cache_path)
     print(f"[Benchmark cache] saved shared baseline + shock states to {cache_path}")
 
@@ -1635,6 +1788,25 @@ def _save_benchmark_shared_state(
 def _resolve_benchmark_baseline_cache_path(results_dir: Path) -> Path:
     if BENCHMARK_BASELINE_CACHE_PATH:
         return Path(BENCHMARK_BASELINE_CACHE_PATH)
+    bundle = _resolve_resume_bundle_dir()
+    if bundle is not None:
+        search_root = bundle.parent if (bundle / "run_state.json").exists() else bundle
+        for name in ("shared_benchmark_state.pkl", "shared_benchmark_state.pkl.gz"):
+            candidate = search_root / name
+            if candidate.exists():
+                return candidate
+            candidate = search_root / "Results" / "benchmark" / name
+            if candidate.exists():
+                return candidate
+    return results_dir / "benchmark" / "shared_benchmark_state.pkl.gz"
+
+
+def _resolve_benchmark_baseline_cache_save_path(results_dir: Path) -> Path:
+    if BENCHMARK_BASELINE_CACHE_PATH:
+        requested = Path(BENCHMARK_BASELINE_CACHE_PATH)
+        if str(requested).startswith("/kaggle/input/"):
+            return results_dir / "benchmark" / requested.name
+        return requested
     return results_dir / "benchmark" / "shared_benchmark_state.pkl.gz"
 
 
@@ -1655,8 +1827,7 @@ def _load_benchmark_baseline_only_from_cache(
             "CG-only benchmark requires an existing shared baseline cache. "
             f"Missing: {cache_path}"
         )
-    with gzip.open(cache_path, "rb") as f:
-        payload = pickle.load(f)
+    payload = _load_pickle_maybe_gzip(cache_path)
     if "shared_baseline_sol" not in payload:
         raise KeyError(f"Benchmark cache has no shared_baseline_sol: {cache_path}")
 
@@ -1922,10 +2093,10 @@ def run_benchmark_cg_only_from_cached_baseline(
                         cg_iterations=cg_iterations,
                         msg=False,
                         gnn_checkpoint=gnn_checkpoint_path,
-                        use_classical_fallback=False,
+                        use_classical_fallback=GNN_USE_CLASSICAL_FALLBACK,
                         gnn_mass_threshold=0.55,
                         gnn_max_keep=150,
-                        gnn_max_keep_fraction=0.30,
+                        gnn_max_keep_fraction=GNN_MAX_KEEP_FRAC,
                         use_branch_and_price=variant_use_branch_and_price,
                         bp_max_nodes=bp_max_nodes,
                         bp_max_depth=bp_max_depth,
@@ -2031,9 +2202,12 @@ def run_benchmark_cg_only_from_cached_baseline(
     numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
     agg_rows: List[Dict[str, Any]] = []
     for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
-        row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
-        if "error" in grp.columns:
-            row["n_failed"] = int(grp["error"].notna().sum())
+        n_failed = int(grp["error"].notna().sum()) if "error" in grp.columns else 0
+        row = {
+            "variant": variant_name,
+            "n_repeats_successful": int(len(grp) - n_failed),
+            "n_failed": n_failed,
+        }
         for c in numeric_cols:
             numeric = pd.to_numeric(grp[c], errors="coerce")
             row[f"{c}_mean"] = float(numeric.mean())
@@ -2267,10 +2441,10 @@ def run_benchmark_sliced_cg_only_from_cached_baseline(
                             cg_iterations=cg_iterations,
                             msg=False,
                             gnn_checkpoint=gnn_checkpoint_path,
-                            use_classical_fallback=False,
+                            use_classical_fallback=GNN_USE_CLASSICAL_FALLBACK,
                             gnn_mass_threshold=0.55,
                             gnn_max_keep=150,
-                            gnn_max_keep_fraction=0.30,
+                            gnn_max_keep_fraction=GNN_MAX_KEEP_FRAC,
                             use_branch_and_price=variant_use_branch_and_price,
                             bp_max_nodes=bp_max_nodes,
                             bp_max_depth=bp_max_depth,
@@ -2388,9 +2562,12 @@ def run_benchmark_sliced_cg_only_from_cached_baseline(
     numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
     agg_rows: List[Dict[str, Any]] = []
     for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
-        row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
-        if "error" in grp.columns:
-            row["n_failed"] = int(grp["error"].notna().sum())
+        n_failed = int(grp["error"].notna().sum()) if "error" in grp.columns else 0
+        row = {
+            "variant": variant_name,
+            "n_repeats_successful": int(len(grp) - n_failed),
+            "n_failed": n_failed,
+        }
         for c in numeric_cols:
             numeric = pd.to_numeric(grp[c], errors="coerce")
             row[f"{c}_mean"] = float(numeric.mean())
@@ -2571,10 +2748,10 @@ def run_benchmark_c_only_with_existing_rows(
                 cg_iterations=cg_iterations,
                 msg=False,
                 gnn_checkpoint=gnn_checkpoint_path,
-                use_classical_fallback=False,
+                use_classical_fallback=GNN_USE_CLASSICAL_FALLBACK,
                 gnn_mass_threshold=0.55,
                 gnn_max_keep=150,
-                gnn_max_keep_fraction=0.30,
+                gnn_max_keep_fraction=GNN_MAX_KEEP_FRAC,
                 use_branch_and_price=True,
                 bp_max_nodes=bp_max_nodes,
                 bp_max_depth=bp_max_depth,
@@ -2639,7 +2816,12 @@ def run_benchmark_c_only_with_existing_rows(
     numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
     agg_rows: List[Dict[str, Any]] = []
     for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
-        row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
+        n_failed = int(grp["error"].notna().sum()) if "error" in grp.columns else 0
+        row = {
+            "variant": variant_name,
+            "n_repeats_successful": int(len(grp) - n_failed),
+            "n_failed": n_failed,
+        }
         for c in numeric_cols:
             numeric = pd.to_numeric(grp[c], errors="coerce")
             row[f"{c}_mean"] = float(numeric.mean())
@@ -2801,10 +2983,10 @@ def run_benchmark_a0_only_with_existing_rows(
                 cg_iterations=cg_iterations,
                 msg=False,
                 gnn_checkpoint=_irp.DEFAULT_GNN_CHECKPOINT,
-                use_classical_fallback=False,
+                use_classical_fallback=GNN_USE_CLASSICAL_FALLBACK,
                 gnn_mass_threshold=0.55,
                 gnn_max_keep=150,
-                gnn_max_keep_fraction=0.30,
+                gnn_max_keep_fraction=GNN_MAX_KEEP_FRAC,
                 use_branch_and_price=True,
                 bp_max_nodes=bp_max_nodes,
                 bp_max_depth=bp_max_depth,
@@ -2872,7 +3054,12 @@ def run_benchmark_a0_only_with_existing_rows(
     numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
     agg_rows: List[Dict[str, Any]] = []
     for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
-        row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
+        n_failed = int(grp["error"].notna().sum()) if "error" in grp.columns else 0
+        row = {
+            "variant": variant_name,
+            "n_repeats_successful": int(len(grp) - n_failed),
+            "n_failed": n_failed,
+        }
         for c in numeric_cols:
             numeric = pd.to_numeric(grp[c], errors="coerce")
             row[f"{c}_mean"] = float(numeric.mean())
@@ -3058,10 +3245,10 @@ def run_benchmark_a0_c_with_existing_rows(
                     cg_iterations=cg_iterations,
                     msg=False,
                     gnn_checkpoint=gnn_checkpoint_path,
-                    use_classical_fallback=False,
+                    use_classical_fallback=GNN_USE_CLASSICAL_FALLBACK,
                     gnn_mass_threshold=0.55,
                     gnn_max_keep=150,
-                    gnn_max_keep_fraction=0.30,
+                    gnn_max_keep_fraction=GNN_MAX_KEEP_FRAC,
                     use_branch_and_price=True,
                     bp_max_nodes=bp_max_nodes,
                     bp_max_depth=bp_max_depth,
@@ -3130,7 +3317,12 @@ def run_benchmark_a0_c_with_existing_rows(
     numeric_cols = [c for c in numeric_cols if c in per_run_df.columns]
     agg_rows: List[Dict[str, Any]] = []
     for variant_name, grp in per_run_df.groupby("variant", sort=False, observed=False):
-        row = {"variant": variant_name, "n_repeats_successful": int(len(grp))}
+        n_failed = int(grp["error"].notna().sum()) if "error" in grp.columns else 0
+        row = {
+            "variant": variant_name,
+            "n_repeats_successful": int(len(grp) - n_failed),
+            "n_failed": n_failed,
+        }
         for c in numeric_cols:
             numeric = pd.to_numeric(grp[c], errors="coerce")
             row[f"{c}_mean"] = float(numeric.mean())
@@ -3206,6 +3398,14 @@ if RUN_BENCHMARK:
             print("[benchmark] force rerun enabled; recomputing only C_gnn_guided_cg and preserving existing A0/A/B rows.")
         elif FORCE_RERUN_BENCHMARK:
             print("[benchmark] force rerun enabled; recomputing A0/A/B/C benchmark with the current checkpoint.")
+        benchmark_needs_gnn = not (
+            BENCHMARK_A0_ONLY
+            and not BENCHMARK_C_ONLY
+            and not BENCHMARK_CG_ONLY_FROM_CACHE
+            and not BENCHMARK_SLICED_CG_ONLY_FROM_CACHE
+        )
+        if benchmark_needs_gnn:
+            require_checkpoint_for_gnn_benchmark(irp.DEFAULT_GNN_CHECKPOINT)
         RUN_STATE.mark_start("benchmark", n_repeats=BENCHMARK_N_REPEATS)
         _, bm_data, _, _, _ = build_data(
             irp,
