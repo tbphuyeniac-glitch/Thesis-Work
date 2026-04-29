@@ -1530,6 +1530,7 @@ class BaselineALNSModel:
         cooling_rate: float = 0.998,
         segment_size: int = 40,
         reaction_factor: float = 0.1,
+        initial_solution: Optional[FullIRPTSolution] = None,
     ) -> FullIRPTSolution:
         # allow_lateral_transshipment is accepted for API parity; LT is never produced here.
         if allow_lateral_transshipment:
@@ -1548,7 +1549,12 @@ class BaselineALNSModel:
         t0 = time.perf_counter()
         deadline = (t0 + float(time_limit)) if time_limit is not None else None
 
-        current = self._build_greedy_initial_solution()
+        # Warm-start from external solution (e.g., Gurobi MIP) if provided —
+        # mirrors Achamrah's Phase 1 (exact) → Phase 2 (heuristic) flow.
+        if initial_solution is not None:
+            current = self._state_from_solution(initial_solution)
+        else:
+            current = self._build_greedy_initial_solution()
         curr_cost, curr_feasible = self._evaluate(current)
         best = current.clone()
         best_cost = curr_cost
@@ -1789,6 +1795,38 @@ class BaselineALNSModel:
                     demand = float(d.demand.get((s, p, t), 0.0))
                     qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
                     inv_store[(s, p)] = max(0.0, inv_store[(s, p)] + qdir - demand)
+        return state
+
+    def _state_from_solution(self, sol: FullIRPTSolution) -> _ALNSState:
+        """Convert a FullIRPTSolution (e.g., from Gurobi MIP) into ALNS state
+        for use as warm-start initial. Extracts route order from sol.x and
+        copies sol.deliv directly (same key format)."""
+        d = self.data
+        state = _ALNSState()
+        # Group active arcs by (vehicle, period)
+        arcs_by_vt: Dict[Tuple[Vehicle, Period], List[Tuple[Node, Node]]] = {}
+        for (i, j, v, t), val in sol.x.items():
+            if float(val) > 0.5:
+                arcs_by_vt.setdefault((v, t), []).append((i, j))
+        # Reconstruct route order: WH → s1 → ... → sk → WH
+        for (v, t), arcs in arcs_by_vt.items():
+            next_map = {i: j for i, j in arcs}
+            route: List[Store] = []
+            cur = d.warehouse
+            visited = {cur}
+            while cur in next_map:
+                nxt = next_map[cur]
+                if nxt == d.warehouse or nxt in visited:
+                    break
+                route.append(nxt)
+                visited.add(nxt)
+                cur = nxt
+            if route:
+                state.routes[(t, v)] = route
+        # Copy deliveries (same key format as ALNS)
+        for k, q in sol.deliv.items():
+            if q > 1e-9:
+                state.deliv[k] = float(q)
         return state
 
     # ------------------------------------------------------------ evaluation

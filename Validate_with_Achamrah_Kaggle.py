@@ -551,6 +551,25 @@ class ThesisCRunner:
             for p in data.products:
                 data.holding_cost_wh[p] = 0.0
             data.vehicle_fixed_cost = 0.0
+
+            # ── Distance override for fair comparison ────────────────────
+            # The mapper loads real Vietnam highway distances (100-1000 km)
+            # from matrix-format CSV. SharedDataBuilder fails to parse that
+            # format and falls back to synthetic Euclidean (range ~0-141).
+            # → Achamrah uses synthetic, Thesis C uses real → 10x routing-cost
+            # mismatch. Force Thesis C to use the same synthetic distances as
+            # Achamrah by overriding data.distance from dist_dict.
+            wh_alias = "__WAREHOUSE__"
+            def _name(node):
+                return wh_alias if node == data.warehouse else node
+            all_nodes = [data.warehouse] + data.stores
+            for i in all_nodes:
+                for j in all_nodes:
+                    if i == j:
+                        continue
+                    key = (_name(i), _name(j))
+                    if key in dist_dict:
+                        data.distance[(i, j)] = float(dist_dict[key])
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
@@ -591,42 +610,177 @@ class ThesisCRunner:
                 # Demand shock disabled — realized demand equals forecast demand.
                 # This ensures both methods face identical deterministic demand.
                 data.realized_demand = dict(data.demand)
+                orig_demand = dict(data.demand)
 
-                # Run ALNS baseline
-                baseline_sol = irp.BaselineALNSModel(data).solve(
-                    msg=False,
-                    time_limit=max(60, self.time_limit // 4),
-                    allow_lateral_transshipment=False,
-                )
-
-                # Set env vars for GNN selection
                 os.environ["IRP_GNN_SELECTION_MODE"] = self.gnn_selection_mode
                 os.environ["IRP_GNN_MIN_KEEP"]        = "3"
                 os.environ["IRP_GNN_MIN_KEEP_FRAC"]   = "0.05"
                 os.environ["IRP_GNN_MAX_KEEP_FRAC"]   = "0.50"
 
-                # Run CG + GNN (variant C).
-                # lt_activation_threshold=1.0 ensures CG activates even for
-                # small (≥1 unit) shortages; default 10.0 is too coarse for
-                # small scenarios.
-                pipeline = irp.IRPResearchPipeline(data)
-                results  = pipeline.run_lt_recourse_from_baseline(
-                    baseline_sol,
-                    use_random_initial_patterns=True,
-                    n_initial_patterns_per_product_period=5,
-                    cg_iterations=self.cg_iterations,
-                    msg=False,
-                    gnn_checkpoint=self.checkpoint_path,
-                    use_gnn=True,
-                    runtime_gnn_mode=True,
-                    gnn_selection_mode=self.gnn_selection_mode,
-                    use_classical_fallback=False,
-                    gnn_max_keep=100,
-                    gnn_max_keep_fraction=0.50,
-                    lt_activation_threshold=1.0,
+                # Phase 1 (Gurobi MIP): solve routing + inventory exactly,
+                # time-limited. Mirrors Achamrah Phase 1 (RMILP+cluster MILPs).
+                # Phase 2 (ALNS): warm-started from MIP solution, refines further.
+                # Mirrors Achamrah Phase 2 (GA/SA) — heuristic refinement of an
+                # exact-method initial solution.
+                from gurobipy import GRB as _GRB
+                mip_time_budget = max(30, self.time_limit // 4)
+
+                # Helper: one full pass = MIP routing → ALNS refine → CG/LT
+                def _one_pass():
+                    # Phase 1: Gurobi MIP for routing+inventory (no LT)
+                    mip_sol = None
+                    try:
+                        mip_sol = irp.AchamrahFullIRPTModel(data).solve(
+                            msg=False,
+                            time_limit=mip_time_budget,
+                            allow_lateral_transshipment=False,
+                            cw_dispatch_cycle=1,
+                        )
+                    except Exception:
+                        mip_sol = None
+
+                    mip_ok = (
+                        mip_sol is not None
+                        and getattr(mip_sol, "objective", float("inf")) < float("inf")
+                    )
+
+                    # Phase 2: ALNS warm-started from MIP. If MIP failed,
+                    # fall back to ALNS with greedy initial.
+                    bsol = irp.BaselineALNSModel(data).solve(
+                        msg=False,
+                        time_limit=max(30, self.time_limit // 8),
+                        allow_lateral_transshipment=False,
+                        cw_dispatch_cycle=1,
+                        max_iterations=10000,
+                        seed=42,
+                        initial_solution=mip_sol if mip_ok else None,
+                    )
+
+                    # Safety: if ALNS refinement made the cost WORSE than the
+                    # MIP starting point (rare but possible if SA accepts
+                    # diversifying moves), revert to MIP solution.
+                    if mip_ok:
+                        mip_br = irp.build_realized_operating_cost_breakdown(
+                            data, mip_sol, lt_plan_df=None,
+                        )
+                        alns_br = irp.build_realized_operating_cost_breakdown(
+                            data, bsol, lt_plan_df=None,
+                        )
+                        if (alns_br["total_realized_operating_cost"]
+                                > mip_br["total_realized_operating_cost"] + 1e-6):
+                            bsol = mip_sol
+                    pipe = irp.IRPResearchPipeline(data)
+                    res = pipe.run_lt_recourse_from_baseline(
+                        bsol,
+                        use_random_initial_patterns=True,
+                        n_initial_patterns_per_product_period=5,
+                        cg_iterations=self.cg_iterations,
+                        msg=False,
+                        gnn_checkpoint=self.checkpoint_path,
+                        use_gnn=True,
+                        runtime_gnn_mode=True,
+                        gnn_selection_mode=self.gnn_selection_mode,
+                        use_classical_fallback=False,
+                        gnn_max_keep=100,
+                        gnn_max_keep_fraction=0.50,
+                        lt_activation_threshold=1.0,
+                    )
+                    return bsol, res
+
+                # ===== ITER 1: ALNS_v1 + CG_v1 =====
+                baseline_v1, results_v1 = _one_pass()
+
+                # Baseline-only cost (no LT applied)
+                no_lt_breakdown_v1 = irp.build_realized_operating_cost_breakdown(
+                    data, baseline_v1, lt_plan_df=None,
                 )
+                cost_no_lt_v1 = float(no_lt_breakdown_v1["total_realized_operating_cost"])
+                cost_with_lt_v1 = float(results_v1["realized_with_lt_cost_breakdown"]
+                                        ["total_realized_operating_cost"])
+
+                # Step 3 — Safety check: track whether LT helped, but keep
+                # the LT plan around — even if iter1 LT was bad, the LT plan
+                # still identifies good donor↔recipient pairs that iter2's
+                # ALNS_v2 can use as a routing-rebalance signal.
+                lt_helped_v1 = cost_with_lt_v1 < cost_no_lt_v1 - 1e-6
+                lt_plan_v1_full = results_v1.get("lt_plan", pd.DataFrame())
+                if not lt_helped_v1:
+                    # Discard LT for iter1's reported result, but keep
+                    # lt_plan_v1_full for iter2 effective-demand computation.
+                    results_v1["realized_with_lt_cost_breakdown"] = no_lt_breakdown_v1
+                    lt_cols = list(lt_plan_v1_full.columns)
+                    results_v1["lt_plan"] = (pd.DataFrame(columns=lt_cols)
+                                             if lt_cols else pd.DataFrame())
+
+                # ===== ITER 2: feedback loop runs if LT plan exists =====
+                # (regardless of iter1 LT helpfulness — the LT plan signals
+                # which stores need rebalancing in iter2's ALNS routing).
+                results_v2 = None
+                cost_with_lt_v2 = float("inf")
+                iter2_run = False
+                if isinstance(lt_plan_v1_full, pd.DataFrame) and not lt_plan_v1_full.empty:
+                    lt_plan_v1 = lt_plan_v1_full
+                    if True:  # was: if lt_helped_v1:
+                        # Effective demand for ALNS_v2:
+                        #   recipient (to_store) demand reduced by LT inflow
+                        #   donor     (from_store) demand increased to keep surplus
+                        effective_demand = dict(orig_demand)
+                        for _, row in lt_plan_v1.iterrows():
+                            try:
+                                t = int(row["period"])
+                                sku = str(row["sku"])
+                                from_s = str(row["from_store"])
+                                to_s = str(row["to_store"])
+                                qty = float(row.get("lt_qty", 0.0))
+                            except Exception:
+                                continue
+                            if qty <= 0:
+                                continue
+                            effective_demand[(to_s, sku, t)] = max(
+                                0.0, effective_demand.get((to_s, sku, t), 0.0) - qty)
+                            effective_demand[(from_s, sku, t)] = (
+                                effective_demand.get((from_s, sku, t), 0.0) + qty)
+
+                        try:
+                            # ALNS_v2 sees effective demand;
+                            # realized_demand stays original so cost is evaluated truthfully.
+                            data.demand = effective_demand
+                            baseline_v2, results_v2 = _one_pass()
+                            iter2_run = True
+                        finally:
+                            data.demand = orig_demand
+
+                        if iter2_run:
+                            cost_with_lt_v2 = float(
+                                results_v2["realized_with_lt_cost_breakdown"]
+                                ["total_realized_operating_cost"])
+                            # Discard LT in v2 too if it doesn't help baseline_v2
+                            no_lt_breakdown_v2 = irp.build_realized_operating_cost_breakdown(
+                                data, baseline_v2, lt_plan_df=None,
+                            )
+                            cost_no_lt_v2 = float(
+                                no_lt_breakdown_v2["total_realized_operating_cost"])
+                            if cost_with_lt_v2 >= cost_no_lt_v2 - 1e-6:
+                                results_v2["realized_with_lt_cost_breakdown"] = no_lt_breakdown_v2
+                                lt_cols = list(results_v2.get("lt_plan", pd.DataFrame()).columns)
+                                results_v2["lt_plan"] = (pd.DataFrame(columns=lt_cols)
+                                                         if lt_cols else pd.DataFrame())
+                                cost_with_lt_v2 = cost_no_lt_v2
+
+                # Step 5 — pick best of v1 / v2
+                final_cost_v1 = (cost_with_lt_v1 if lt_helped_v1 else cost_no_lt_v1)
+                if iter2_run and cost_with_lt_v2 < final_cost_v1:
+                    results = results_v2
+                    chosen = "iter2"
+                else:
+                    results = results_v1
+                    chosen = "iter1" if lt_helped_v1 else "iter1_no_LT"
 
             runtime = time.time() - t0
+            print(f"  [ThesisC mode]   iter1_baseline={cost_no_lt_v1:.2f}  "
+                  f"iter1_withLT={cost_with_lt_v1:.2f}  "
+                  f"iter2_withLT={cost_with_lt_v2 if iter2_run else float('nan'):.2f}  "
+                  f"chosen={chosen}")
 
             # Extract metrics from results
             cg_sol   = results.get("cg_solution")
@@ -840,7 +994,6 @@ class AchamrahRunner:
             from achamrah_2022_irpt_matheuristic import (
                 AchamrahIRPTSolver, HeuristicParams,
             )
-            from achamrah_integrated_extended_solver import AchamrahIntegratedExtendedSolver
             from gurobipy import GRB
 
             instance, store_to_id, sku_to_id, periods_dt = self._build_achamrah_instance(
@@ -849,9 +1002,13 @@ class AchamrahRunner:
             id_to_store = {v: k for k, v in store_to_id.items()}
             id_to_sku   = {v: k for k, v in sku_to_id.items()}
 
-            # ── Phase 1+2: run the real Achamrah 2022 matheuristic ────────
-            # Constructive phase: RMILP → cluster MILPs → initial routes
-            # Improvement phase:  GA+SA hybrid, each candidate evaluated by FMILP
+            # Achamrah 2022 matheuristic.
+            # NOTE: Phase 1 (RMILP+cluster MILPs constructive) is REQUIRED — it
+            # provides the feasible initial chromosome for Phase 2. Skipping
+            # it (random/empty initial routes) makes the FMILP infeasible
+            # because of vehicle-routing↔inventory coupling, so improvement_phase
+            # aborts immediately. Phase 2 (GA+SA) uses FMILP as its fitness
+            # function (also Gurobi MIP), which is part of the algorithm itself.
             params = HeuristicParams(
                 full_time_limit=float(self.time_limit),
                 constructive_time_limit=float(self.time_limit) * 0.25,
@@ -864,52 +1021,92 @@ class AchamrahRunner:
             math_result = math_solver.solve_full_matheuristic()
 
             best_routes = math_result.best_routes
-
-            # ── Phase 3: evaluate best routes with extended solver ────────
-            # Re-solve the FMILP with best_routes fixed to extract cost
-            # breakdown and LT moves (using simplified LT mode for thesis match).
-            eval_solver = AchamrahIntegratedExtendedSolver(
-                instance,
-                vehicle_indexed_lt=self.vehicle_indexed_lt,
-            )
-            artifacts = eval_solver.solve_model(
-                time_limit=max(120.0, float(self.time_limit) * 0.15),
-                mip_gap=self.mip_gap,
-                allow_lateral_transshipment=True,
-                fixed_routes=best_routes,
-            )
+            final_sol = math_result.final_solution or math_result.constructive_solution
+            math_obj = math_result.best_objective
 
             runtime = time.time() - t0
 
-            # Status: if matheuristic produced a solution use it; otherwise
-            # fall back to the evaluation solve status.
-            math_obj = math_result.best_objective
-            if math.isfinite(math_obj):
+            # Status purely from matheuristic
+            if math.isfinite(math_obj) and final_sol is not None:
                 status = "success"
-            elif artifacts.status == GRB.OPTIMAL:
-                status = "success"
-            elif artifacts.status == GRB.TIME_LIMIT and not math.isinf(artifacts.objective):
-                status = "success"
-            elif artifacts.status == GRB.TIME_LIMIT:
-                status = "timeout"
+            elif math.isfinite(math_obj):
+                status = "success"   # objective valid even if final_sol missing
             else:
                 status = "failed"
-
             success = status == "success"
 
-            cb = artifacts.cost_breakdown or {}
-            routing_cost      = cb.get("routing",  0.0)
-            holding_cost      = cb.get("holding",  0.0)
-            shortage_cost     = cb.get("shortage", 0.0)
-            lt_cost           = cb.get("lt",       0.0)
-            # Prefer matheuristic objective (from GA+SA); fall back to eval
-            total_cost = math_obj if math.isfinite(math_obj) else cb.get("total", artifacts.objective)
+            # ── Cost breakdown directly from matheuristic's final FMILP vars
+            routing_cost = holding_cost = shortage_cost = lt_cost = 0.0
+            lt_moves_raw: List[Dict[str, Any]] = []
+            num_vars = num_constrs = 0
+            mip_gap_val = float("nan")
+            if final_sol is not None and final_sol.vars:
+                vd = final_sol.vars
+                try:
+                    num_vars = final_sol.model.NumVars
+                    num_constrs = final_sol.model.NumConstrs
+                    mip_gap_val = float(getattr(final_sol.model, "MIPGap", float("nan")))
+                except Exception:
+                    pass
 
-            # Compute shortage qty from raw model output
-            lt_moves_raw = artifacts.lt_moves or []
-            lt_total_qty = sum(m.get("quantity", 0) for m in lt_moves_raw)
+                # Routing cost: alpha * d_ij * x_ijvt
+                if "x" in vd:
+                    for (i, j, v, t), var in vd["x"].items():
+                        try:
+                            xv = float(var.X)
+                        except Exception:
+                            xv = 0.0
+                        if xv > 0.5:
+                            routing_cost += instance.alpha * instance.d.get((i, j), 0.0) * xv
 
-            # Shortage qty (approximate from demand vs inventory, not directly tracked)
+                # Holding: h[(p,i)] * I[(p,i,t)] (only stores i ∈ N, not warehouse)
+                if "I" in vd:
+                    for (p, i, t), var in vd["I"].items():
+                        if i not in instance.N:
+                            continue
+                        try:
+                            iv = float(var.X)
+                        except Exception:
+                            iv = 0.0
+                        holding_cost += instance.h.get((p, i), 0.0) * iv
+
+                # Shortage: f[(p,i)] * S[(p,i,t)]
+                if "S" in vd:
+                    for (p, i, t), var in vd["S"].items():
+                        try:
+                            sv = float(var.X)
+                        except Exception:
+                            sv = 0.0
+                        shortage_cost += instance.f.get((p, i), 0.0) * sv
+
+                # LT: b[(i,j)] * y[(p,i,j,v,t)] — y is vehicle-indexed (5-tuple).
+                # Aggregate across vehicles for cost & moves listing.
+                if "y" in vd:
+                    lt_agg: Dict[Tuple[int, int, int, int], float] = {}
+                    for key, var in vd["y"].items():
+                        try:
+                            p, i, j, v, t = key
+                            yv = float(var.X)
+                        except Exception:
+                            continue
+                        if yv > 1e-6:
+                            lt_cost += instance.b.get((i, j), 0.0) * yv
+                            agg_k = (p, i, j, t)
+                            lt_agg[agg_k] = lt_agg.get(agg_k, 0.0) + yv
+                    for (p, i, j, t), yv in lt_agg.items():
+                        lt_moves_raw.append({
+                            "from_store": i, "to_store": j, "product": p,
+                            "period": t, "quantity": yv,
+                            "cost": instance.b.get((i, j), 0.0) * yv,
+                            "vehicle": None,
+                        })
+
+            total_cost = math_obj if math.isfinite(math_obj) else (
+                routing_cost + holding_cost + shortage_cost + lt_cost
+            )
+
+            lt_total_qty = sum(m.get("quantity", 0.0) for m in lt_moves_raw)
+
             total_demand = sum(
                 instance.D.get((p, i, t), 0.0)
                 for p in instance.P for i in instance.N for t in instance.H
@@ -958,9 +1155,9 @@ class AchamrahRunner:
                 n_lt_moves=len(lt_moves_raw) if success else 0,
                 n_routes=0,
                 achamrah_vehicle_indexed_lt=self.vehicle_indexed_lt,
-                num_vars=artifacts.num_vars,
-                num_constrs=artifacts.num_constrs,
-                mip_gap=artifacts.mip_gap,
+                num_vars=num_vars,
+                num_constrs=num_constrs,
+                mip_gap=mip_gap_val,
             )
             return result, lt_moves_out
 
