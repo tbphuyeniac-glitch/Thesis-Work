@@ -1,0 +1,10 @@
+[2026-04-30 13:08:21.856883] train_samples=18646 valid_samples=5850
+[2026-04-30 13:08:21.857111] dataset_type=teacher data_dir=GNN/data/irplt_teacher_filtered label_sources={'teacher_rmp': 24496}
+[2026-04-30 13:08:21.857161] model=BiGAT device=cpu hidden_dim=16
+[2026-04-30 13:08:21.857196] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-30 13:09:51.018875] epoch=001 objective=pairwise_rank train_loss=0.6393 valid_loss=0.6061 ranking_valid_mrr=0.8121 ranking_valid_top1=0.6538 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.8106 binary_valid_f1=0.4775 pos_score=0.5616 neg_score=0.4762 score_gap=0.0854 col_emb_norm=3.6652 con_emb_norm=2.9653 param_update_norm=10.441460
+[2026-04-30 13:09:51.033076] saved best BiGAT model
+[2026-04-30 13:11:23.878341] epoch=002 objective=pairwise_rank train_loss=0.6211 valid_loss=0.5974 ranking_valid_mrr=0.8165 ranking_valid_top1=0.6629 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.8032 binary_valid_f1=0.3636 pos_score=0.4916 neg_score=0.4238 score_gap=0.0678 col_emb_norm=3.5686 con_emb_norm=2.7202 param_update_norm=8.236445
+[2026-04-30 13:11:23.888594] saved best BiGAT model
+[2026-04-30 13:11:24.060563] saved training history to GNN/trained_models/irplt_teacher_filtered_smoke/bigat/pairwise_rank/training_history.json
+[2026-04-30 13:11:24.060677] saved training loss chart to GNN/trained_models/irplt_teacher_filtered_smoke/bigat/pairwise_rank/training_loss_curve.png

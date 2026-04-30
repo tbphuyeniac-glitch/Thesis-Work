@@ -1,30 +1,30 @@
 """
-solve_TSRFP_TC.py — Man-Joint-TC Oracle Benchmark.
+solve_TSRFP_TC.py
+=================
+Two functions in this file:
 
-This solves a JOINT two-stage problem where both Stage 1 (routing) and Stage 2
-(lateral transshipment) are optimized simultaneously.  Because Stage 1 variables
-share the same Gurobi model as Stage 2, the routing decisions can "see" the
-realized shocked demand indirectly — making this an oracle / full-information
-benchmark, NOT a true TSRFP-TC.
+1. solve_joint_tc(...)       — Man-Joint-TC Oracle
+   Joint two-stage MIP: Stage 1 routing can "see" realized demand indirectly.
+   Used as perfect-information lower bound. NOT a true robust method.
+   Label: "Man-Joint-TC"
 
-Labelled internally as: "Man-Joint-TC"
+2. solve_tsrfp_tc(...)       — Man-TSRFP-TC with C&CG
+   True two-stage robust optimization via Column-and-Constraint Generation.
+   Stage 1 uses only nominal/forecast demand. Stage 2 is recourse.
+   Uncertainty set (from Man et al.):
+       d(ε)(i,m) = d_nom(i,m) × (1 + ε_im × rho)
+       0 ≤ ε_im ≤ 1,   Σ_im ε_im ≤ Γ = b × N × M
+   C&CG algorithm:
+     1. Solve master with recourse scenarios S (Stage 1 + η + Stage 2 for each s)
+     2. Adversarial subproblem: given fixed Stage 1 deliveries q*, find d* ∈ U
+        that maximizes Stage 2 cost (LP, using Stage 2 dual variables)
+     3. If Stage2_cost(d*) − η < tol: converged
+     4. Else: add d* to S and repeat
+   Final evaluation: apply actual shocked demand (dim_real) to the converged
+   Stage 1 solution — same metric as Man-BFP-TC for comparability.
+   Label: "Man-TSRFP-TC"
 
-Structural alignment with Man-BFP-TC (solve_BFP_TC.py):
-  - Exact same constraint set for Stage 1 (cons 2–9 from solve_DB_FP.py)
-  - Exact same Stage 2 LT formulation (wijm per unit, zij binary route gate)
-  - Same cost components: routing, vehicle fixed, holding, shortage, LT
-  - Stage 1 holding/shortage uses dim_forecast (sdim approach)
-  - Stage 2 pre-LT balance uses realized demand (ksi/miu as LP variables)
-  - LT transport cost = cij * 1.2 per route opened (zij binary), same as BFP-TC
-
-Difference from Man-BFP-TC:
-  - Single Gurobi model (joint) instead of two sequential models
-  - Stage 1 can indirectly anticipate Stage 2 demand shock → Oracle semantics
-
-Usage:
-    from solve_TSRFP_TC import solve_joint_tc
-    res = solve_joint_tc(N, M, K, Ui, cij, pim, Qk, bk, vim, him, Iim0,
-                         dim_real=..., dim=..., ...)
+Structural alignment with Man-BFP-TC for all cost components.
 """
 
 from __future__ import annotations
