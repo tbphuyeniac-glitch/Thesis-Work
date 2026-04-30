@@ -252,21 +252,63 @@ def group_key(row: Dict[str, Any]) -> GroupKey:
     return source_instance, branch_node, episode, product, period, constraint_state
 
 
+def _batch_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Identify the EXPORT BATCH a row belongs to. The teacher exporter writes
+    one batch per (source_instance, branch_node_id, episode, RMP state). A single
+    batch can contain rows for many different (product, period) pairs because the
+    constraint matrix is shared across them — so the per-row `constraint_features_json`
+    blob is written only on column_index=0 of the batch and propagated to siblings.
+
+    Therefore propagation must be keyed at BATCH level, not at the narrower
+    (source_instance, branch_node_id, episode, product, period, constraint_state)
+    used by `group_key`. Otherwise the JSON written on row 0 of the batch (which
+    belongs to one specific (product, period) group) cannot reach the other
+    (product, period) groups in the same batch and they end up with empty JSON
+    → 99% all-zero constraint matrices in the final pkl samples.
+    """
+    source_instance = str(row.get("source_instance") or row.get("instance_id") or "default")
+    branch_node = str(row.get("branch_node_id") or row.get("node_id") or "root")
+    episode = str(row.get("episode") or row.get("episode_id") or "0")
+    constraint_state = str(row.get("constraint_state_hash") or "").strip() or "no_constraints"
+    return source_instance, branch_node, episode, constraint_state
+
+
 def propagate_constraint_features_json(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Within each (group_key) bucket, fill the empty `constraint_features_json`
-    entries with the first non-empty value in the group. The teacher exporter
-    writes the full JSON only on the first row of each batch to keep the CSV
-    small; consumers that previously read the JSON per-row still get a full
-    value after this pass."""
-    first_by_group: Dict[GroupKey, str] = {}
+    """Fill empty `constraint_features_json` entries from the first non-empty
+    value in the same EXPORT BATCH (not the same group_key).
+
+    The teacher exporter de-duplicates the constraint blob by writing the JSON
+    only on the first pattern row of each batch. A batch is identified by
+    (source_instance, branch_node_id, episode, constraint_state_hash) — the
+    constraint matrix is identical for every row in the batch, even though the
+    rows span many (product, period) pairs.
+
+    Earlier versions keyed propagation by the full `group_key` (which includes
+    product+period), so the JSON written on row 0 of a batch could only reach
+    the single (product, period) group that row 0 belonged to; all the other
+    (product, period) groups in the same batch silently received an empty JSON
+    and were later padded with zero matrices by `_repair_constraint_features_for_group`.
+    On the E1 filtered dataset, that bug zeroed out 99% of constraint feature
+    matrices — message passing on the constraint half of the bipartite graph
+    became uninformative and BiGAT effectively trained as a column-only scorer.
+    """
+    first_by_batch: Dict[Tuple[str, str, str, str], str] = {}
     for row in rows:
-        key = group_key(row)
+        key = _batch_key(row)
         value = str(row.get("constraint_features_json") or "").strip()
-        if value and key not in first_by_group:
-            first_by_group[key] = value
+        if value and key not in first_by_batch:
+            first_by_batch[key] = value
+    n_filled = 0
     for row in rows:
         if not str(row.get("constraint_features_json") or "").strip():
-            row["constraint_features_json"] = first_by_group.get(group_key(row), "")
+            replacement = first_by_batch.get(_batch_key(row), "")
+            if replacement:
+                row["constraint_features_json"] = replacement
+                n_filled += 1
+    print(
+        f"[propagate] batches={len(first_by_batch)}  "
+        f"rows_filled_from_batch_sibling={n_filled}  total_rows={len(rows)}"
+    )
     return rows
 
 

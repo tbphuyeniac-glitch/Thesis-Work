@@ -2,8 +2,13 @@
 Benchmark runners for E1 (no-penalty) and E2 (with-penalty) experiments.
 ========================================================================
 
-E1 benchmark:  A0 (no penalty) vs C_rc_only       → "vanilla CG approximation"
-E2 benchmark:  A0 (with penalty) vs C_multi       → "SLA-aware CG acceleration"
+E1 benchmark:  A0_no_penalty   vs E1_rc_only / E1_rc_gnn  ("vanilla CG ablation")
+E2 benchmark:  A0_with_penalty vs E2_pruned_gnn           ("SLA-aware CG acceleration")
+
+Both A0 and E2_pruned_gnn solve the SAME exact MIQP pricing under the SLA
+penalty; E2 just pre-screens donor/receiver pairs by four pricing features
+and re-ranks the resulting column pool with the trained BiGAT. No
+Stackelberg in either E1 or E2.
 
 Both run on the 30 test scenarios from scenarios_manifest.json. The two
 experiments are kept separate so each is internally consistent (train regime
@@ -42,18 +47,20 @@ def _run_one(experiment: str, mu: str, nu: str, gnn_ckpt: str, feature_mask: str
     env.setdefault("IRP_GNN_MIN_KEEP", "5")
 
     if experiment == "e1":
-        # E1: NO penalty for both A0 and C_rc_only
+        # E1: NO penalty for both A0 and E1_rc_only / E1_rc_gnn.
         env.pop("IRP_SLA_PENALTY", None)
         env.pop("IRP_SLA_MU", None)
         env.pop("IRP_SLA_NU", None)
-        print("[benchmark E1] SLA penalty: OFF (A0 vanilla vs C_rc_only)")
+        env["IRP_BENCHMARK_VARIANTS"] = "e1_only"
+        print("[benchmark E1] SLA penalty: OFF — variants=A0_no_penalty / E1_rc_only / E1_rc_gnn")
     elif experiment == "e2":
         env["IRP_SLA_PENALTY"] = "on"
         env["IRP_SLA_MU"] = mu
         env["IRP_SLA_NU"] = nu
         env.setdefault("IRP_SLA_ALPHA", "4.0")
         env.setdefault("IRP_SLA_BETA", "2.0")
-        print(f"[benchmark E2] SLA penalty: ON  mu={mu}  nu={nu}")
+        env["IRP_BENCHMARK_VARIANTS"] = "e2_only"
+        print(f"[benchmark E2] SLA penalty: ON  mu={mu}  nu={nu} — variants=A0_with_penalty / E2_pruned_gnn")
     else:
         raise ValueError(f"unknown experiment {experiment!r}")
 

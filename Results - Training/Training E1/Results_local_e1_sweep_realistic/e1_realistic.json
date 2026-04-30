@@ -1,0 +1,89 @@
+{
+  "rows": [
+    {
+      "instance": "8x4",
+      "stores": 8,
+      "skus": 4,
+      "shock": "medium",
+      "variant": "A0",
+      "use_bp": true,
+      "obj": 18178879647035.215,
+      "rt_s": 7.75076712500595,
+      "iters": 32,
+      "bp_nodes": 15,
+      "cols_gen": 338,
+      "cols_added": 338
+    },
+    {
+      "instance": "8x4",
+      "stores": 8,
+      "skus": 4,
+      "shock": "medium",
+      "variant": "E1_rc_only",
+      "use_bp": false,
+      "obj": 18178879616711.91,
+      "rt_s": 2.5297720830130856,
+      "iters": 4,
+      "bp_nodes": 0,
+      "cols_gen": 358,
+      "cols_added": 358
+    },
+    {
+      "instance": "8x4",
+      "stores": 8,
+      "skus": 4,
+      "shock": "medium",
+      "variant": "E1_rc_gnn",
+      "use_bp": false,
+      "obj": 18178879745050.29,
+      "rt_s": 3.8404764169972623,
+      "iters": 5,
+      "bp_nodes": 0,
+      "cols_gen": 164,
+      "cols_added": 164
+    },
+    {
+      "instance": "10x5",
+      "stores": 10,
+      "skus": 5,
+      "shock": "medium",
+      "variant": "A0",
+      "use_bp": true,
+      "obj": 22926086332636.297,
+      "rt_s": 28.405040334007936,
+      "iters": 32,
+      "bp_nodes": 15,
+      "cols_gen": 893,
+      "cols_added": 873
+    },
+    {
+      "instance": "10x5",
+      "stores": 10,
+      "skus": 5,
+      "shock": "medium",
+      "variant": "E1_rc_only",
+      "use_bp": false,
+      "obj": 22926086255548.473,
+      "rt_s": 8.619765916999313,
+      "iters": 5,
+      "bp_nodes": 0,
+      "cols_gen": 952,
+      "cols_added": 952
+    },
+    {
+      "instance": "10x5",
+      "stores": 10,
+      "skus": 5,
+      "shock": "medium",
+      "variant": "E1_rc_gnn",
+      "use_bp": false,
+      "obj": 22926086544694.34,
+      "rt_s": 8.366333375000977,
+      "iters": 5,
+      "bp_nodes": 0,
+      "cols_gen": 379,
+      "cols_added": 379
+    }
+  ],
+  "ckpt": "GNN/trained_models/irplt_teacher_filtered_local3/bigat/pairwise_rank/best_model.pt"
+}

@@ -3625,8 +3625,14 @@ class LateralTransshipmentCG:
             )
             if not (self.collect_teacher_mode and allow_collect_with_exact):
                 self.collect_teacher_mode = False
-            self.runtime_gnn_mode = False
-            self.use_gnn = False
+            # E2 inference path: pruned exact MIQP + GNN re-ranking. Keep
+            # runtime_gnn_mode/use_gnn intact when teacher collection is OFF so
+            # the benchmark can rank pruned-exact columns with the trained
+            # GNN. During teacher collection runtime GNN must stay OFF to avoid
+            # self-filtered labels.
+            if self.collect_teacher_mode:
+                self.runtime_gnn_mode = False
+                self.use_gnn = False
             self.heuristic_top_k_mode = False
         # Follower-aware system-level column scoring (enabled when stackelberg_aware_scoring=True).
         self.stackelberg_aware_scoring = bool(stackelberg_aware_scoring)
@@ -6320,9 +6326,13 @@ class LateralTransshipmentCG:
             self._last_pricing_summary["runtime_gnn_mode"] = False
             return selected_patterns
         if self.pruned_exact_mode:
-            # E2 teacher generation: four-feature pruning first, then exact
-            # Gurobi pricing over the surviving donor-receiver pairs.
-            selected_patterns = self._candidate_patterns_pruned_exact(
+            # E2 path: four-feature pruning first, then exact Gurobi pricing
+            # over the surviving donor-receiver pairs. Used in two regimes:
+            #   - teacher generation (collect_teacher_mode=True): export rows
+            #     for GNN training, no inference-time ranking.
+            #   - benchmark inference (runtime_gnn_mode=True): rank the
+            #     pruned-exact columns with the trained GNN and keep top-k.
+            new_patterns = self._candidate_patterns_pruned_exact(
                 need=need,
                 surplus=surplus,
                 active_product_periods=active_product_periods,
@@ -6331,17 +6341,30 @@ class LateralTransshipmentCG:
                 rc_tol=rc_tol,
                 episode=self.current_episode,
             )
-            if self.collect_teacher_mode and selected_patterns:
+            if self.collect_teacher_mode and new_patterns:
                 self._collect_teacher_batch_without_gnn_prefilter(
-                    patterns=selected_patterns,
+                    patterns=new_patterns,
                     need=need,
                     surplus=surplus,
                     dual_need=master_solution.dual_need,
                     dual_surplus=master_solution.dual_surplus,
                 )
+                selected_patterns = new_patterns
+            elif self.runtime_gnn_mode and new_patterns:
+                selected_patterns = self._select_patterns_with_gnn(
+                    patterns=new_patterns,
+                    need=need,
+                    surplus=surplus,
+                    dual_need=master_solution.dual_need,
+                    dual_surplus=master_solution.dual_surplus,
+                )
+            else:
+                selected_patterns = new_patterns
             self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
+            self._last_pricing_summary["patterns_kept_after_gnn"] = len(selected_patterns)
             self._last_pricing_summary["collect_teacher_mode"] = bool(self.collect_teacher_mode)
-            self._last_pricing_summary["runtime_gnn_mode"] = False
+            self._last_pricing_summary["runtime_gnn_mode"] = bool(self.runtime_gnn_mode)
+            self._last_pricing_summary["pruned_exact_mode"] = True
             return selected_patterns
         if self.stackelberg_aware_scoring:
             # Follower-aware mode: admit only columns that reduce total system
@@ -9162,6 +9185,11 @@ def run_three_way_benchmark(
         #   "full"     (default) → A0 / A / B / C   classic 4-way comparison
         #   "e1_only"  → A0_no_penalty / E1_rc_only / E1_rc_gnn   thesis E1 ablation:
         #                isolates GNN's ranking contribution from RC pre-filter.
+        #   "e2_only"  → A0_with_penalty / E2_pruned_gnn          thesis E2 benchmark:
+        #                both variants use exact MIQP pricing under SLA penalty;
+        #                E2 pre-filters donor/receiver pairs by the four pricing
+        #                features and re-ranks the resulting columns with the
+        #                trained BiGAT. No Stackelberg.
         variant_set = os.environ.get("IRP_BENCHMARK_VARIANTS", "full").strip().lower()
         gnn_selection_mode_env = os.environ.get("IRP_GNN_SELECTION_MODE", "cumulative_mass").strip() or "cumulative_mass"
         if variant_set == "e1_only":
@@ -9192,6 +9220,34 @@ def run_three_way_benchmark(
                     "rc_filter_mode": True,
                     "gnn_selection_mode": gnn_selection_mode_env,
                     "use_branch_and_price": False,
+                }),
+            ]
+        elif variant_set == "e2_only":
+            variants = [
+                # A0_with_penalty: pure CG with exact Gurobi pricing under SLA
+                # penalty. No four-feature pruning, no GNN, no Stackelberg.
+                # Reference upper bound on quality / lower bound on speed for
+                # the E2 benchmark. Penalty is configured via IRP_SLA_PENALTY/
+                # MU/NU/ALPHA/BETA env vars; when on, the pricing MIP becomes
+                # an MIQP per (product, period).
+                ("A0_with_penalty", {
+                    "use_gnn": False, "collect_teacher_mode": False,
+                    "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+                    "exact_full_mode": True,
+                }),
+                # E2_pruned_gnn: same SLA-penalty MIQP pricing as A0, but
+                # restricted to donor-receiver pairs that survive the four-
+                # feature screen. The trained BiGAT then re-ranks the
+                # resulting column pool. Δ(A0_with_penalty, E2_pruned_gnn)
+                # measures the runtime saving from pruning + GNN ranking at
+                # matched penalty regime. No Stackelberg; B&P kept on to
+                # match the teacher-generation regime that produced the
+                # checkpoint training data.
+                ("E2_pruned_gnn", {
+                    "use_gnn": True, "collect_teacher_mode": False,
+                    "runtime_gnn_mode": True, "heuristic_top_k_mode": False,
+                    "pruned_exact_mode": True,
+                    "gnn_selection_mode": gnn_selection_mode_env,
                 }),
             ]
         else:

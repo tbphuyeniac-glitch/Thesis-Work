@@ -1,0 +1,8 @@
+[2026-04-30 23:40:35.151664] train_samples=9300 valid_samples=3002
+[2026-04-30 23:40:35.152092] dataset_type=teacher data_dir=GNN/data/irplt_teacher_E2_filtered label_sources={'teacher_rmp': 12302}
+[2026-04-30 23:40:35.152162] model=BiGAT device=cpu hidden_dim=16
+[2026-04-30 23:40:35.152207] objective=pairwise_rank primary_metric=ranking_mrr ranking_metrics=valid_loss,mrr,mean_positive_rank,topk binary_threshold_metrics=secondary
+[2026-04-30 23:42:25.635551] epoch=001 objective=pairwise_rank train_loss=0.6228 valid_loss=0.5181 ranking_valid_mrr=0.9179 ranking_valid_top1=0.8411 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.6123 binary_valid_f1=0.5227 pos_score=0.6070 neg_score=0.5231 score_gap=0.0839 col_emb_norm=4.0232 con_emb_norm=3.9233 param_update_norm=8.878177
+[2026-04-30 23:42:25.695264] saved best BiGAT model
+[2026-04-30 23:43:40.709742] epoch=002 objective=pairwise_rank train_loss=0.5580 valid_loss=0.4868 ranking_valid_mrr=0.9212 ranking_valid_top1=0.8491 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.6104 binary_valid_f1=0.5839 pos_score=0.6130 neg_score=0.4551 score_gap=0.1579 col_emb_norm=3.7376 con_emb_norm=3.8048 param_update_norm=5.838664
+[2026-04-30 23:43:40.742807] saved best BiGAT model

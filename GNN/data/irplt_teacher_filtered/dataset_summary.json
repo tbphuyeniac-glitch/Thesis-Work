@@ -51,8 +51,8 @@
     "train": {
       "groups": 18646,
       "samples_written": 18646,
-      "groups_valid": 200,
-      "groups_repaired_zero_padded": 18446,
+      "groups_valid": 18646,
+      "groups_repaired_zero_padded": 0,
       "groups_skipped": 0,
       "skip_reasons": {},
       "total_columns": 54978,
@@ -70,8 +70,8 @@
     "valid": {
       "groups": 5850,
       "samples_written": 5850,
-      "groups_valid": 65,
-      "groups_repaired_zero_padded": 5785,
+      "groups_valid": 5850,
+      "groups_repaired_zero_padded": 0,
       "groups_skipped": 0,
       "skip_reasons": {},
       "total_columns": 17195,
@@ -89,8 +89,8 @@
     "test": {
       "groups": 5047,
       "samples_written": 5047,
-      "groups_valid": 70,
-      "groups_repaired_zero_padded": 4977,
+      "groups_valid": 5047,
+      "groups_repaired_zero_padded": 0,
       "groups_skipped": 0,
       "skip_reasons": {},
       "total_columns": 14762,

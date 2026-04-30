@@ -75,8 +75,8 @@ from Validate_with_Achamrah_Kaggle import (
 # -- Man-BFP-TC adapter ------------------------------------------------------ #
 from man_bfp_tc_benchmark import ManBFPTCRunner, ManBFPTCResult
 
-# -- Man-Joint-TC (Oracle) adapter ------------------------------------------- #
-from tsrfp_runner import JointTCRunner, JointTCResult
+# -- Man-Joint-TC (Oracle) and Man-TSRFP-TC (C&CG robust) adapters ----------- #
+from tsrfp_runner import JointTCRunner, JointTCResult, TSRFPTCRunner, TSRFPTCResult
 
 
 # ======================================================================
@@ -363,6 +363,39 @@ class JointRunner:
                                          demand_shock=demand_shock)
 
 
+class TSRFPRunner:
+    """Thin wrapper around TSRFPTCRunner matching the ManRunner interface."""
+
+    METHOD_NAME = "Man-TSRFP-TC"
+
+    def __init__(
+        self,
+        time_limit: int = MAN_TIME_LIMIT,
+        mip_gap: float = MAN_MIP_GAP,
+        threads: int = 4,
+    ):
+        self._runner = TSRFPTCRunner(
+            time_limit=time_limit,
+            mip_gap=mip_gap,
+            threads=threads,
+            vehicle_count=VEHICLE_COUNT,
+            vehicle_capacity=VEHICLE_CAPACITY,
+            holding_cost_rate=HOLDING_COST_RATE,
+            shortage_cost_rate=SHORTAGE_COST_RATE,
+        )
+        self.source_name = self.METHOD_NAME
+
+    def run_scenario(
+        self,
+        scenario: ScenarioSpec,
+        df_slice: pd.DataFrame,
+        dist_dict: Dict[Tuple[str, str], float],
+        demand_shock: Optional[Dict[Tuple[str, str, int], float]] = None,
+    ) -> Tuple[TSRFPTCResult, List[Dict[str, Any]]]:
+        return self._runner.run_scenario(scenario, df_slice, dist_dict,
+                                         demand_shock=demand_shock)
+
+
 # ======================================================================
 # COMPARISON ENGINE  (C vs Man)
 # ======================================================================
@@ -469,6 +502,58 @@ class ManComparisonEngine:
                 "cost_gap_pct", "cost_gap_abs",
                 "runtime_C", "runtime_Joint", "runtime_ratio_C_vs_Joint",
                 "thesis_service_level", "joint_service_level", "service_level_diff",
+            ]:
+                row[k] = float("nan")
+            row["interpretation"] = "comparison not possible (one or both methods failed)"
+        return row
+
+    @staticmethod
+    def compute_per_scenario_gaps_tsrfp(
+        thesis_result: ScenarioResult,
+        tsrfp_result:  "TSRFPTCResult",
+    ) -> Dict[str, Any]:
+        """Same structure as compute_per_scenario_gaps but for C vs Man-TSRFP-TC."""
+        row: Dict[str, Any] = {
+            "scenario_id":       thesis_result.scenario_id,
+            "thesis_success":    thesis_result.success,
+            "tsrfp_success":     tsrfp_result.success,
+            "thesis_status":     thesis_result.status,
+            "tsrfp_status":      tsrfp_result.status,
+        }
+        if thesis_result.success and tsrfp_result.success:
+            tc = thesis_result.total_cost
+            rc = tsrfp_result.total_cost
+            gap = (tc - rc) / max(abs(rc), 1e-9) * 100.0
+            row.update({
+                "thesis_total_cost":           tc,
+                "tsrfp_total_cost":            rc,
+                "cost_gap_pct":                round(gap, 4),
+                "cost_gap_abs":                round(tc - rc, 4),
+                "runtime_C":                   thesis_result.runtime_seconds,
+                "runtime_TSRFP":               tsrfp_result.runtime_seconds,
+                "runtime_ratio_C_vs_TSRFP":    round(
+                    thesis_result.runtime_seconds / max(tsrfp_result.runtime_seconds, 1e-3), 4
+                ),
+                "thesis_service_level":        thesis_result.service_level,
+                "tsrfp_service_level":         tsrfp_result.service_level,
+                "service_level_diff":          round(
+                    thesis_result.service_level - tsrfp_result.service_level, 6
+                ),
+                "ccg_iterations":              tsrfp_result.ccg_iterations,
+                "final_robust_gap":            tsrfp_result.final_robust_gap,
+                "interpretation": (
+                    "C cheaper than TSRFP" if gap < -0.5
+                    else "TSRFP cheaper than C" if gap > 0.5
+                    else "C and TSRFP within 0.5%"
+                ),
+            })
+        else:
+            for k in [
+                "thesis_total_cost", "tsrfp_total_cost",
+                "cost_gap_pct", "cost_gap_abs",
+                "runtime_C", "runtime_TSRFP", "runtime_ratio_C_vs_TSRFP",
+                "thesis_service_level", "tsrfp_service_level", "service_level_diff",
+                "ccg_iterations", "final_robust_gap",
             ]:
                 row[k] = float("nan")
             row["interpretation"] = "comparison not possible (one or both methods failed)"
@@ -602,6 +687,9 @@ class ManOutputWriter:
     def write_joint_gaps(self, gap_rows: List[Dict]) -> Path:
         return self._save(pd.DataFrame(gap_rows), "validate_man_vs_C_joint_gaps.csv")
 
+    def write_tsrfp_gaps(self, gap_rows: List[Dict]) -> Path:
+        return self._save(pd.DataFrame(gap_rows), "validate_man_vs_C_tsrfp_gaps.csv")
+
 
 # ======================================================================
 # VALIDATION ORCHESTRATOR
@@ -628,6 +716,7 @@ class ManValidationOrchestrator:
         window_length: int = WINDOW_LENGTH_PERIODS,
         demand_shock_sigma: float = DEMAND_SHOCK_SIGMA,
         include_joint_tc: bool = False,
+        include_tsrfp_tc: bool = False,
         debug: bool = False,
         seed: int = 42,
     ):
@@ -639,6 +728,7 @@ class ManValidationOrchestrator:
         self.window_length      = int(window_length)
         self.demand_shock_sigma = float(demand_shock_sigma)
         self.include_joint_tc   = bool(include_joint_tc)
+        self.include_tsrfp_tc   = bool(include_tsrfp_tc)
         self.debug              = debug
         self.seed               = seed
 
@@ -673,6 +763,10 @@ class ManValidationOrchestrator:
             time_limit=MAN_TIME_LIMIT,
             mip_gap=MAN_MIP_GAP,
         ) if self.include_joint_tc else None
+        self.tsrfp_runner = TSRFPRunner(
+            time_limit=MAN_TIME_LIMIT,
+            mip_gap=MAN_MIP_GAP,
+        ) if self.include_tsrfp_tc else None
         self.writer = ManOutputWriter(output_dir)
 
     def run(self) -> None:
@@ -712,21 +806,25 @@ class ManValidationOrchestrator:
             "vehicle_count":          VEHICLE_COUNT,
             "vehicle_capacity":       VEHICLE_CAPACITY,
             "include_joint_tc":       self.include_joint_tc,
+            "include_tsrfp_tc":       self.include_tsrfp_tc,
             "debug":                  self.debug,
             "seed":                   self.seed,
         }
         self.writer.write_config(config_record)
 
         # ── Per-scenario loop ──────────────────────────────────────────
-        all_results:    List[Dict] = []
-        all_lt_moves:   List[Dict] = []
-        gap_rows:       List[Dict] = []       # C vs Man-BFP-TC
-        joint_gap_rows: List[Dict] = []       # C vs Man-Joint-TC
+        all_results:     List[Dict] = []
+        all_lt_moves:    List[Dict] = []
+        gap_rows:        List[Dict] = []       # C vs Man-BFP-TC
+        joint_gap_rows:  List[Dict] = []       # C vs Man-Joint-TC
+        tsrfp_gap_rows:  List[Dict] = []       # C vs Man-TSRFP-TC
         partial_path = Path(self.output_dir) / "validate_man_vs_C_per_scenario.csv"
 
         methods_str = f"Thesis_C  vs  {self.man_runner.source_name}"
         if self.include_joint_tc:
             methods_str += f"  vs  {self.joint_runner.source_name}"
+        if self.include_tsrfp_tc:
+            methods_str += f"  vs  {self.tsrfp_runner.source_name}"
         print(f"\n{'='*70}")
         print(f"Starting validation: {len(scenarios)} scenarios")
         print(f"Methods: {methods_str}")
@@ -787,10 +885,26 @@ class ManValidationOrchestrator:
                       f"mip_gap={joint_result.mip_gap:.4f}  "
                       f"runtime={joint_result.runtime_seconds:.1f}s")
 
+            # ─ Run Man-TSRFP-TC (C&CG robust) — optional ────────────────
+            tsrfp_result = None
+            tsrfp_lt_moves: List[Dict[str, Any]] = []
+            if self.include_tsrfp_tc and self.tsrfp_runner is not None:
+                print(f"  [Man-TSRFP-TC]  running...")
+                tsrfp_result, tsrfp_lt_moves = self.tsrfp_runner.run_scenario(
+                    scenario, df_slice, dist_dict, demand_shock=shock or None
+                )
+                print(f"  [Man-TSRFP-TC]  status={tsrfp_result.status}  "
+                      f"cost={tsrfp_result.total_cost:.2f}  "
+                      f"ccg_iters={tsrfp_result.ccg_iterations}  "
+                      f"mip_gap={tsrfp_result.mip_gap:.4f}  "
+                      f"runtime={tsrfp_result.runtime_seconds:.1f}s")
+
             # ─ Annotate results with scenario metadata ──────────────────
             results_this_scenario = [c_result, man_result]
             if joint_result is not None:
                 results_this_scenario.append(joint_result)
+            if tsrfp_result is not None:
+                results_this_scenario.append(tsrfp_result)
 
             for result in results_this_scenario:
                 d = result.to_dict()
@@ -806,6 +920,8 @@ class ManValidationOrchestrator:
             all_lt_moves.extend(lt_moves)
             if joint_lt_moves:
                 all_lt_moves.extend(joint_lt_moves)
+            if tsrfp_lt_moves:
+                all_lt_moves.extend(tsrfp_lt_moves)
 
             # ─ Compute C vs Man-BFP-TC gap ──────────────────────────────
             gap = ManComparisonEngine.compute_per_scenario_gaps(c_result, man_result)
@@ -827,6 +943,17 @@ class ManValidationOrchestrator:
                     print(f"  [Gap C vs Joint-TC]  {jgap.get('cost_gap_pct', float('nan')):.2f}%  "
                           f"→ {jgap.get('interpretation', '')}")
 
+            # ─ Compute C vs Man-TSRFP-TC gap ────────────────────────────
+            if tsrfp_result is not None:
+                rgap = ManComparisonEngine.compute_per_scenario_gaps_tsrfp(
+                    c_result, tsrfp_result
+                )
+                rgap["size_label"] = scenario.size_label
+                tsrfp_gap_rows.append(rgap)
+                if c_result.success and tsrfp_result.success:
+                    print(f"  [Gap C vs TSRFP-TC]  {rgap.get('cost_gap_pct', float('nan')):.2f}%  "
+                          f"→ {rgap.get('interpretation', '')}")
+
             # ─ Partial save ─────────────────────────────────────────────
             if all_results:
                 pd.DataFrame(all_results).to_csv(partial_path, index=False)
@@ -847,6 +974,8 @@ class ManValidationOrchestrator:
         self.writer.write_failures(all_results)
         if joint_gap_rows:
             self.writer.write_joint_gaps(joint_gap_rows)
+        if tsrfp_gap_rows:
+            self.writer.write_tsrfp_gaps(tsrfp_gap_rows)
 
         # ── Print summary table ────────────────────────────────────────
         total_runtime = time.time() - t_total
@@ -927,6 +1056,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "Set to 0 for deterministic baseline (no shock)."))
     p.add_argument("--joint_tc",    action="store_true",
                    help="Also run Man-Joint-TC (Oracle) alongside BFP-TC and Thesis C")
+    p.add_argument("--tsrfp_tc",    action="store_true",
+                   help="Also run Man-TSRFP-TC (C&CG robust) alongside BFP-TC and Thesis C")
     p.add_argument("--debug",       action="store_true",
                    help="Quick debug run: 3 scenarios per size instead of 10")
     p.add_argument("--seed",        type=int, default=42)
@@ -987,6 +1118,7 @@ def main() -> None:
     print(f"  demand_shock_sigma: {args.demand_shock_sigma}"
           f"  ({'no shock — deterministic' if args.demand_shock_sigma == 0 else 'N(1,σ²) shock active'})")
     print(f"  joint_tc:           {args.joint_tc}  (Oracle benchmark)")
+    print(f"  tsrfp_tc:           {args.tsrfp_tc}  (C&CG robust benchmark)")
     print(f"  debug:              {args.debug}")
     print(f"  man_time_limit:     {MAN_TIME_LIMIT}s")
     print(f"  man_mip_gap:        {MAN_MIP_GAP}")
@@ -1004,6 +1136,7 @@ def main() -> None:
         window_length=args.window_length,
         demand_shock_sigma=args.demand_shock_sigma,
         include_joint_tc=args.joint_tc,
+        include_tsrfp_tc=args.tsrfp_tc,
         debug=args.debug,
         seed=args.seed,
     )
