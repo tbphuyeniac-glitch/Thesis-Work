@@ -3489,6 +3489,14 @@ class LateralTransshipmentCG:
         # Bianchessi et al. (2024) resource-window reduction. Default reads
         # IRP_ADAPTIVE_PRUNING (default "1" = enabled).
         adaptive_pruning_enabled: Optional[bool] = None,
+        # ── E1 thesis benchmark mode ──────────────────────────────────────
+        # When True, pricing path is "RC-only filter": enumerate all donor-
+        # receiver pairs, compute reduced cost analytically (no MIP), keep
+        # negative-rc pairs, build patterns greedily by RC. No feature
+        # admissibility check, no Stackelberg game. Used to isolate GNN's
+        # contribution from heuristic pruning. Combined with use_gnn=True
+        # gives the E1_rc_gnn variant; with use_gnn=False gives E1_rc_only.
+        rc_filter_mode: bool = False,
         source_instance: Optional[str] = None,
     ):
         self.data = data
@@ -3590,6 +3598,9 @@ class LateralTransshipmentCG:
         # is intentionally separate from exact_full_mode, which means A0-style
         # no-pruning exact pricing.
         self.pruned_exact_mode = bool(pruned_exact_mode)
+        # E1 thesis-benchmark RC-only filter mode. Mutually exclusive with
+        # exact_full_mode and pruned_exact_mode (those use Gurobi MIP).
+        self.rc_filter_mode = bool(rc_filter_mode)
         if self.exact_full_mode:
             # Exact mode overrides heuristic filters that *replace* pricing
             # (Stackelberg, GNN runtime, top-k). Teacher collection is allowed
@@ -5387,6 +5398,143 @@ class LateralTransshipmentCG:
         }
         return new_patterns
 
+    def _candidate_patterns_rc_only(
+        self,
+        need,
+        surplus,
+        active_product_periods: Set[Tuple[Product, Period]],
+        dual_need: Dict[Tuple[Store, Product, Period], float],
+        dual_surplus: Dict[Tuple[Store, Product, Period], float],
+        rc_tol: float,
+        episode: int,
+    ) -> List[LTPattern]:
+        """E1 benchmark pricing: enumerate pairs → RC filter → build patterns.
+
+        Skips Gurobi MIP, feature admissibility, Stackelberg game, and adaptive
+        pruning. The intent is to isolate GNN's ranking contribution: with this
+        path, any speedup over A0 is purely from "no MIP", and any further
+        improvement when use_gnn=True can be attributed to learned ranking.
+
+        Pattern construction is greedy by RC ascending (most negative first):
+        starting from each top RC pair, accumulate up to max_pairs_per_pattern
+        feasible pairs that further reduce the pattern's RC.
+        """
+        new_patterns: List[LTPattern] = []
+        candidate_pairs_total = 0
+        negative_rc_pairs_total = 0
+        patterns_built_before_dedup = 0
+
+        for p, t in sorted(active_product_periods):
+            pair_candidates: List[Dict[str, Any]] = []
+            for i in self.data.stores:
+                for j in self.data.stores:
+                    if i == j:
+                        continue
+                    surp = float(surplus.get((i, p, t), 0.0))
+                    rcv = float(need.get((j, p, t), 0.0))
+                    if surp <= 1e-9 or rcv <= 1e-9:
+                        continue
+                    qty_cap = min(surp, rcv)
+                    unit_cost = float(self.data.ship_cost_lt[(i, j, p)])
+                    fixed_cost = float(self.data.fixed_dispatch_lt[(i, j)])
+                    dual_score = (
+                        float(dual_need.get((j, p, t), 0.0))
+                        + float(dual_surplus.get((i, p, t), 0.0))
+                    )
+                    rc_proxy = fixed_cost + unit_cost * qty_cap - dual_score * qty_cap
+                    candidate_pairs_total += 1
+                    pair_candidates.append({
+                        "pair": (i, j),
+                        "qty_cap": qty_cap,
+                        "fixed_cost": fixed_cost,
+                        "unit_cost": unit_cost,
+                        "dual_score": dual_score,
+                        "reduced_cost_proxy": rc_proxy,
+                    })
+
+            # Filter to negative-RC pairs (necessary for CG progress).
+            negative_pairs = [r for r in pair_candidates if r["reduced_cost_proxy"] < rc_tol]
+            negative_rc_pairs_total += len(negative_pairs)
+            if not negative_pairs:
+                continue
+
+            # Sort by RC ascending (most negative first) — same greedy seed
+            # ordering as `_build_patterns_from_pruned_pairs` uses inside each
+            # feature bucket.
+            negative_pairs.sort(key=lambda r: r["reduced_cost_proxy"])
+            n_to_build = min(len(negative_pairs), self.top_patterns_per_feature)
+
+            for start_idx in range(n_to_build):
+                donor_work = {s: float(surplus.get((s, p, t), 0.0)) for s in self.data.stores}
+                recv_work = {s: float(need.get((s, p, t), 0.0)) for s in self.data.stores}
+                flows: Dict[Tuple[Store, Store], float] = {}
+                pattern_cost = 0.0
+                reduced_cost_total = 0.0
+
+                ordered = negative_pairs[start_idx:] + negative_pairs[:start_idx]
+                for row in ordered:
+                    if len(flows) >= self.max_pairs_per_pattern:
+                        break
+                    i, j = row["pair"]
+                    qty = min(donor_work.get(i, 0.0), recv_work.get(j, 0.0), row["qty_cap"])
+                    if qty <= 1e-9:
+                        continue
+                    pair_rc = row["fixed_cost"] + row["unit_cost"] * qty - row["dual_score"] * qty
+                    if pair_rc >= -1e-9 and flows:
+                        continue
+                    flows[(i, j)] = qty
+                    donor_work[i] -= qty
+                    recv_work[j] -= qty
+                    pattern_cost += row["fixed_cost"] + row["unit_cost"] * qty
+                    reduced_cost_total += pair_rc
+
+                if flows and reduced_cost_total < rc_tol:
+                    patterns_built_before_dedup += 1
+                    pair_signature = tuple(
+                        sorted((i, j, round(qty, 6)) for (i, j), qty in flows.items())
+                    )
+                    new_patterns.append(
+                        LTPattern(
+                            pattern_id=f"RCONLY_E{episode}_{p}_T{t}_{patterns_built_before_dedup}",
+                            period=t,
+                            product=p,
+                            pattern_flows=flows,
+                            column_cost=round(pattern_cost, 6),
+                            metadata={
+                                "source": "pricing_rc_only_filter",
+                                "reduced_cost": round(reduced_cost_total, 6),
+                                "negative_rc_pair_pool": len(negative_pairs),
+                                "pair_signature": str(pair_signature),
+                            },
+                        )
+                    )
+
+        new_patterns = self._deduplicate_priced_patterns(new_patterns, episode=episode)
+        if self.max_columns_per_product_period > 0:
+            capped: List[LTPattern] = []
+            by_pp: Dict[Tuple[Product, Period], List[LTPattern]] = {}
+            for pat in new_patterns:
+                by_pp.setdefault((pat.product, pat.period), []).append(pat)
+            for key in sorted(by_pp):
+                rows = by_pp[key]
+                rows.sort(key=lambda pat: float(pat.metadata.get("reduced_cost", 0.0) or 0.0))
+                capped.extend(rows[:self.max_columns_per_product_period])
+            new_patterns = capped
+
+        self._last_pricing_summary = {
+            "candidate_pairs_before_pruning": candidate_pairs_total,
+            "pairs_after_pruning": negative_rc_pairs_total,
+            "pairs_accepted_stackelberg": 0,
+            "pairs_recovered_stackelberg_fallback": 0,
+            "patterns_built_before_dedup": patterns_built_before_dedup,
+            "patterns_deduplicated_before_gnn": patterns_built_before_dedup - len(new_patterns),
+            "patterns_removed_by_product_period_cap": 0,
+            "patterns_built_before_gnn": len(new_patterns),
+            "max_columns_per_product_period": self.max_columns_per_product_period,
+            "rc_filter_mode": True,
+        }
+        return new_patterns
+
     def _candidate_patterns_pruned_exact(
         self,
         need,
@@ -6199,6 +6347,35 @@ class LateralTransshipmentCG:
             # Follower-aware mode: admit only columns that reduce total system
             # cost (LT + shortage + holding) after the follower's best-response.
             return self._pricing_step_stackelberg_aware(master_solution, rc_tol=rc_tol)
+        if self.rc_filter_mode:
+            # E1 thesis benchmark: RC-only filter + (optional) GNN rank.
+            # No feature admissibility, no Stackelberg, no MIP. Used to
+            # isolate GNN's ranking contribution from heuristic pruning.
+            new_patterns = self._candidate_patterns_rc_only(
+                need=need,
+                surplus=surplus,
+                active_product_periods=active_product_periods,
+                dual_need=master_solution.dual_need,
+                dual_surplus=master_solution.dual_surplus,
+                rc_tol=rc_tol,
+                episode=self.current_episode,
+            )
+            if self.runtime_gnn_mode:
+                selected_patterns = self._select_patterns_with_gnn(
+                    patterns=new_patterns,
+                    need=need,
+                    surplus=surplus,
+                    dual_need=master_solution.dual_need,
+                    dual_surplus=master_solution.dual_surplus,
+                )
+            else:
+                selected_patterns = new_patterns
+            self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
+            self._last_pricing_summary["patterns_kept_after_gnn"] = len(selected_patterns)
+            self._last_pricing_summary["collect_teacher_mode"] = bool(self.collect_teacher_mode)
+            self._last_pricing_summary["runtime_gnn_mode"] = bool(self.runtime_gnn_mode)
+            self._last_pricing_summary["rc_filter_mode"] = True
+            return selected_patterns
         new_patterns = self._candidate_patterns_from_duals(
             need=need,
             surplus=surplus,
@@ -7891,6 +8068,7 @@ class IRPResearchPipeline:
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
         pruned_exact_mode: bool = False,
+        rc_filter_mode: bool = False,
         stackelberg_aware_scoring: bool = False,
         stackelberg_exact_follower: bool = False,
         stackelberg_min_lateral_qty: Optional[float] = None,
@@ -7975,6 +8153,7 @@ class IRPResearchPipeline:
             heuristic_top_k=heuristic_top_k,
             exact_full_mode=exact_full_mode,
             pruned_exact_mode=pruned_exact_mode,
+            rc_filter_mode=rc_filter_mode,
             stackelberg_aware_scoring=stackelberg_aware_scoring,
             stackelberg_exact_follower=stackelberg_exact_follower,
             stackelberg_min_lateral_qty=stackelberg_min_lateral_qty,
@@ -8126,6 +8305,7 @@ class IRPResearchPipeline:
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
         pruned_exact_mode: bool = False,
+        rc_filter_mode: bool = False,
         stackelberg_aware_scoring: bool = False,
         stackelberg_exact_follower: bool = False,
         stackelberg_min_lateral_qty: Optional[float] = None,
@@ -8208,6 +8388,7 @@ class IRPResearchPipeline:
             heuristic_top_k=heuristic_top_k,
             exact_full_mode=exact_full_mode,
             pruned_exact_mode=pruned_exact_mode,
+            rc_filter_mode=rc_filter_mode,
             stackelberg_aware_scoring=stackelberg_aware_scoring,
             stackelberg_exact_follower=stackelberg_exact_follower,
             stackelberg_min_lateral_qty=stackelberg_min_lateral_qty,
@@ -8318,6 +8499,13 @@ def _collect_benchmark_metrics(variant: str, results: Dict[str, Any],
         "lt_cost_with_lt": float(realized_with_lt.get("lateral_transshipment_cost_realized", 0.0)),
         "shortage_cost_with_lt": float(realized_with_lt.get("shortage_cost_realized", 0.0)),
         "cg_iterations": int(len(cg_history)),
+        # Decomposed runtime: per-iteration cost (= variant runtime / iters).
+        # Lets thesis isolate GNN's two contributions:
+        #   (1) faster per iteration (skip MIP)
+        #   (2) fewer iterations (better column choice → faster convergence)
+        "time_per_cg_iteration_seconds": (
+            float(runtime_seconds) / max(1, int(len(cg_history)))
+        ),
         "stopping_reason": stopping_reason,
         # `total_runtime_seconds` is kept as end-to-end comparable runtime for
         # backward compatibility with reports/charts: shared baseline + this
@@ -8970,24 +9158,61 @@ def run_three_way_benchmark(
     _prior_stop_mode = os.environ.get("IRP_CG_STOPPING_MODE")
     os.environ["IRP_CG_STOPPING_MODE"] = "convergence"
     try:
-        variants: List[Tuple[str, Dict[str, Any]]] = [
-            # A0: pure CG with exact Gurobi pricing — no pruning, no Stackelberg,
-            # no GNN, no top-k heuristic. One exact pricing MIP is solved per
-            # active (product, period); this is the reference variant that A/B/C
-            # are measured against.
-            ("A0_cg_full_exact", {"use_gnn": False, "collect_teacher_mode": False,
-                                    "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
-                                    "exact_full_mode": True}),
-            ("A_classical_cg",  {"use_gnn": False, "collect_teacher_mode": False,
-                                  "runtime_gnn_mode": False, "heuristic_top_k_mode": False}),
-            ("B_heuristic_cg",  {"use_gnn": False, "collect_teacher_mode": False,
-                                  "runtime_gnn_mode": False, "heuristic_top_k_mode": True,
-                                  "heuristic_top_k": heuristic_top_k,
-                                  "use_branch_and_price": False}),
-            ("C_gnn_guided_cg", {"use_gnn": True,  "collect_teacher_mode": False,
-                                  "runtime_gnn_mode": True,  "heuristic_top_k_mode": False,
-                                  "gnn_selection_mode": os.environ.get("IRP_GNN_SELECTION_MODE", "cumulative_mass").strip() or "cumulative_mass"}),
-        ]
+        # IRP_BENCHMARK_VARIANTS selects which variants to run:
+        #   "full"     (default) → A0 / A / B / C   classic 4-way comparison
+        #   "e1_only"  → A0_no_penalty / E1_rc_only / E1_rc_gnn   thesis E1 ablation:
+        #                isolates GNN's ranking contribution from RC pre-filter.
+        variant_set = os.environ.get("IRP_BENCHMARK_VARIANTS", "full").strip().lower()
+        gnn_selection_mode_env = os.environ.get("IRP_GNN_SELECTION_MODE", "cumulative_mass").strip() or "cumulative_mass"
+        if variant_set == "e1_only":
+            variants: List[Tuple[str, Dict[str, Any]]] = [
+                # A0_no_penalty: pure CG with exact Gurobi pricing, no GNN, no
+                # SLA penalty. Reference upper bound on quality / lower bound on
+                # speed for the E1 ablation.
+                ("A0_no_penalty", {
+                    "use_gnn": False, "collect_teacher_mode": False,
+                    "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+                    "exact_full_mode": True,
+                }),
+                # E1_rc_only: skip MIP, enumerate pairs, RC-only filter, no
+                # GNN. Isolates the speedup from "no MIP". Same pricing engine
+                # as E1_rc_gnn but with GNN turned off.
+                ("E1_rc_only", {
+                    "use_gnn": False, "collect_teacher_mode": False,
+                    "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+                    "rc_filter_mode": True,
+                    "use_branch_and_price": False,
+                }),
+                # E1_rc_gnn: same RC pre-filter pipeline, with GNN re-ranking
+                # the negative-rc pattern pool. Δ(E1_rc_gnn, E1_rc_only) is the
+                # marginal contribution of learned GNN scoring beyond RC sort.
+                ("E1_rc_gnn", {
+                    "use_gnn": True, "collect_teacher_mode": False,
+                    "runtime_gnn_mode": True, "heuristic_top_k_mode": False,
+                    "rc_filter_mode": True,
+                    "gnn_selection_mode": gnn_selection_mode_env,
+                    "use_branch_and_price": False,
+                }),
+            ]
+        else:
+            variants = [
+                # A0: pure CG with exact Gurobi pricing — no pruning, no Stackelberg,
+                # no GNN, no top-k heuristic. One exact pricing MIP is solved per
+                # active (product, period); this is the reference variant that A/B/C
+                # are measured against.
+                ("A0_cg_full_exact", {"use_gnn": False, "collect_teacher_mode": False,
+                                        "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+                                        "exact_full_mode": True}),
+                ("A_classical_cg",  {"use_gnn": False, "collect_teacher_mode": False,
+                                      "runtime_gnn_mode": False, "heuristic_top_k_mode": False}),
+                ("B_heuristic_cg",  {"use_gnn": False, "collect_teacher_mode": False,
+                                      "runtime_gnn_mode": False, "heuristic_top_k_mode": True,
+                                      "heuristic_top_k": heuristic_top_k,
+                                      "use_branch_and_price": False}),
+                ("C_gnn_guided_cg", {"use_gnn": True,  "collect_teacher_mode": False,
+                                      "runtime_gnn_mode": True,  "heuristic_top_k_mode": False,
+                                      "gnn_selection_mode": gnn_selection_mode_env}),
+            ]
         # Same seed sequence is reused across variants so variant differences
         # aren't confounded by different demand realizations.
         n_repeats = max(1, int(n_repeats))
@@ -9143,11 +9368,15 @@ def run_three_way_benchmark(
                       f"(shared_baseline={shared_baseline_runtime_seconds:.1f}s) "
                       f"cols_gen={row['columns_generated']} cols_added={row['columns_added_to_rmp']}")
 
+        # Use the configured variants list as the canonical ordering. Falls
+        # back to BENCHMARK_VARIANT_ORDER (legacy A0/A/B/C) when the active set
+        # uses those names, but accepts the new E1 variant names too.
+        active_variant_order = [name for name, _ in variants]
         per_run_df = pd.DataFrame(rows)
         if not per_run_df.empty and "variant" in per_run_df.columns:
             per_run_df["variant"] = pd.Categorical(
                 per_run_df["variant"],
-                categories=BENCHMARK_VARIANT_ORDER,
+                categories=active_variant_order,
                 ordered=True,
             )
             sort_cols = ["variant"] + [c for c in ("repeat", "run_label") if c in per_run_df.columns]
@@ -9161,7 +9390,8 @@ def run_three_way_benchmark(
         numeric_cols = [
             "rmp_objective", "realized_cost_no_lt", "realized_cost_with_lt",
             "lt_cost_with_lt", "shortage_cost_with_lt",
-            "cg_iterations", "total_runtime_seconds",
+            "cg_iterations", "time_per_cg_iteration_seconds",
+            "total_runtime_seconds",
             "variant_runtime_seconds",
             "shared_baseline_runtime_seconds",
             "total_runtime_with_shared_baseline_seconds",
@@ -9188,7 +9418,7 @@ def run_three_way_benchmark(
         if not aggregate_df.empty and "variant" in aggregate_df.columns:
             aggregate_df["variant"] = pd.Categorical(
                 aggregate_df["variant"],
-                categories=BENCHMARK_VARIANT_ORDER,
+                categories=active_variant_order,
                 ordered=True,
             )
             aggregate_df = aggregate_df.sort_values("variant").reset_index(drop=True)
