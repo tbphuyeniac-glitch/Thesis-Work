@@ -33,8 +33,10 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import random
 import shutil
+import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -44,6 +46,187 @@ import utilities
 
 
 GroupKey = Tuple[str, str, str, str, str, str]
+
+
+# ----------------------------------------------------------------------
+# Ranking-filter helpers (Fix A: drop signal-less groups + stratified cap)
+# ----------------------------------------------------------------------
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(out) or math.isinf(out):
+        return default
+    return out
+
+
+def _is_positive_row(row: Dict[str, Any]) -> bool:
+    """Mirror utilities.build_training_sample_from_exported_teacher_rows: prefer
+    teacher_label, fall back to selected_in_rmp. Anything not clearly truthy
+    counts as negative."""
+    raw = row.get("teacher_label")
+    if raw is not None and str(raw).strip() != "":
+        return _safe_float(raw, 0.0) > 0.5
+    return utilities._truthy(row.get("selected_in_rmp", False))
+
+
+def _stratified_cap(
+    pos: List[Dict[str, Any]],
+    neg: List[Dict[str, Any]],
+    max_size: int,
+) -> List[Dict[str, Any]]:
+    """Subsample a large group to <= max_size while preserving the positive
+    ratio. Positives ranked by teacher_score desc (best first); negatives
+    ranked by |reduced_cost| asc (hard negatives near the decision boundary
+    first). Both buckets are guaranteed non-empty in the output."""
+    p_total = len(pos)
+    n_total = len(neg)
+    g_total = p_total + n_total
+    if g_total <= max_size:
+        return pos + neg
+
+    ratio = p_total / g_total
+    target_pos = max(1, min(p_total, int(round(max_size * ratio))))
+    target_neg = max(1, max_size - target_pos)
+    # Rebalance if either side runs short.
+    if target_neg > n_total:
+        target_neg = n_total
+        target_pos = max(1, max_size - target_neg)
+    if target_pos > p_total:
+        target_pos = p_total
+        target_neg = max(1, max_size - target_pos)
+
+    pos_sorted = sorted(pos, key=lambda r: -_safe_float(r.get("teacher_score"), 0.0))
+    neg_sorted = sorted(neg, key=lambda r: abs(_safe_float(r.get("reduced_cost"), 1e18)))
+    return pos_sorted[:target_pos] + neg_sorted[:target_neg]
+
+
+def _group_pair_count(rows: List[Dict[str, Any]]) -> int:
+    """Estimate number of pairwise (pos, neg) comparisons for ranking loss."""
+    p = sum(1 for r in rows if _is_positive_row(r))
+    return p * (len(rows) - p)
+
+
+def _group_size_stats(sizes: List[int]) -> Dict[str, float]:
+    if not sizes:
+        return {"min": 0, "median": 0, "mean": 0.0, "max": 0}
+    return {
+        "min": int(min(sizes)),
+        "median": int(statistics.median(sizes)),
+        "mean": float(sum(sizes) / len(sizes)),
+        "max": int(max(sizes)),
+    }
+
+
+def filter_and_cap_groups(
+    grouped_rows: Dict[GroupKey, List[Dict[str, Any]]],
+    *,
+    min_size: int,
+    max_size: int,
+    require_mixed: bool,
+) -> Tuple[Dict[GroupKey, List[Dict[str, Any]]], Dict[str, Any]]:
+    """Apply ranking-friendly filtering on a per-group basis.
+
+    Rules:
+      1. drop groups with size < min_size                       (no ranking signal)
+      2. drop groups with all-positive or all-negative labels    (no pairwise signal)
+      3. cap groups with size > max_size via stratified subsample (best positives,
+         hard negatives), preserving positive ratio.
+
+    Returns (filtered_grouped_rows, report_stats)."""
+    out: Dict[GroupKey, List[Dict[str, Any]]] = {}
+
+    sizes_in: List[int] = []
+    sizes_out: List[int] = []
+    pos_in = 0
+    neg_in = 0
+    pos_out = 0
+    neg_out = 0
+    pairs_in = 0
+    pairs_out = 0
+    n_dropped_small = 0
+    n_dropped_zero_pos = 0
+    n_dropped_all_pos = 0
+    n_capped = 0
+    n_kept = 0
+
+    for key, rows in grouped_rows.items():
+        n = len(rows)
+        sizes_in.append(n)
+        pos = [r for r in rows if _is_positive_row(r)]
+        neg = [r for r in rows if not _is_positive_row(r)]
+        pos_in += len(pos)
+        neg_in += len(neg)
+        pairs_in += len(pos) * len(neg)
+
+        if n < min_size:
+            n_dropped_small += 1
+            continue
+        if require_mixed:
+            if len(pos) == 0:
+                n_dropped_zero_pos += 1
+                continue
+            if len(neg) == 0:
+                n_dropped_all_pos += 1
+                continue
+
+        if n > max_size:
+            kept = _stratified_cap(pos, neg, max_size)
+            n_capped += 1
+        else:
+            kept = rows
+
+        out[key] = kept
+        n_kept += 1
+        sizes_out.append(len(kept))
+        pos_kept = sum(1 for r in kept if _is_positive_row(r))
+        neg_kept = len(kept) - pos_kept
+        pos_out += pos_kept
+        neg_out += neg_kept
+        pairs_out += pos_kept * neg_kept
+
+    report = {
+        "groups_in": len(grouped_rows),
+        "groups_out": n_kept,
+        "groups_dropped_too_small": n_dropped_small,
+        "groups_dropped_zero_positive": n_dropped_zero_pos,
+        "groups_dropped_all_positive": n_dropped_all_pos,
+        "groups_capped": n_capped,
+        "columns_in": pos_in + neg_in,
+        "columns_out": pos_out + neg_out,
+        "positives_in": pos_in,
+        "positives_out": pos_out,
+        "positive_rate_in": (pos_in / max(1, pos_in + neg_in)),
+        "positive_rate_out": (pos_out / max(1, pos_out + neg_out)) if (pos_out + neg_out) else 0.0,
+        "pairwise_pairs_in": pairs_in,
+        "pairwise_pairs_out": pairs_out,
+        "pairwise_pairs_reduction": (1.0 - pairs_out / pairs_in) if pairs_in else 0.0,
+        "size_stats_in": _group_size_stats(sizes_in),
+        "size_stats_out": _group_size_stats(sizes_out),
+        "min_size_threshold": min_size,
+        "max_size_threshold": max_size,
+        "require_mixed_labels": bool(require_mixed),
+    }
+    return out, report
+
+
+def print_filter_report(report: Dict[str, Any]) -> None:
+    print("\n[Ranking-filter report]")
+    print(f"  groups        : {report['groups_in']:>8,} → {report['groups_out']:>8,}  "
+          f"(dropped: small={report['groups_dropped_too_small']:,}  "
+          f"zero_pos={report['groups_dropped_zero_positive']:,}  "
+          f"all_pos={report['groups_dropped_all_positive']:,}  "
+          f"capped={report['groups_capped']:,})")
+    print(f"  columns       : {report['columns_in']:>8,} → {report['columns_out']:>8,}")
+    print(f"  positive rate : {report['positive_rate_in']:.3f} → {report['positive_rate_out']:.3f}")
+    print(f"  pairwise pairs: {report['pairwise_pairs_in']:>10,} → {report['pairwise_pairs_out']:>10,}  "
+          f"(reduction: {report['pairwise_pairs_reduction']*100:.1f}%)")
+    s_in, s_out = report["size_stats_in"], report["size_stats_out"]
+    print(f"  group size in : min={s_in['min']:<4} median={s_in['median']:<4} "
+          f"mean={s_in['mean']:.1f} max={s_in['max']}")
+    print(f"  group size out: min={s_out['min']:<4} median={s_out['median']:<4} "
+          f"mean={s_out['mean']:.1f} max={s_out['max']}")
 
 
 def group_key(row: Dict[str, Any]) -> GroupKey:
@@ -361,6 +544,53 @@ def main() -> None:
              "Set higher for very small smoke runs; default rejects datasets where >30%% "
              "of teacher groups had to be dropped for missing graph features.",
     )
+    # ── Ranking-friendly group filter (Fix A) ───────────────────────────
+    parser.add_argument(
+        "--ranking-filter-groups",
+        action="store_true",
+        help="Drop signal-less groups and stratified-cap large groups before "
+             "writing samples. Recommended for pairwise_rank training.",
+    )
+    parser.add_argument(
+        "--min-group-size",
+        type=int,
+        default=2,
+        help="When --ranking-filter-groups is on, drop groups with fewer than this "
+             "many columns (no pairwise signal possible).",
+    )
+    parser.add_argument(
+        "--max-group-size",
+        type=int,
+        default=64,
+        help="When --ranking-filter-groups is on, cap larger groups via stratified "
+             "subsampling (best positives by teacher_score, hardest negatives by "
+             "|reduced_cost|). Curbs O(P×N) compute on giant CG branch nodes.",
+    )
+    parser.add_argument(
+        "--require-mixed-labels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --ranking-filter-groups is on, drop groups with no positives or "
+             "no negatives (they contribute zero gradient to pairwise loss).",
+    )
+    parser.add_argument(
+        "--min-groups-after-filter",
+        type=int,
+        default=200,
+        help="Fail-fast: refuse to build if fewer useful groups remain after filtering.",
+    )
+    parser.add_argument(
+        "--positive-rate-min",
+        type=float,
+        default=0.10,
+        help="Fail-fast: refuse to build if positive rate after filter is below this.",
+    )
+    parser.add_argument(
+        "--positive-rate-max",
+        type=float,
+        default=0.90,
+        help="Fail-fast: refuse to build if positive rate after filter is above this.",
+    )
     args = parser.parse_args()
 
     teacher_csv = Path(args.teacher_csv)
@@ -381,6 +611,48 @@ def main() -> None:
     grouped_rows: Dict[GroupKey, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped_rows[group_key(row)].append(row)
+
+    # ------------------------------------------------------------------
+    # Ranking-friendly group filter (Fix A). Runs BEFORE split so the report
+    # reflects the dataset that actually feeds the trainer. Physical cap:
+    # capped groups lose column nodes from their bipartite graph, but the
+    # constraint subgraph is unchanged. Acceptable simplification for the
+    # first iteration; revisit with masked-loss-only capping if needed.
+    # ------------------------------------------------------------------
+    filter_report: Dict[str, Any] = {}
+    if args.ranking_filter_groups:
+        grouped_rows, filter_report = filter_and_cap_groups(
+            grouped_rows,
+            min_size=args.min_group_size,
+            max_size=args.max_group_size,
+            require_mixed=args.require_mixed_labels,
+        )
+        print_filter_report(filter_report)
+
+        # Fail-fast checks — refuse to build a dataset that won't train well.
+        if filter_report["size_stats_out"]["max"] > args.max_group_size:
+            raise RuntimeError(
+                f"INTERNAL: capped group exceeds max_size "
+                f"({filter_report['size_stats_out']['max']} > {args.max_group_size}). "
+                "Filter implementation is buggy."
+            )
+        if filter_report["groups_out"] < args.min_groups_after_filter:
+            raise RuntimeError(
+                f"After filter only {filter_report['groups_out']} groups remain "
+                f"(< {args.min_groups_after_filter}). Loosen filter thresholds or collect more teacher rows."
+            )
+        rate_out = filter_report["positive_rate_out"]
+        if rate_out < args.positive_rate_min or rate_out > args.positive_rate_max:
+            raise RuntimeError(
+                f"Positive rate after filter = {rate_out:.3f} is outside acceptable range "
+                f"[{args.positive_rate_min:.2f}, {args.positive_rate_max:.2f}]. "
+                "Check teacher label generation."
+            )
+        if filter_report["pairwise_pairs_out"] == 0:
+            raise RuntimeError(
+                "Filter left zero pairwise pairs — every remaining group is unmixed. "
+                "Disable --require-mixed-labels or check teacher labels."
+            )
 
     out_dir = Path(args.out_dir)
     if out_dir.exists() and args.overwrite:
@@ -490,6 +762,10 @@ def main() -> None:
         "n_distinct_base_ids": len(base_to_split),
         "split_mode": split_mode,
         "group_key_fields": ["source_instance", "branch_node_id", "episode", "product", "period", "constraint_state_hash"],
+        "ranking_filter": {
+            "enabled": bool(args.ranking_filter_groups),
+            **(filter_report if args.ranking_filter_groups else {}),
+        },
         "splits": {},
         "skipped_groups": [],
     }

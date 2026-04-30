@@ -9,3 +9,6 @@ Results/
 *.log
 Results_Kaggle/
 *.pt
+Results - Training/Training E1/aggregate_teacher_rows.csv
+__pycache__/
+*.pyc

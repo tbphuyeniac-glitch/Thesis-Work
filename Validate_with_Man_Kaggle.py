@@ -627,6 +627,7 @@ class ManValidationOrchestrator:
         scenarios_per_size: int = SCENARIOS_PER_SIZE,
         window_length: int = WINDOW_LENGTH_PERIODS,
         demand_shock_sigma: float = DEMAND_SHOCK_SIGMA,
+        include_joint_tc: bool = False,
         debug: bool = False,
         seed: int = 42,
     ):
@@ -637,6 +638,7 @@ class ManValidationOrchestrator:
         self.repo_root          = repo_root
         self.window_length      = int(window_length)
         self.demand_shock_sigma = float(demand_shock_sigma)
+        self.include_joint_tc   = bool(include_joint_tc)
         self.debug              = debug
         self.seed               = seed
 
@@ -667,6 +669,10 @@ class ManValidationOrchestrator:
             time_limit=MAN_TIME_LIMIT,
             mip_gap=MAN_MIP_GAP,
         )
+        self.joint_runner = JointRunner(
+            time_limit=MAN_TIME_LIMIT,
+            mip_gap=MAN_MIP_GAP,
+        ) if self.include_joint_tc else None
         self.writer = ManOutputWriter(output_dir)
 
     def run(self) -> None:
@@ -705,20 +711,25 @@ class ManValidationOrchestrator:
             "routing_alpha":          ROUTING_ALPHA,
             "vehicle_count":          VEHICLE_COUNT,
             "vehicle_capacity":       VEHICLE_CAPACITY,
+            "include_joint_tc":       self.include_joint_tc,
             "debug":                  self.debug,
             "seed":                   self.seed,
         }
         self.writer.write_config(config_record)
 
         # ── Per-scenario loop ──────────────────────────────────────────
-        all_results:  List[Dict] = []
-        all_lt_moves: List[Dict] = []
-        gap_rows:     List[Dict] = []
+        all_results:    List[Dict] = []
+        all_lt_moves:   List[Dict] = []
+        gap_rows:       List[Dict] = []       # C vs Man-BFP-TC
+        joint_gap_rows: List[Dict] = []       # C vs Man-Joint-TC
         partial_path = Path(self.output_dir) / "validate_man_vs_C_per_scenario.csv"
 
+        methods_str = f"Thesis_C  vs  {self.man_runner.source_name}"
+        if self.include_joint_tc:
+            methods_str += f"  vs  {self.joint_runner.source_name}"
         print(f"\n{'='*70}")
         print(f"Starting validation: {len(scenarios)} scenarios")
-        print(f"Methods: Thesis_C_ALNS_CG_GNN  vs  {self.man_runner.source_name}")
+        print(f"Methods: {methods_str}")
         print(f"{'='*70}\n")
 
         for idx, scenario in enumerate(scenarios, start=1):
@@ -763,8 +774,25 @@ class ManValidationOrchestrator:
                   f"cost={man_result.total_cost:.2f}  "
                   f"mip_gap={man_result.mip_gap:.4f}  runtime={man_result.runtime_seconds:.1f}s")
 
+            # ─ Run Man-Joint-TC (Oracle) — optional ─────────────────────
+            joint_result = None
+            joint_lt_moves: List[Dict[str, Any]] = []
+            if self.include_joint_tc and self.joint_runner is not None:
+                print(f"  [Man-Joint-TC]  running...")
+                joint_result, joint_lt_moves = self.joint_runner.run_scenario(
+                    scenario, df_slice, dist_dict, demand_shock=shock or None
+                )
+                print(f"  [Man-Joint-TC]  status={joint_result.status}  "
+                      f"cost={joint_result.total_cost:.2f}  "
+                      f"mip_gap={joint_result.mip_gap:.4f}  "
+                      f"runtime={joint_result.runtime_seconds:.1f}s")
+
             # ─ Annotate results with scenario metadata ──────────────────
-            for result in [c_result, man_result]:
+            results_this_scenario = [c_result, man_result]
+            if joint_result is not None:
+                results_this_scenario.append(joint_result)
+
+            for result in results_this_scenario:
                 d = result.to_dict()
                 d["size_label"]  = scenario.size_label
                 d["store_limit"] = scenario.store_limit
@@ -776,16 +804,28 @@ class ManValidationOrchestrator:
                 all_results.append(d)
 
             all_lt_moves.extend(lt_moves)
+            if joint_lt_moves:
+                all_lt_moves.extend(joint_lt_moves)
 
-            # ─ Compute gap ──────────────────────────────────────────────
+            # ─ Compute C vs Man-BFP-TC gap ──────────────────────────────
             gap = ManComparisonEngine.compute_per_scenario_gaps(c_result, man_result)
             gap["size_label"] = scenario.size_label
             gap_rows.append(gap)
 
             if c_result.success and man_result.success:
-                print(f"  [Gap]  cost_gap={gap.get('cost_gap_pct', 'n/a'):.2f}%  "
-                      f"runtime_ratio={gap.get('runtime_ratio_C_vs_Man', 'n/a'):.2f}x  "
+                print(f"  [Gap C vs BFP-TC]  {gap.get('cost_gap_pct', float('nan')):.2f}%  "
                       f"→ {gap.get('interpretation', '')}")
+
+            # ─ Compute C vs Man-Joint-TC gap ────────────────────────────
+            if joint_result is not None:
+                jgap = ManComparisonEngine.compute_per_scenario_gaps_joint(
+                    c_result, joint_result
+                )
+                jgap["size_label"] = scenario.size_label
+                joint_gap_rows.append(jgap)
+                if c_result.success and joint_result.success:
+                    print(f"  [Gap C vs Joint-TC]  {jgap.get('cost_gap_pct', float('nan')):.2f}%  "
+                          f"→ {jgap.get('interpretation', '')}")
 
             # ─ Partial save ─────────────────────────────────────────────
             if all_results:
@@ -805,6 +845,8 @@ class ManValidationOrchestrator:
         self.writer.write_lt_plan(all_lt_moves)
         self.writer.write_gaps(gap_rows)
         self.writer.write_failures(all_results)
+        if joint_gap_rows:
+            self.writer.write_joint_gaps(joint_gap_rows)
 
         # ── Print summary table ────────────────────────────────────────
         total_runtime = time.time() - t_total
@@ -834,6 +876,17 @@ class ManValidationOrchestrator:
                 mean_gap = sum(g["cost_gap_pct"] for g in gap_valid) / len(gap_valid)
                 print(f"  Mean cost gap (C vs Man-BFP-TC): {mean_gap:+.2f}%  "
                       f"(positive = C more expensive, negative = C cheaper)")
+            if joint_gap_rows:
+                jgap_valid = [g for g in joint_gap_rows
+                              if not math.isnan(g.get("cost_gap_pct", float("nan")))]
+                if jgap_valid:
+                    mean_jgap = sum(g["cost_gap_pct"] for g in jgap_valid) / len(jgap_valid)
+                    print(f"  Mean cost gap (C vs Oracle):    {mean_jgap:+.2f}%  "
+                          f"(Oracle = perfect-info lower bound)")
+                    joint_rows = results_df[results_df["method"] == "Man-Joint-TC"]
+                    if not joint_rows.empty:
+                        j_success = joint_rows["success"].mean()
+                        print(f"  Man-Joint-TC success rate: {j_success*100:.1f}%")
         print(f"  Outputs saved to: {self.output_dir}")
 
 
@@ -872,6 +925,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "Stage-1 (routing) and Stage-2 (LT/CG) for BOTH methods "
                          f"(default: {DEMAND_SHOCK_SIGMA}). "
                          "Set to 0 for deterministic baseline (no shock)."))
+    p.add_argument("--joint_tc",    action="store_true",
+                   help="Also run Man-Joint-TC (Oracle) alongside BFP-TC and Thesis C")
     p.add_argument("--debug",       action="store_true",
                    help="Quick debug run: 3 scenarios per size instead of 10")
     p.add_argument("--seed",        type=int, default=42)
@@ -931,6 +986,7 @@ def main() -> None:
           f"({'single-period (Man native scope)' if args.window_length == 1 else 'multi-period'})")
     print(f"  demand_shock_sigma: {args.demand_shock_sigma}"
           f"  ({'no shock — deterministic' if args.demand_shock_sigma == 0 else 'N(1,σ²) shock active'})")
+    print(f"  joint_tc:           {args.joint_tc}  (Oracle benchmark)")
     print(f"  debug:              {args.debug}")
     print(f"  man_time_limit:     {MAN_TIME_LIMIT}s")
     print(f"  man_mip_gap:        {MAN_MIP_GAP}")
@@ -947,6 +1003,7 @@ def main() -> None:
         scenarios_per_size=args.scenarios_per_size,
         window_length=args.window_length,
         demand_shock_sigma=args.demand_shock_sigma,
+        include_joint_tc=args.joint_tc,
         debug=args.debug,
         seed=args.seed,
     )
