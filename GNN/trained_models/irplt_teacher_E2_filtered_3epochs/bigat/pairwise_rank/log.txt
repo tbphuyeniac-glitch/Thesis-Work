@@ -6,3 +6,7 @@
 [2026-04-30 23:42:25.695264] saved best BiGAT model
 [2026-04-30 23:43:40.709742] epoch=002 objective=pairwise_rank train_loss=0.5580 valid_loss=0.4868 ranking_valid_mrr=0.9212 ranking_valid_top1=0.8491 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.6104 binary_valid_f1=0.5839 pos_score=0.6130 neg_score=0.4551 score_gap=0.1579 col_emb_norm=3.7376 con_emb_norm=3.8048 param_update_norm=5.838664
 [2026-04-30 23:43:40.742807] saved best BiGAT model
+[2026-04-30 23:45:41.082161] epoch=003 objective=pairwise_rank train_loss=0.5414 valid_loss=0.4792 ranking_valid_mrr=0.9213 ranking_valid_top1=0.8494 ranking_valid_top3=1.0000 ranking_mean_positive_rank=1.6109 binary_valid_f1=0.6256 pos_score=0.7067 neg_score=0.5746 score_gap=0.1321 col_emb_norm=3.5824 con_emb_norm=3.6995 param_update_norm=5.222136
+[2026-04-30 23:45:41.116447] saved best BiGAT model
+[2026-04-30 23:45:41.676909] saved training history to GNN/trained_models/irplt_teacher_E2_filtered_3epochs/bigat/pairwise_rank/training_history.json
+[2026-04-30 23:45:41.681486] saved training loss chart to GNN/trained_models/irplt_teacher_E2_filtered_3epochs/bigat/pairwise_rank/training_loss_curve.png

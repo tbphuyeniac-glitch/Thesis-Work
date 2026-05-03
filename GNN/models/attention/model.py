@@ -66,7 +66,7 @@ class BiGATColumnScorer(nn.Module):
 
     def __init__(
         self,
-        column_dim: int = 12,
+        column_dim: int = 10,
         constraint_dim: int = 4,
         edge_dim: int = 3,
         hidden_dim: int = 64,

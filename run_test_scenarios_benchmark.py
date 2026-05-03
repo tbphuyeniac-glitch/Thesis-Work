@@ -1,0 +1,212 @@
+"""Benchmark E1 variants on PRE-COMPUTED test scenarios from test_baselines.
+
+Each scenario pkl already contains shocked_data + baseline_sol — we skip ALNS
+(saving 60-120s per scenario) and go directly to CG. This matches the real
+inference workflow: a deployed system has the baseline cached, only CG runs
+per shock event.
+
+Variants (production parity):
+  - A0_no_penalty   : exact_full_mode + use_branch_and_price=True   (full BP)
+  - E1_rc_only      : rc_filter_mode  + use_branch_and_price=False  (RC-only)
+  - E1_rc_gnn       : rc_filter_mode  + GNN re-rank + BP=False
+
+Usage:
+    IRP_GNN_CHECKPOINT=GNN/trained_models/irplt_teacher_filtered_local200_fixed/bigat/pairwise_rank/best_model.pt \
+    python3 run_test_scenarios_benchmark.py
+"""
+from __future__ import annotations
+import os, time, json, gzip, pickle
+from pathlib import Path
+from copy import deepcopy
+
+os.environ.setdefault("IRP_TIME_LIMIT", "240")
+os.environ.setdefault("IRP_CG_ITERATIONS", "15")
+os.environ.setdefault("IRP_BP_MAX_NODES", "15")
+os.environ.setdefault("IRP_BP_MAX_DEPTH", "6")
+os.environ.setdefault("IRP_QUIET", "1")
+os.environ.setdefault("IRP_CG_STOPPING_MODE", "convergence")
+os.environ.setdefault("IRP_RESULTS_DIR_OVERRIDE", "Result_E2_local_benchmark")
+os.environ.pop("IRP_SLA_PENALTY", None)
+
+import irp_gurobi_converted as irp
+
+
+VARIANTS = [
+    ("A0_no_penalty", {
+        "use_gnn": False, "collect_teacher_mode": False,
+        "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+        "exact_full_mode": True,
+        "use_branch_and_price": True,
+    }),
+    ("E1_rc_only", {
+        "use_gnn": False, "collect_teacher_mode": False,
+        "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+        "rc_filter_mode": True,
+        "use_branch_and_price": False,
+    }),
+    ("E1_rc_gnn", {
+        "use_gnn": True, "collect_teacher_mode": False,
+        "runtime_gnn_mode": True, "heuristic_top_k_mode": False,
+        "rc_filter_mode": True,
+        "gnn_selection_mode": "relative_threshold",
+        "gnn_relative_threshold": 0.70,
+        "gnn_max_keep_fraction": 0.30,
+        "use_branch_and_price": False,
+    }),
+]
+
+# Scenarios across sizes:
+#   small : base_01 (4×2×153)
+#   medium: base_09 (5×3×153)
+#   large : base_24 (7×4×149)
+SCENARIO_SELECTION = [
+    ("small",  "base_01__normal_global__seed1373158607"),
+    ("small",  "base_01__sku_spike__seed53710185"),
+    ("medium", "base_09__normal_global__seed1730483679"),
+    ("medium", "base_09__sku_spike__seed1499242942"),
+    ("large",  "base_24__normal_global__seed814874364"),
+    ("large",  "base_24__sku_spike__seed992696250"),
+]
+
+GNN_CKPT = os.environ.get(
+    "IRP_GNN_CHECKPOINT",
+    "GNN/trained_models/irplt_teacher_filtered_local200_fixed/bigat/pairwise_rank/best_model.pt",
+)
+SCENARIOS_DIR = Path("Test 30 scenarios/test_baselines/scenarios")
+
+
+def load_scenario(name):
+    pkl = SCENARIOS_DIR / f"{name}.pkl.gz"
+    with gzip.open(pkl, "rb") as f:
+        s = pickle.load(f)
+    return s["shocked_data"], s["baseline_sol"], s.get("shock_type", ""), s.get("shock_seed", "")
+
+
+def run_variant(v_name, kwargs, shocked_data, baseline_sol):
+    data_copy = deepcopy(shocked_data)
+    baseline_copy = deepcopy(baseline_sol)
+    use_bp = kwargs.pop("use_branch_and_price", False)
+    pipeline = irp.IRPResearchPipeline(data_copy)
+    t0 = time.perf_counter()
+    result = pipeline.run_lt_recourse_from_baseline(
+        baseline_copy,
+        use_random_initial_patterns=True,
+        n_initial_patterns_per_product_period=5,
+        cg_iterations=15,
+        msg=False,
+        gnn_checkpoint=GNN_CKPT if kwargs.get("use_gnn") else None,
+        use_classical_fallback=False,
+        gnn_max_keep=150,
+        use_branch_and_price=use_bp,
+        bp_max_nodes=15, bp_max_depth=6,
+        lt_activation_threshold=10.0,
+        **kwargs,
+    )
+    rt = time.perf_counter() - t0
+    cg_sol = result.get("cg_solution")
+    obj = float(getattr(cg_sol, "objective", float("nan")))
+    cg_history = result.get("cg_episode_history", []) or []
+    cg_iters = max(0, len(cg_history) - 1)
+    cols_added = sum(int(h.get("added_columns", 0)) for h in cg_history)
+    cols_proposed = sum(int(h.get("proposed_columns", 0)) for h in cg_history)
+    bp_nodes = len(result.get("branch_price_history", []) or [])
+    return {
+        "obj": obj, "rt": rt, "iters": cg_iters,
+        "cols_added": cols_added, "cols_proposed": cols_proposed,
+        "bp_nodes": bp_nodes, "use_bp": use_bp,
+    }
+
+
+def main():
+    if not Path(GNN_CKPT).exists():
+        raise SystemExit(f"GNN checkpoint not found: {GNN_CKPT}")
+    print(f"[bench] checkpoint: {GNN_CKPT}\n")
+
+    rows = []
+    for size_label, name in SCENARIO_SELECTION:
+        print("=" * 90)
+        print(f"[scenario] {size_label} | {name}")
+        print("=" * 90)
+        shocked_data, baseline_sol, shock_type, shock_seed = load_scenario(name)
+        n_stores = len(shocked_data.stores)
+        n_skus = len(shocked_data.products)
+        n_periods = len(shocked_data.periods)
+        baseline_obj = float(baseline_sol.objective)
+        print(f"  size: {n_stores} stores × {n_skus} skus × {n_periods} periods")
+        print(f"  shock: {shock_type} seed={shock_seed}")
+        print(f"  baseline obj: {baseline_obj:.2f}\n")
+
+        for v_name, kwargs_orig in VARIANTS:
+            kwargs = dict(kwargs_orig)
+            r = run_variant(v_name, kwargs, shocked_data, baseline_sol)
+            row = {
+                "size": size_label, "scenario": name,
+                "stores": n_stores, "skus": n_skus, "periods": n_periods,
+                "shock_type": shock_type, "shock_seed": shock_seed,
+                "variant": v_name,
+                "use_bp": r["use_bp"],
+                "obj": r["obj"], "rt_s": r["rt"],
+                "iters": r["iters"],
+                "bp_nodes": r["bp_nodes"],
+                "cols_added": r["cols_added"], "cols_proposed": r["cols_proposed"],
+                "baseline_obj": baseline_obj,
+            }
+            rows.append(row)
+            tag = "BP" if r["use_bp"] else "noBP"
+            print(f"  {v_name:<14} [{tag}] obj={r['obj']:.2f}  rt={r['rt']:.2f}s  "
+                  f"iters={r['iters']}  bp_nodes={r['bp_nodes']}  cols_added={r['cols_added']}")
+        print()
+
+    print("\n" + "#" * 105)
+    print("# E1 BENCHMARK SUMMARY (test scenarios — production-style A0=BP, E1=noBP)")
+    print("#" * 105)
+    print(f"{'size':<7} {'scenario':<55} {'A0_rt':>8} {'rcOnly_rt':>10} {'rcGnn_rt':>10}  "
+          f"{'A0_it':>6} {'rco_it':>7} {'rcg_it':>7}  "
+          f"{'rc_speedup':>11} {'gnn_speedup':>12}")
+    grouped = {}
+    for r in rows:
+        key = (r["size"], r["scenario"])
+        grouped.setdefault(key, {})[r["variant"]] = r
+    for (size, scen), per_v in grouped.items():
+        a0 = per_v["A0_no_penalty"]
+        ro = per_v["E1_rc_only"]
+        rg = per_v["E1_rc_gnn"]
+        rc_speedup  = a0["rt_s"] / max(1e-6, ro["rt_s"])
+        gnn_speedup = a0["rt_s"] / max(1e-6, rg["rt_s"])
+        scen_short = scen[-50:] if len(scen) > 50 else scen
+        print(f"{size:<7} {scen_short:<55} {a0['rt_s']:>8.2f} {ro['rt_s']:>10.2f} {rg['rt_s']:>10.2f}  "
+              f"{a0['iters']:>6} {ro['iters']:>7} {rg['iters']:>7}  "
+              f"{rc_speedup:>10.2f}x {gnn_speedup:>11.2f}x")
+
+    print("\n# AGGREGATE BY SIZE (mean across scenarios)")
+    print("#" * 105)
+    print(f"{'size':<10} {'n_scen':>7} {'A0_rt':>10} {'rcOnly_rt':>11} {'rcGnn_rt':>10}  "
+          f"{'A0_it':>7} {'rco_it':>7} {'rcg_it':>7}  "
+          f"{'rc_speedup':>11} {'gnn_speedup':>12}")
+    by_size = {}
+    for r in rows:
+        by_size.setdefault(r["size"], []).append(r)
+    for size in ["small", "medium", "large"]:
+        size_rows = by_size.get(size, [])
+        n = len([r for r in size_rows if r["variant"] == "A0_no_penalty"])
+        if n == 0: continue
+        a0_rts = [r["rt_s"] for r in size_rows if r["variant"] == "A0_no_penalty"]
+        ro_rts = [r["rt_s"] for r in size_rows if r["variant"] == "E1_rc_only"]
+        rg_rts = [r["rt_s"] for r in size_rows if r["variant"] == "E1_rc_gnn"]
+        a0_its = [r["iters"] for r in size_rows if r["variant"] == "A0_no_penalty"]
+        ro_its = [r["iters"] for r in size_rows if r["variant"] == "E1_rc_only"]
+        rg_its = [r["iters"] for r in size_rows if r["variant"] == "E1_rc_gnn"]
+        a0m = sum(a0_rts)/len(a0_rts); rom = sum(ro_rts)/len(ro_rts); rgm = sum(rg_rts)/len(rg_rts)
+        print(f"{size:<10} {n:>7} {a0m:>10.2f} {rom:>11.2f} {rgm:>10.2f}  "
+              f"{sum(a0_its)/n:>7.1f} {sum(ro_its)/n:>7.1f} {sum(rg_its)/n:>7.1f}  "
+              f"{a0m/max(1e-6,rom):>10.2f}x {a0m/max(1e-6,rgm):>11.2f}x")
+
+    out_path = Path("Result_E2_local_benchmark") / "e1_test_scenarios.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump({"rows": rows, "ckpt": GNN_CKPT}, f, indent=2)
+    print(f"\n[bench] saved {out_path}")
+
+
+if __name__ == "__main__":
+    main()

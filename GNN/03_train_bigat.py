@@ -233,11 +233,11 @@ def main() -> None:
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--dataset-type", choices=["teacher", "synthetic"], default="teacher")
     parser.add_argument("--seed", type=utilities.valid_seed, default=0)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden-dim", type=int, default=16)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--objective", choices=["binary", "pairwise_rank", "score_regression"], default="pairwise_rank")
     parser.add_argument("--resume-checkpoint", default=None, help="Optional checkpoint to fine-tune from.")
     parser.add_argument(
@@ -460,7 +460,9 @@ def main() -> None:
     utilities.log(f"saved training loss chart to {chart_path}", logfile)
 
     _atomic_json_save({
-        "best_valid_loss": best_valid,
+        "best_valid_mrr": best_valid if _maximize_primary else None,
+        "best_valid_loss": best_valid if not _maximize_primary else None,
+        "primary_metric": primary_metric,
         "objective": args.objective,
         "dataset_type": args.dataset_type,
         "data_dir": args.data_dir,

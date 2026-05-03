@@ -8,7 +8,7 @@
       "variant": "A0",
       "use_bp": true,
       "obj": 11726637107635.557,
-      "rt_s": 4.092428000003565,
+      "rt_s": 5.212492666993057,
       "iters": 31,
       "bp_nodes": 15,
       "cols_gen": 208,
@@ -22,7 +22,7 @@
       "variant": "E1_rc_only",
       "use_bp": false,
       "obj": 11726637075422.705,
-      "rt_s": 0.7299333330010995,
+      "rt_s": 1.1480707500013523,
       "iters": 3,
       "bp_nodes": 0,
       "cols_gen": 249,
@@ -35,12 +35,12 @@
       "shock": "medium",
       "variant": "E1_rc_gnn",
       "use_bp": false,
-      "obj": 11726637188712.49,
-      "rt_s": 1.7457930419914192,
+      "obj": 11726637166121.615,
+      "rt_s": 2.632940834009787,
       "iters": 3,
       "bp_nodes": 0,
-      "cols_gen": 117,
-      "cols_added": 117
+      "cols_gen": 118,
+      "cols_added": 118
     },
     {
       "instance": "10x5",
@@ -50,7 +50,7 @@
       "variant": "A0",
       "use_bp": true,
       "obj": 22926086332636.297,
-      "rt_s": 27.850174457998946,
+      "rt_s": 35.76198424999893,
       "iters": 32,
       "bp_nodes": 15,
       "cols_gen": 893,
@@ -64,7 +64,7 @@
       "variant": "E1_rc_only",
       "use_bp": false,
       "obj": 22926086255548.473,
-      "rt_s": 8.926539292006055,
+      "rt_s": 11.935053374996642,
       "iters": 5,
       "bp_nodes": 0,
       "cols_gen": 952,
@@ -77,13 +77,13 @@
       "shock": "medium",
       "variant": "E1_rc_gnn",
       "use_bp": false,
-      "obj": 22926086522092.684,
-      "rt_s": 13.68873970900313,
-      "iters": 8,
+      "obj": 22926086476561.203,
+      "rt_s": 11.180421291996026,
+      "iters": 5,
       "bp_nodes": 0,
-      "cols_gen": 381,
-      "cols_added": 381
+      "cols_gen": 393,
+      "cols_added": 393
     }
   ],
-  "ckpt": "GNN/trained_models/irplt_teacher_filtered_local3_fixed/bigat/pairwise_rank/best_model.pt"
+  "ckpt": "/tmp/best_at_epoch_50.pt"
 }

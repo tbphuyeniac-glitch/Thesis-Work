@@ -1,0 +1,104 @@
+{
+  "rows": [
+    {
+      "size": "small",
+      "scenario": "base_01__normal_global__seed1373158607",
+      "variant": "A0_no_penalty",
+      "obj": 587125396.8091294,
+      "rt_s": 3.1857727499991597,
+      "iters": 9,
+      "cols_added": 609,
+      "cols_proposed": 609,
+      "baseline_obj": 557710816.4999993
+    },
+    {
+      "size": "small",
+      "scenario": "base_01__normal_global__seed1373158607",
+      "variant": "E1_gnn_only_k1",
+      "obj": 587125396.8091294,
+      "rt_s": 2.3789577499992447,
+      "iters": 8,
+      "cols_added": 621,
+      "cols_proposed": 621,
+      "baseline_obj": 557710816.4999993
+    },
+    {
+      "size": "small",
+      "scenario": "base_01__normal_global__seed1373158607",
+      "variant": "E1_gnn_only_k3",
+      "obj": 587125396.3369243,
+      "rt_s": 1.7192578750000393,
+      "iters": 7,
+      "cols_added": 1266,
+      "cols_proposed": 1266,
+      "baseline_obj": 557710816.4999993
+    },
+    {
+      "size": "medium",
+      "scenario": "base_09__normal_global__seed1730483679",
+      "variant": "A0_no_penalty",
+      "obj": 1094963638.3591142,
+      "rt_s": 7.809850290999748,
+      "iters": 13,
+      "cols_added": 1046,
+      "cols_proposed": 1046,
+      "baseline_obj": 1004656107.1999996
+    },
+    {
+      "size": "medium",
+      "scenario": "base_09__normal_global__seed1730483679",
+      "variant": "E1_gnn_only_k1",
+      "obj": 1094963639.2134666,
+      "rt_s": 5.809037875002105,
+      "iters": 14,
+      "cols_added": 1089,
+      "cols_proposed": 1089,
+      "baseline_obj": 1004656107.1999996
+    },
+    {
+      "size": "medium",
+      "scenario": "base_09__normal_global__seed1730483679",
+      "variant": "E1_gnn_only_k3",
+      "obj": 1094963636.9210033,
+      "rt_s": 4.955018541000754,
+      "iters": 8,
+      "cols_added": 2534,
+      "cols_proposed": 2534,
+      "baseline_obj": 1004656107.1999996
+    },
+    {
+      "size": "large",
+      "scenario": "base_24__normal_global__seed814874364",
+      "variant": "A0_no_penalty",
+      "obj": 1678527218.6775126,
+      "rt_s": 19.76796362499954,
+      "iters": 15,
+      "cols_added": 1858,
+      "cols_proposed": 1858,
+      "baseline_obj": 1507064430.400002
+    },
+    {
+      "size": "large",
+      "scenario": "base_24__normal_global__seed814874364",
+      "variant": "E1_gnn_only_k1",
+      "obj": 1678527220.6320577,
+      "rt_s": 15.452749624997523,
+      "iters": 15,
+      "cols_added": 2032,
+      "cols_proposed": 2032,
+      "baseline_obj": 1507064430.400002
+    },
+    {
+      "size": "large",
+      "scenario": "base_24__normal_global__seed814874364",
+      "variant": "E1_gnn_only_k3",
+      "obj": 1678527217.9359574,
+      "rt_s": 17.440118082999106,
+      "iters": 12,
+      "cols_added": 4549,
+      "cols_proposed": 4549,
+      "baseline_obj": 1507064430.400002
+    }
+  ],
+  "ckpt": "GNN/trained_models/irplt_teacher_filtered_local200_fixed/bigat/pairwise_rank/best_model.pt"
+}

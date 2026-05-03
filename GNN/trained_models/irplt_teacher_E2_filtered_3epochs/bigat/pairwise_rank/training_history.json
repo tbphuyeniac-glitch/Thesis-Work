@@ -46,5 +46,29 @@
     "column_embedding_norm": 3.7376279830932617,
     "constraint_embedding_norm": 3.804842948913574,
     "param_update_norm": 5.8386640548706055
+  },
+  {
+    "epoch": 3,
+    "train_loss": 0.5414011327516537,
+    "valid_loss": 0.4791983320873959,
+    "primary_metric": "ranking_mrr",
+    "ranking_valid_mrr": 0.9213302244967735,
+    "ranking_valid_mean_positive_rank": 1.6109260493004665,
+    "ranking_valid_top1": 0.8494337108594271,
+    "ranking_valid_top3": 1.0,
+    "ranking_valid_top5": 1.0,
+    "binary_valid_f1": 0.625616255829447,
+    "binary_valid_precision": 0.5830002220741727,
+    "binary_valid_recall": 0.7706528980679547,
+    "valid_f1": 0.625616255829447,
+    "valid_top1": 0.8494337108594271,
+    "valid_mrr": 0.9213302244967735,
+    "valid_mean_positive_rank": 1.6109260493004665,
+    "pos_score": 0.7066851258277893,
+    "neg_score": 0.5745880007743835,
+    "score_gap": 0.13209712505340576,
+    "column_embedding_norm": 3.5824098587036133,
+    "constraint_embedding_norm": 3.6994659900665283,
+    "param_update_norm": 5.222136497497559
   }
 ]

@@ -1,0 +1,35 @@
+[
+  {
+    "variant": "A0_pool1",
+    "rmp_objective": 1301914876.0859776,
+    "realized_cost": 1114690857.977915,
+    "runtime_seconds": 7.279758917007712,
+    "cg_iterations": 7,
+    "cols_per_iter": [
+      371,
+      307,
+      73,
+      14,
+      7,
+      6
+    ],
+    "total_cols_added": 778,
+    "avg_cols_per_iter": 129.66666666666666
+  },
+  {
+    "variant": "E2_pool5_GNN_global",
+    "rmp_objective": 1301769767.272286,
+    "realized_cost": 1115665387.436839,
+    "runtime_seconds": 10.64843783401011,
+    "cg_iterations": 6,
+    "cols_per_iter": [
+      1139,
+      1002,
+      271,
+      98,
+      40
+    ],
+    "total_cols_added": 2550,
+    "avg_cols_per_iter": 510.0
+  }
+]

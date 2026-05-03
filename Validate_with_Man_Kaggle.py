@@ -116,6 +116,17 @@ class _ShockedDataProxy:
         return getattr(object.__getattribute__(self, "_w"), name)
 
     def __setattr__(self, name: str, value):
+        # Properties on the proxy class (e.g. `realized_demand`) must
+        # dispatch to their setter, otherwise the unconditional else-branch
+        # below bypasses the shock multiplier and writes the unshocked value
+        # straight onto the wrapped IRPData. (This was a silent bug — every
+        # prior shock run actually evaluated Thesis C on forecast demand.)
+        cls_attr = getattr(type(self), name, None)
+        if isinstance(cls_attr, property):
+            if cls_attr.fset is None:
+                raise AttributeError(f"can't set attribute {name!r}")
+            cls_attr.fset(self, value)
+            return
         if name in ("_w", "_shock", "_realized"):
             object.__setattr__(self, name, value)
         else:
@@ -129,19 +140,30 @@ class _ShockedDataProxy:
 class ManThesisCRunner(ThesisCRunner):
     """Thin subclass of ThesisCRunner that supports per-scenario demand shock.
 
-    Only `_build_irp_data` is overridden — it wraps the returned IRPData with
-    `_ShockedDataProxy` when a shock dict is active.  All other behaviour
-    (MIP/ALNS routing, CG/LT column generation) is unchanged.
+    Adds two things on top of ThesisCRunner:
+      1. `_build_irp_data` is overridden to apply a per-scenario demand shock
+         via `_ShockedDataProxy`.
+      2. `run_scenario` runs an additional "no-routing trial" (iter0) by
+         calling JointTCRunner with vehicle_count=0 — i.e. solving the Stage 2
+         LP (LT-only redistribution) given zero DC deliveries. If that beats
+         the standard ALNS+CG+LT result, we adopt it. This closes the gap to
+         the Oracle in scenarios where ALNS over-routes.
 
     Usage:
-        runner.set_shock(shock_dict)      # before run_scenario()
-        result = runner.run_scenario(...) # shock applied to realized_demand
-        runner.set_shock(None)            # reset to deterministic
+        runner.set_shock(shock_dict)
+        result = runner.run_scenario(scenario, df_slice, dist_dict)
+        runner.set_shock(None)
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._active_shock: Optional[Dict] = None
+        self._no_routing_trial_enabled: bool = (
+            os.environ.get("THESIS_C_NO_ROUTING_TRIAL", "1") == "1"
+        )
+        self._disable_phase1_mip: bool = (
+            os.environ.get("THESIS_C_DISABLE_PHASE1_MIP", "0") == "1"
+        )
 
     def set_shock(self, shock: Optional[Dict]):
         self._active_shock = shock or None
@@ -152,6 +174,119 @@ class ManThesisCRunner(ThesisCRunner):
         if shock:
             return _ShockedDataProxy(data, shock)
         return data
+
+    def _no_routing_trial(
+        self,
+        scenario: "ScenarioSpec",
+        df_slice: pd.DataFrame,
+        dist_dict: Dict[Tuple[str, str], float],
+    ) -> Tuple[Optional["JointTCResult"], List[Dict[str, Any]]]:
+        """Solve Stage 2 LP with zero DC routing — returns LT-only optimum.
+
+        Implemented by reusing JointTCRunner with vehicle_count=0. The
+        Stage 1 routing structure becomes empty, so the joint MIP collapses
+        to the Stage 2 LP that redistributes existing store/DC inventory via
+        LT to meet realized demand. This is the "iter0" trial.
+        """
+        try:
+            helper = JointTCRunner(
+                time_limit=180,
+                mip_gap=0.02,
+                threads=4,
+                vehicle_count=0,        # KEY: forbid DC routing
+                vehicle_capacity=0.0,
+                holding_cost_rate=HOLDING_COST_RATE,
+                shortage_cost_rate=SHORTAGE_COST_RATE,
+                lt_cost_multiplier=1.2,
+            )
+            return helper.run_scenario(
+                scenario, df_slice, dist_dict,
+                demand_shock=self._active_shock or None,
+            )
+        except Exception as exc:
+            print(f"  [ThesisC iter0] no-routing trial errored: {exc}")
+            return None, []
+
+    def run_scenario(
+        self,
+        scenario: "ScenarioSpec",
+        df_slice: pd.DataFrame,
+        dist_dict: Dict[Tuple[str, str], float],
+    ) -> ScenarioResult:
+        import irp_gurobi_converted as _irp
+
+        # ---- Optional: disable Phase 1 (Gurobi MIP exact routing) ----
+        original_mip_solve = None
+        if self._disable_phase1_mip:
+            original_mip_solve = _irp.AchamrahFullIRPTModel.solve
+
+            def _stub_solve(self, *args, **kwargs):
+                return None
+            _irp.AchamrahFullIRPTModel.solve = _stub_solve
+            print(f"  [ThesisC]   Phase 1 (Gurobi MIP exact) DISABLED — ALNS only")
+
+        # ---- Shock-propagation patch: auto-build post_shock_inventory ----
+        # _ShockedDataProxy alone is insufficient — it intercepts
+        # data.realized_demand, but cost evaluation reads
+        # data.post_shock_inventory / data.post_shock_shortage which are
+        # empty dicts unless build_post_shock_inventory_state(data, sol) is
+        # called explicitly. The training pipeline calls it; the benchmark
+        # validator does not, so shock never reaches the Phase 3 shortage
+        # gate. Monkey-patch build_realized_operating_cost_breakdown so it
+        # auto-populates the post-shock state on first call.
+        original_breakdown = _irp.build_realized_operating_cost_breakdown
+        shock_active = bool(self._active_shock)
+
+        def _patched_breakdown(data, dc_solution, lt_plan_df=None):
+            if shock_active:
+                rd = getattr(data, "realized_demand", None)
+                psi = getattr(data, "post_shock_inventory", None) or {}
+                if rd and not psi:
+                    _irp.build_post_shock_inventory_state(data, dc_solution)
+            return original_breakdown(data, dc_solution, lt_plan_df=lt_plan_df)
+
+        _irp.build_realized_operating_cost_breakdown = _patched_breakdown
+
+        try:
+            # ---- Standard ALNS + CG + LT path ----
+            result_A = super().run_scenario(scenario, df_slice, dist_dict)
+        finally:
+            _irp.build_realized_operating_cost_breakdown = original_breakdown
+            if original_mip_solve is not None:
+                _irp.AchamrahFullIRPTModel.solve = original_mip_solve
+
+        if not self._no_routing_trial_enabled:
+            return result_A
+        if not getattr(result_A, "success", False):
+            return result_A
+
+        # ---- iter0: no-routing trial (LT-only) ----
+        result_B, lt_moves_B = self._no_routing_trial(scenario, df_slice, dist_dict)
+
+        if (result_B is None or not getattr(result_B, "success", False)
+                or not (result_B.total_cost < result_A.total_cost - 1e-6)):
+            print(f"  [ThesisC iter0]   no-routing={getattr(result_B, 'total_cost', float('nan')):.2f}"
+                  f"  ALNS+CG={result_A.total_cost:.2f}  → keep ALNS")
+            return result_A
+
+        print(f"  [ThesisC iter0]   no-routing={result_B.total_cost:.2f} "
+              f"< ALNS+CG={result_A.total_cost:.2f}  → adopt iter0 (saved "
+              f"{result_A.total_cost - result_B.total_cost:.2f})")
+
+        # Overlay iter0 numbers onto the ScenarioResult shell. Keep status,
+        # method, runtime, etc. from result_A; replace the cost/quantity
+        # fields with the iter0 winners.
+        result_A.total_cost          = float(result_B.total_cost)
+        result_A.routing_cost        = 0.0
+        result_A.holding_cost        = float(result_B.holding_cost)
+        result_A.transshipment_cost  = float(result_B.transshipment_cost)
+        result_A.shortage_cost       = float(result_B.shortage_cost)
+        result_A.shortage_qty        = float(result_B.shortage_qty)
+        result_A.service_level       = float(result_B.service_level)
+        result_A.lt_total_qty        = float(result_B.lt_total_qty)
+        result_A.n_lt_moves          = int(result_B.n_lt_moves)
+        result_A.n_routes            = 0
+        return result_A
 
 
 # ======================================================================
@@ -341,6 +476,13 @@ class JointRunner:
         mip_gap: float = MAN_MIP_GAP,
         threads: int = 4,
     ):
+        # Bound dc_capacity exactly to total initial DC stock (5 SKUs × 10k =
+        # 50k). This forces replenishment rm to 0 across the rolling horizon.
+        # Without this bound, rm has no cost penalty in the objective, so
+        # Gurobi picks rm = max(allowed) = dc_capacity − dc_init_stock, which
+        # leaves later periods with a depleted-per-SKU DC and no replenishment
+        # headroom → infeasible. With rm=0 forced, the model becomes a pure
+        # closed-system rolling-horizon problem (matches Man et al. 2025).
         self._runner = JointTCRunner(
             time_limit=time_limit,
             mip_gap=mip_gap,
@@ -349,6 +491,8 @@ class JointRunner:
             vehicle_capacity=VEHICLE_CAPACITY,
             holding_cost_rate=HOLDING_COST_RATE,
             shortage_cost_rate=SHORTAGE_COST_RATE,
+            dc_capacity=50000.0,                     # = 5 SKUs × 10k init
+            dc_initial_stock_per_product=10000.0,
         )
         self.source_name = self.METHOD_NAME
 

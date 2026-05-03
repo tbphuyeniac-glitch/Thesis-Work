@@ -161,12 +161,24 @@ def _safe_obj_value(model: gp.Model) -> float:
 def _model_efficiency_metrics(model: gp.Model) -> Dict[str, float]:
     node_count = float(getattr(model, "NodeCount", 0.0))
     is_mip = bool(getattr(model, "IsMIP", 0))
+    # MIPGap / ObjBound only meaningful for MIP runs that produced a solution;
+    # default to NaN so callers can detect "no gap available".
+    try:
+        mip_gap = float(model.MIPGap) if is_mip and _has_solution(model) else float("nan")
+    except Exception:
+        mip_gap = float("nan")
+    try:
+        obj_bound = float(model.ObjBound) if is_mip else float("nan")
+    except Exception:
+        obj_bound = float("nan")
     return {
         "gurobi_runtime_seconds": float(getattr(model, "Runtime", 0.0)),
         "lp_iterations": float(getattr(model, "IterCount", 0.0)),
         "barrier_iterations": float(getattr(model, "BarIterCount", 0.0)),
         "nodes_explored": node_count,
         "lp_relaxations_solved_estimate": node_count if is_mip else 1.0,
+        "mip_gap": mip_gap,
+        "obj_bound": obj_bound,
     }
 
 
@@ -316,67 +328,6 @@ def _integer_final_outputs_enabled() -> bool:
     in the primary output files (debug copies are always written).
     """
     return os.environ.get("IRP_INTEGER_FINAL_OUTPUTS", "1").lower() not in {"0", "false", "no", ""}
-
-
-# ----------------------------------------------------------------------
-# SLA penalty (L1) configuration. DEFAULT OFF — completely transparent for
-# any code path that does not opt in. Validate_with_*.py and other legacy
-# scripts continue to behave bit-identically when the env vars are unset.
-#
-# Activation: set IRP_SLA_PENALTY=on (or 1/true/yes). Then:
-#   IRP_SLA_MU    = shortage penalty weight (default 0)
-#   IRP_SLA_NU    = surplus-leftover penalty weight (default 0)
-#   IRP_SLA_ALPHA = scale on time_urgency for omega(j,p,t)  (default 4)
-#   IRP_SLA_BETA  = scale on surplus_ratio  for rho(i,p,t)  (default 2)
-#
-# When mu==0 AND nu==0 the helper returns enabled=False so callers can
-# short-circuit any new code-paths and remain bit-identical to the
-# original objective.
-# ----------------------------------------------------------------------
-def _get_sla_penalty_config() -> Tuple[bool, float, float, float, float]:
-    enabled = os.environ.get("IRP_SLA_PENALTY", "off").lower() in {"1", "on", "true", "yes"}
-    if not enabled:
-        return False, 0.0, 0.0, 0.0, 0.0
-    try:
-        mu = float(os.environ.get("IRP_SLA_MU", "0.0") or "0.0")
-    except (TypeError, ValueError):
-        mu = 0.0
-    try:
-        nu = float(os.environ.get("IRP_SLA_NU", "0.0") or "0.0")
-    except (TypeError, ValueError):
-        nu = 0.0
-    try:
-        alpha = float(os.environ.get("IRP_SLA_ALPHA", "4.0") or "4.0")
-    except (TypeError, ValueError):
-        alpha = 4.0
-    try:
-        beta = float(os.environ.get("IRP_SLA_BETA", "2.0") or "2.0")
-    except (TypeError, ValueError):
-        beta = 2.0
-    if mu <= 0.0 and nu <= 0.0:
-        return False, 0.0, 0.0, alpha, beta
-    return True, mu, nu, alpha, beta
-
-
-def _sla_time_urgency(t, periods) -> float:
-    """time_urgency in [0, 1]. 0 at the start of the horizon, 1 in the last
-    period. Used as omega weight scale: omega = 1 + alpha * time_urgency.
-    """
-    if not periods:
-        return 1.0
-    period_list = list(periods)
-    if t not in period_list:
-        return 1.0
-    n = len(period_list)
-    if n <= 1:
-        return 1.0
-    return float(period_list.index(t)) / float(n - 1)
-
-
-def _sla_surplus_ratio(donor_surplus: float, total_surplus: float) -> float:
-    if total_surplus <= 1e-9:
-        return 0.0
-    return float(min(1.0, max(0.0, donor_surplus / total_surplus)))
 
 
 def _is_quiet() -> bool:
@@ -1588,8 +1539,9 @@ class BaselineALNSModel:
         max_iterations: int = 2000,
         seed: int = 20260419,
         initial_temperature: Optional[float] = None,
-        cooling_rate: float = 0.998,
+        cooling_rate: float = 0.995,
         segment_size: int = 40,
+        restart_no_improve_iters: int = 150,
         reaction_factor: float = 0.1,
         initial_solution: Optional[FullIRPTSolution] = None,
     ) -> FullIRPTSolution:
@@ -1646,6 +1598,9 @@ class BaselineALNSModel:
         n_accept = 0
         n_improve = 0
         n_new_best = 0
+        # Bug 2 fix: track stagnation so we can restart from `best` once the
+        # current trajectory has drifted away from the incumbent for too long.
+        last_improvement_iter = 0
         history: List[Dict[str, float]] = [{
             "iteration": 0,
             "current_cost": float(curr_cost),
@@ -1697,6 +1652,7 @@ class BaselineALNSModel:
                 curr_cost = cand_cost
                 curr_feasible = True
                 n_accept += 1
+                last_improvement_iter = iteration
             elif accepted:
                 n_accept += 1
                 if delta < 0.0:
@@ -1725,6 +1681,18 @@ class BaselineALNSModel:
             })
 
             temperature = max(1e-6, temperature * cooling_rate)
+
+            # Bug 2 fix: if we have stagnated for too long, snap `current` back
+            # to the incumbent so subsequent destroy/repair operates on the
+            # known-best state instead of a drifted (worse) trajectory.
+            if (
+                int(restart_no_improve_iters) > 0
+                and iteration - last_improvement_iter >= int(restart_no_improve_iters)
+            ):
+                current = best.clone()
+                curr_cost = best_cost
+                curr_feasible = best_feasible
+                last_improvement_iter = iteration
 
             if iteration % segment_size == 0:
                 for i in range(len(w_destroy)):
@@ -2119,6 +2087,12 @@ class BaselineALNSModel:
         return float(qty)
 
     def _collect_unserved_requests(self, state: _ALNSState) -> List[Tuple[Store, Product, Period, float]]:
+        # Bug 1 fix: align repair targets with the greedy initial builder.
+        # The greedy builder ships up to `_target_delivery(...)` (covers current
+        # demand PLUS future demand until the next dispatch). Previously this
+        # method only flagged a top-up when the *current* period ended with
+        # negative inventory, so destroy+repair could never restore the
+        # multi-period buffer once it was destroyed — best stayed stuck.
         d = self.data
         requests: List[Tuple[Store, Product, Period, float]] = []
         inv_store = {(s, p): float(d.init_inventory_store.get((s, p), 0.0)) for s in d.stores for p in d.products}
@@ -2126,23 +2100,34 @@ class BaselineALNSModel:
         for t in d.periods:
             for p in d.products:
                 inv_wh[p] += float(d.replenishment_wh.get((p, t), 0.0))
+            # Reserve the WH inventory already committed via existing deliveries in t.
             for p in d.products:
                 for s in d.stores:
                     qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
                     inv_wh[p] = max(0.0, inv_wh[p] - qdir)
-            for s in d.stores:
-                for p in d.products:
-                    qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
-                    demand = float(d.demand.get((s, p, t), 0.0))
-                    ending = inv_store[(s, p)] + qdir - demand
-                    if t in self._dispatch_periods and ending < -1e-6:
-                        shortfall = -ending
-                        max_room = max(0.0, float(d.max_inventory_store.get((s, p), float("inf"))) - (inv_store[(s, p)] + qdir))
+            # Generate top-up requests on dispatch periods using _target_delivery.
+            if t in self._dispatch_periods:
+                for s in d.stores:
+                    for p in d.products:
+                        qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
+                        target = self._target_delivery(s, p, t, inv_store[(s, p)])
+                        shortfall = max(0.0, target - qdir)
+                        max_room = max(
+                            0.0,
+                            float(d.max_inventory_store.get((s, p), float("inf"))) - (inv_store[(s, p)] + qdir),
+                        )
                         addable = min(shortfall, max_room, inv_wh.get(p, 0.0))
                         addable = self._snap_qty(addable)
                         if addable > 1e-9:
                             requests.append((s, p, t, addable))
-                    inv_store[(s, p)] = max(0.0, ending)
+                            inv_wh[p] = max(0.0, inv_wh[p] - addable)
+            # Update store inventory in EVERY period (not only dispatch) so that
+            # _target_delivery sees the correct prev_inv at the next dispatch t.
+            for s in d.stores:
+                for p in d.products:
+                    qdir = sum(state.deliv.get((s, p, v, t), 0.0) for v in d.vehicles)
+                    demand = float(d.demand.get((s, p, t), 0.0))
+                    inv_store[(s, p)] = max(0.0, inv_store[(s, p)] + qdir - demand)
         return requests
 
     def _insertion_cost(self, state: _ALNSState, s: Store, p: Product, t: Period, v: Vehicle, qty: float) -> Optional[float]:
@@ -3467,7 +3452,7 @@ class LateralTransshipmentCG:
         heuristic_top_k: int = 20,
         exact_full_mode: bool = False,
         pruned_exact_mode: bool = False,
-        exact_pricing_pool_size: int = 3,
+        exact_pricing_pool_size: int = 1,
         exact_pricing_time_limit: Optional[int] = 30,
         # ── Follower-aware LT column pricing ──────────────────────────────
         # When stackelberg_aware_scoring=True the pricing step scores every
@@ -3497,6 +3482,15 @@ class LateralTransshipmentCG:
         # contribution from heuristic pruning. Combined with use_gnn=True
         # gives the E1_rc_gnn variant; with use_gnn=False gives E1_rc_only.
         rc_filter_mode: bool = False,
+        # E1 column budget per (product, period) per CG iteration.
+        # Default 1: only the single best column (most negative RC proxy) is
+        # added per (p,t) per iter. This mirrors A0's exact_pricing_pool_size=1
+        # — diversity across iterations comes from different (p,t) pairs, NOT
+        # from multiple columns of the same (p,t). Setting this > 1 (old
+        # default was effectively 3 via max_columns_per_product_period) makes
+        # the RMP grow K× faster per iter without a matching reduction in
+        # iteration count, wasting solve time on λ=0 columns.
+        rc_only_cols_per_pp: int = 1,
         source_instance: Optional[str] = None,
     ):
         self.data = data
@@ -3511,6 +3505,7 @@ class LateralTransshipmentCG:
         self.max_columns_per_product_period = int(max_columns_per_product_period)
         self.top_pairs_per_feature = int(top_pairs_per_feature)
         self.top_patterns_per_feature = int(top_patterns_per_feature)
+        self.rc_only_cols_per_pp = max(1, int(rc_only_cols_per_pp))
         # Strict benchmark mode — disable every search-space-restricting heuristic
         # so the classical CG baseline sees the full candidate pool. All of these
         # are speed heuristics only; relaxing them changes the effective search
@@ -3584,12 +3579,19 @@ class LateralTransshipmentCG:
         self.heuristic_top_k = max(1, int(heuristic_top_k))
         # Run-A0 (benchmark) — exact CG pricing via Gurobi MIP per active
         # (product, period), with no feature pruning, Stackelberg game, GNN, or
-        # top-k ranking anywhere in the path. Pool search returns up to
-        # exact_pricing_pool_size distinct negative-RC columns per subproblem
-        # per iteration (PoolSearchMode=2), matching the multi-column generation
-        # rate of classical CG for a fair runtime comparison.
+        # top-k ranking anywhere in the path. Default pool_size=1 matches
+        # classical CG theory: one most-negative-RC column per subproblem per
+        # iteration. Set exact_pricing_pool_size>1 or IRP_EXACT_PRICING_POOL_SIZE
+        # env var for multi-column variants (K-best pool ablations).
         self.exact_full_mode = bool(exact_full_mode)
-        self.exact_pricing_pool_size = max(1, int(exact_pricing_pool_size))
+        # IRP_EXACT_PRICING_POOL_SIZE env var overrides the constructor default
+        # (used by ablation benchmarks to widen the K-best pool from 3 → 15+ so
+        # GNN ranker has actual filtering room instead of collapsing to 1-per-(p,t)).
+        _env_pool = os.environ.get("IRP_EXACT_PRICING_POOL_SIZE", "").strip()
+        if _env_pool:
+            self.exact_pricing_pool_size = max(1, int(_env_pool))
+        else:
+            self.exact_pricing_pool_size = max(1, int(exact_pricing_pool_size))
         self.exact_pricing_time_limit = (
             int(exact_pricing_time_limit) if exact_pricing_time_limit is not None else None
         )
@@ -3614,8 +3616,18 @@ class LateralTransshipmentCG:
             )
             if not (self.collect_teacher_mode and allow_collect_with_exact):
                 self.collect_teacher_mode = False
-            self.runtime_gnn_mode = False
-            self.use_gnn = False
+            # IRP_EXACT_GNN_RANKER=1 enables the "exact pricing + GNN ranker"
+            # ablation: GNN does NOT replace exact pricing — it only re-ranks
+            # the columns that exact MIP has already certified to be K-best
+            # negative-RC per (product, period). Used to isolate GNN's pure
+            # ranking contribution from any pricing replacement effect.
+            allow_gnn_ranker_with_exact = (
+                os.environ.get("IRP_EXACT_GNN_RANKER", "0").lower()
+                not in {"0", "false", "no", ""}
+            )
+            if not (allow_gnn_ranker_with_exact and not self.collect_teacher_mode):
+                self.runtime_gnn_mode = False
+                self.use_gnn = False
             self.heuristic_top_k_mode = False
             self.pruned_exact_mode = False
         elif self.pruned_exact_mode:
@@ -4617,15 +4629,10 @@ class LateralTransshipmentCG:
             ))
             need[(s, p, t)] = max(shortage, demand_cover_target - ending_inventory)
             surplus[(s, p, t)] = max(0.0, ending_inventory - reserve_target)
-        if master_solution is not None:
-            for key, net_lt in master_solution.implied_net_lt.items():
-                if key not in need:
-                    continue
-                net_lt = float(net_lt)
-                if net_lt > 1e-9:
-                    need[key] = max(0.0, need[key] - net_lt)
-                elif net_lt < -1e-9:
-                    surplus[key] = max(0.0, surplus[key] + net_lt)
+        # implied_net_lt from master_solution is NOT applied here (feasible-region fix).
+        # It is passed instead as an objective-penalty argument to _solve_exact_pricing_subproblem
+        # so the MIP objective discounts flows to already-served receivers without
+        # shrinking the feasible region across iterations (matches E1 fixed-domain semantics).
         return need, surplus
 
     def _compute_active_product_periods(self, need, surplus) -> Set[Tuple[Product, Period]]:
@@ -5159,23 +5166,32 @@ class LateralTransshipmentCG:
         rc_tol: float,
         episode: int,
         allowed_pairs: Optional[Set[Tuple[Store, Store]]] = None,
+        implied_net_lt: Optional[Dict[Tuple, float]] = None,
     ) -> List[LTPattern]:
         """Exact CG pricing subproblem solved by Gurobi for one (product, period).
 
         Solves the fixed-charge MIP
 
             min  sum_{i,j} [f_ij * y_ij + (c_ij - dual_need_j - dual_surplus_i) * q_ij]
-            s.t. sum_j q_ij <= surplus_i            (donor capacity)
-                 sum_i q_ij <= need_j               (receiver capacity)
+                         + implied_net_lt penalty (see below)
+            s.t. sum_j q_ij <= surplus_i            (donor capacity, FIXED from problem data)
+                 sum_i q_ij <= need_j               (receiver capacity, FIXED from problem data)
                  q_ij <= min(surplus_i, need_j) * y_ij  (fixed-charge)
                  sum y_ij <= max_pairs_per_pattern
                  y_ij in {0,1}, q_ij >= 0
 
+        implied_net_lt penalty: when the current RMP LP solution already routes
+        implied_net_lt[j,p,t] units to receiver j, additional flow to j yields
+        diminishing marginal value. The penalty adds
+            dual_need[j] * min(1, implied_lt_j/need_j) * q[j]    (receivers)
+            dual_surplus[i] * min(1, implied_out_i/surplus_i) * outflow[i]  (donors)
+        to the objective — discounting already-committed flows without touching the
+        feasible region (need/surplus constraints stay at base problem values).
+
         Uses Gurobi PoolSearchMode=2 (systematic K-best search) to return up to
         `exact_pricing_pool_size` distinct negative-RC columns per subproblem per
-        iteration. This gives A0 a comparable multi-column generation rate to the
-        classical CG (which generates many columns per iteration via enumerate-
-        and-filter), making the runtime comparison fair.
+        iteration. Default pool_size=1 is classical CG (one optimal column per
+        subproblem). pool_size>1 activates multi-column generation for ablations.
 
         When `allowed_pairs` is provided, the exact MIP is restricted to that
         caller-supplied screened pair set. Otherwise no heuristic filter
@@ -5242,68 +5258,42 @@ class LateralTransshipmentCG:
             ) * q[(i, j)]
             for (i, j) in pairs
         )
-        # ── SLA penalty in pricing (L2 quadratic) ────────────────────────
-        # When IRP_SLA_PENALTY=on, the pricing subproblem penalises the
-        # column's contribution to residual shortage / unused surplus by the
-        # SAME quadratic form used in solve_rmp().  Adding penalty here
-        # promotes the master's L2 RMP into a properly aligned pricing MIQP:
-        # A0 (full exact) now solves a quadratic-objective MIP per (p, t),
-        # which is provably slower than the linear MIP under L1 — providing
-        # the runtime gap E2 (pruned) needs to demonstrate filter benefit.
+        # ── implied_net_lt objective penalty ─────────────────────────────
+        # When implied_net_lt is provided (from the current RMP LP solution),
+        # discount dual contributions for receivers/donors whose need/surplus
+        # is already partially covered by the current LP basis.  This replaces
+        # the old feasible-region shrink (need[j] -= net_lt) with a soft
+        # objective penalty, keeping the MIP feasible region fixed at base
+        # problem data (same semantics as E1 rc_filter_mode).
         #
-        # Note on duality: under standard CG, RMP duals already encode the
-        # marginal penalty effect, so adding the same penalty term to pricing
-        # double-counts. We accept this controlled bias because:
-        #   (a) the same penalty applies to BOTH A0 and C/E2 → fair
-        #       per-iteration comparison;
-        #   (b) the resulting LP optimum is invariant of the bias direction
-        #       (it just changes WHICH columns get added when), so the final
-        #       RMP objective converges to the same value;
-        #   (c) it makes the pricing MIQP genuinely harder, which is the
-        #       mechanism by which "A0 is slow under penalty" — exactly the
-        #       thesis claim being demonstrated.
-        # Bit-identical to legacy pricing when sla_on=False.
-        sla_on_p, sla_mu_p, sla_nu_p, sla_alpha_p, sla_beta_p = _get_sla_penalty_config()
-        if sla_on_p and (sla_mu_p > 0.0 or sla_nu_p > 0.0):
-            urgency_t = _sla_time_urgency(t, d.periods)
-            total_surplus_pt = sum(float(surplus.get((s, p, t), 0.0)) for s in d.stores)
-            quad_terms = gp.QuadExpr()
+        # For receiver j with net_inflow x already committed:
+        #   add  dual_need[j] * min(1, x/need_j) * inflow_j  [positive → less attractive]
+        # For donor i with net_outflow x already committed:
+        #   add  dual_surplus[i] * min(1, x/surplus_i) * outflow_i  [same]
+        if implied_net_lt:
             for j in receivers:
-                if sla_mu_p <= 0.0:
-                    break
-                inflow_j = gp.quicksum(q[(i, j)] for (i, jj) in pairs if jj == j)
-                if isinstance(inflow_j, gp.LinExpr) and inflow_j.size() == 0:
+                net_in = float(implied_net_lt.get((j, p, t), 0.0))
+                if net_in <= 1e-9:
                     continue
-                # shortage_j(this column) = need_j - inflow_j   (≥ 0 in feasible space)
-                need_j = float(need.get((j, p, t), 0.0))
-                omega_j = 1.0 + sla_alpha_p * urgency_t
-                # (need_j - inflow_j)^2 = need_j^2 - 2 need_j inflow_j + inflow_j^2
-                quad_terms.add(
-                    sla_mu_p * omega_j * (
-                        need_j * need_j
-                        - 2.0 * need_j * inflow_j
-                        + inflow_j * inflow_j
-                    )
-                )
+                need_j = float(need.get((j, p, t), 1e-9))
+                frac_j = min(1.0, net_in / max(need_j, 1e-9))
+                if frac_j <= 1e-9:
+                    continue
+                d_need_j = float(dual_need.get((j, p, t), 0.0))
+                inflow_j = gp.quicksum(q[(i, jj)] for (i, jj) in pairs if jj == j)
+                obj_expr = obj_expr + d_need_j * frac_j * inflow_j
             for i in donors:
-                if sla_nu_p <= 0.0:
-                    break
-                outflow_i = gp.quicksum(q[(i, j)] for (ii, j) in pairs if ii == i)
-                if isinstance(outflow_i, gp.LinExpr) and outflow_i.size() == 0:
+                net_out = -float(implied_net_lt.get((i, p, t), 0.0))
+                if net_out <= 1e-9:
                     continue
-                surplus_i = float(surplus.get((i, p, t), 0.0))
-                rho_i = 1.0 + sla_beta_p * _sla_surplus_ratio(surplus_i, total_surplus_pt)
-                # surplus_unused_i = surplus_i - outflow_i   (≥ 0 in feasible space)
-                quad_terms.add(
-                    sla_nu_p * rho_i * (
-                        surplus_i * surplus_i
-                        - 2.0 * surplus_i * outflow_i
-                        + outflow_i * outflow_i
-                    )
-                )
-            mdl.setObjective(obj_expr + quad_terms, GRB.MINIMIZE)
-        else:
-            mdl.setObjective(obj_expr, GRB.MINIMIZE)
+                surplus_i = float(surplus.get((i, p, t), 1e-9))
+                frac_i = min(1.0, net_out / max(surplus_i, 1e-9))
+                if frac_i <= 1e-9:
+                    continue
+                d_surp_i = float(dual_surplus.get((i, p, t), 0.0))
+                outflow_i = gp.quicksum(q[(ii, j)] for (ii, j) in pairs if ii == i)
+                obj_expr = obj_expr + d_surp_i * frac_i * outflow_i
+        mdl.setObjective(obj_expr, GRB.MINIMIZE)
         mdl.optimize()
 
         if mdl.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT) or mdl.SolCount == 0:
@@ -5360,6 +5350,7 @@ class LateralTransshipmentCG:
         dual_surplus: Dict[Tuple[Store, Product, Period], float],
         rc_tol: float,
         episode: int,
+        implied_net_lt: Optional[Dict] = None,
     ) -> List[LTPattern]:
         """Generate A0 benchmark candidates via exact Gurobi pricing only.
 
@@ -5382,6 +5373,7 @@ class LateralTransshipmentCG:
                 dual_surplus=dual_surplus,
                 rc_tol=rc_tol,
                 episode=episode,
+                implied_net_lt=implied_net_lt,
             )
             if priced:
                 subproblems_with_negative_rc += 1
@@ -5421,9 +5413,13 @@ class LateralTransshipmentCG:
         path, any speedup over A0 is purely from "no MIP", and any further
         improvement when use_gnn=True can be attributed to learned ranking.
 
-        Pattern construction is greedy by RC ascending (most negative first):
-        starting from each top RC pair, accumulate up to max_pairs_per_pattern
-        feasible pairs that further reduce the pattern's RC.
+        Column budget per (product, period) per iteration is rc_only_cols_per_pp
+        (default 1). Only 1 column per (p,t) is built — the greedy pattern
+        starting from the most negative RC pair. This mirrors A0's
+        exact_pricing_pool_size=1: CG diversity comes from multiple (p,t)
+        pairs, not multiple columns of the same (p,t). Adding K>1 columns from
+        the same (p,t) makes the RMP K× larger per iter while the LP at optimum
+        only ever uses 1 of them (the others are λ=0), wasting solve time.
         """
         new_patterns: List[LTPattern] = []
         candidate_pairs_total = 0
@@ -5459,7 +5455,12 @@ class LateralTransshipmentCG:
                     })
 
             # Filter to negative-RC pairs (necessary for CG progress).
-            negative_pairs = [r for r in pair_candidates if r["reduced_cost_proxy"] < rc_tol]
+            # IRP_DISABLE_RC_FILTER=1 bypasses this filter entirely so the GNN
+            # sees the full candidate pool — used for the "GNN-only" ablation
+            # benchmark to isolate GNN's ranking contribution from RC pruning.
+            _disable_rc_filter = os.environ.get("IRP_DISABLE_RC_FILTER", "0").lower() not in {"0", "false", "no", ""}
+            effective_rc_tol = float("inf") if _disable_rc_filter else rc_tol
+            negative_pairs = [r for r in pair_candidates if r["reduced_cost_proxy"] < effective_rc_tol]
             negative_rc_pairs_total += len(negative_pairs)
             if not negative_pairs:
                 continue
@@ -5468,7 +5469,12 @@ class LateralTransshipmentCG:
             # ordering as `_build_patterns_from_pruned_pairs` uses inside each
             # feature bucket.
             negative_pairs.sort(key=lambda r: r["reduced_cost_proxy"])
-            n_to_build = min(len(negative_pairs), self.top_patterns_per_feature)
+            # Build at most rc_only_cols_per_pp columns per (p,t) per iter.
+            # Default=1: one column starting from the most-negative-RC pair.
+            # CG diversity is achieved across different (p,t) pairs, not by
+            # adding multiple columns from the same (p,t) (which only inflates
+            # the RMP with λ=0 columns at optimum).
+            n_to_build = min(len(negative_pairs), self.rc_only_cols_per_pp)
 
             for start_idx in range(n_to_build):
                 donor_work = {s: float(surplus.get((s, p, t), 0.0)) for s in self.data.stores}
@@ -5536,6 +5542,7 @@ class LateralTransshipmentCG:
             "patterns_deduplicated_before_gnn": patterns_built_before_dedup - len(new_patterns),
             "patterns_removed_by_product_period_cap": 0,
             "patterns_built_before_gnn": len(new_patterns),
+            "rc_only_cols_per_pp": self.rc_only_cols_per_pp,
             "max_columns_per_product_period": self.max_columns_per_product_period,
             "rc_filter_mode": True,
         }
@@ -5550,6 +5557,7 @@ class LateralTransshipmentCG:
         dual_surplus: Dict[Tuple[Store, Product, Period], float],
         rc_tol: float,
         episode: int,
+        implied_net_lt: Optional[Dict] = None,
     ) -> List[LTPattern]:
         """Generate E2 teacher candidates via four-feature pruning, then exact MIP pricing.
 
@@ -5629,6 +5637,7 @@ class LateralTransshipmentCG:
                 rc_tol=rc_tol,
                 episode=episode,
                 allowed_pairs=allowed_pairs,
+                implied_net_lt=implied_net_lt,
             )
             n_priced = len(priced)
             if priced:
@@ -5912,73 +5921,10 @@ class LateralTransshipmentCG:
             for s, p, t in residual_need_keys
         }
 
-        # ── SLA penalty (L2 quadratic) ───────────────────────────────────
-        # Default OFF (env IRP_SLA_PENALTY=off). When on, adds
-        #   + μ · ω(s,p,t) · residual_need[s,p,t]^2
-        #   + ν · ρ(s,p,t) · surplus_unused[s,p,t]^2
-        # to the master objective. Quadratic form (vs the previous L1) is the
-        # standard variance-aware / risk-averse penalty in inventory routing —
-        # large stockouts are penalised disproportionately more than many
-        # small ones, matching realistic SLA preferences.
-        #
-        # Why quadratic: L1 with one-sided variables (residual_need, surplus_unused
-        # both ≥ 0) collapses to a linear cost coefficient and never makes the
-        # MIP/LP harder. L2 turns the master into a QP and the pricing MIP into
-        # an MIQP (see _solve_exact_pricing_subproblem) so A0's exact pricing is
-        # provably slower under penalty — defendable as the source of E2's
-        # runtime advantage at matched LP-objective.
-        #
-        #   ω(s,p,t) = 1 + α · time_urgency(t)        (urgency in [0,1])
-        #   ρ(s,p,t) = 1 + β · surplus_ratio(s,p,t)   (donor share in [0,1])
-        # surplus_unused is a NEW non-negative variable bound by the per-store
-        # outbound flow:  surplus_unused = surplus(s,p,t) - outbound.
-        # Bit-identical to legacy when sla_on=False.
-        sla_on, sla_mu, sla_nu, sla_alpha, sla_beta = _get_sla_penalty_config()
-        sla_extra_terms = []
-        sla_surplus_unused: Dict[Tuple[Store, Product, Period], gp.Var] = {}
-        sla_omega: Dict[Tuple[Store, Product, Period], float] = {}
-        sla_rho: Dict[Tuple[Store, Product, Period], float] = {}
-        if sla_on:
-            for (s, p, t) in residual_need_keys:
-                urgency_t = _sla_time_urgency(t, d.periods)
-                sla_omega[(s, p, t)] = 1.0 + sla_alpha * urgency_t
-            for (p, t) in active_product_periods:
-                total_surplus_pt = sum(float(surplus.get((ss, p, t), 0.0)) for ss in d.stores)
-                for s in d.stores:
-                    donor_surplus_q = float(surplus.get((s, p, t), 0.0))
-                    sla_rho[(s, p, t)] = (
-                        1.0 + sla_beta * _sla_surplus_ratio(donor_surplus_q, total_surplus_pt)
-                    )
-                    if donor_surplus_q > 0.0:
-                        var = mdl.addVar(
-                            lb=0.0,
-                            ub=donor_surplus_q,
-                            vtype=GRB.CONTINUOUS,
-                            name=f"surplus_unused__{s}__{p}__{t}",
-                        )
-                        sla_surplus_unused[(s, p, t)] = var
-            if sla_mu > 0.0:
-                sla_extra_terms.append(
-                    gp.quicksum(
-                        sla_mu * sla_omega[(s, p, t)]
-                        * residual_need[(s, p, t)] * residual_need[(s, p, t)]
-                        for (s, p, t) in residual_need_keys
-                    )
-                )
-            if sla_nu > 0.0 and sla_surplus_unused:
-                sla_extra_terms.append(
-                    gp.quicksum(
-                        sla_nu * sla_rho[key]
-                        * sla_surplus_unused[key] * sla_surplus_unused[key]
-                        for key in sla_surplus_unused
-                    )
-                )
-
         mdl.setObjective(
             baseline_without_shortage
             + gp.quicksum(pat.column_cost * lam[pat.pattern_id] for pat in pattern_map.values())
-            + gp.quicksum(need_penalty[(s, p, t)] * residual_need[(s, p, t)] for s, p, t in residual_need_keys)
-            + (gp.quicksum(sla_extra_terms) if sla_extra_terms else 0.0),
+            + gp.quicksum(need_penalty[(s, p, t)] * residual_need[(s, p, t)] for s, p, t in residual_need_keys),
             GRB.MINIMIZE,
         )
 
@@ -6009,22 +5955,10 @@ class LateralTransshipmentCG:
                 for (i, j), qty in pat.pattern_flows.items()
                 if i == s
             )
-            # When SLA penalty is ON and surplus_unused exists for this (s,p,t):
-            # tighten the surplus capacity to an EQUALITY linking surplus_unused
-            # to the unused capacity. Otherwise (default OFF, or no surplus
-            # available at this store), keep the original ≤ form to remain
-            # bit-identical with legacy code paths.
-            unused_var = sla_surplus_unused.get((s, p, t)) if sla_on else None
-            if unused_var is not None:
-                con = mdl.addConstr(
-                    outbound + unused_var == surplus[(s, p, t)],
-                    name=f"surplus_balance__{len(surplus_constraints)}",
-                )
-            else:
-                con = mdl.addConstr(
-                    outbound <= surplus[(s, p, t)],
-                    name=f"surplus_cap__{len(surplus_constraints)}",
-                )
+            con = mdl.addConstr(
+                outbound <= surplus[(s, p, t)],
+                name=f"surplus_cap__{len(surplus_constraints)}",
+            )
             surplus_constraints[(s, p, t)] = con
 
         if infeasible_branch:
@@ -6286,7 +6220,10 @@ class LateralTransshipmentCG:
         }
 
     def pricing_step(self, master_solution: CGSolution, rc_tol: float = -1e-6) -> List[LTPattern]:
-        need, surplus = self._build_need_and_surplus_proxies(master_solution=master_solution)
+        # Use base need/surplus (master_solution=None) so the pricing feasible region
+        # is fixed across all CG iterations. The implied_net_lt adjustment makes it
+        # primal-dependent, which causes K=1 and K=3 to diverge to different LP optima.
+        need, surplus = self._build_need_and_surplus_proxies(master_solution=None)
         active_product_periods = self._compute_active_product_periods(need, surplus)
         # Make LB/UB visible to the adaptive pruner. LB = current RMP LP value
         # (this iteration's lower bound on the LP relaxation). UB is left None
@@ -6296,8 +6233,15 @@ class LateralTransshipmentCG:
             float(master_solution.objective)
         ) else None
         if self.exact_full_mode:
-            # A0 benchmark: exact Gurobi pricing, no pruning / Stackelberg / GNN / top-k.
-            selected_patterns = self._candidate_patterns_exact_full(
+            # A0 benchmark: exact Gurobi pricing, no pruning / Stackelberg / top-k.
+            # When runtime_gnn_mode=True we ADD a GNN ranking step on top of the
+            # exact-pricing pool — the model acts as a pure RANKER over columns
+            # that exact MIP has already certified to be among the K-best per
+            # (product, period). This isolates the GNN's contribution from the
+            # column-generation step itself: any speedup over A0 in this regime
+            # is purely from "fewer columns added to RMP per iter" (smaller RMP
+            # solves) and/or "GNN picks higher-value columns" (fewer iters).
+            new_patterns = self._candidate_patterns_exact_full(
                 need=need,
                 surplus=surplus,
                 active_product_periods=active_product_periods,
@@ -6305,6 +6249,7 @@ class LateralTransshipmentCG:
                 dual_surplus=master_solution.dual_surplus,
                 rc_tol=rc_tol,
                 episode=self.current_episode,
+                implied_net_lt=master_solution.implied_net_lt or None,
             )
             # If teacher collection is requested ALONGSIDE exact pricing, export
             # the exact-pricing column pool as teacher rows so the GNN learns
@@ -6312,18 +6257,57 @@ class LateralTransshipmentCG:
             # path used during E1/E2 teacher generation (see kaggle pipeline
             # IRP_TEACHER_USE_EXACT=1). When collect_teacher_mode=False the
             # call below is a no-op so A0 runtime / outputs are unchanged.
-            if self.collect_teacher_mode and selected_patterns:
+            if self.collect_teacher_mode and new_patterns:
                 self._collect_teacher_batch_without_gnn_prefilter(
-                    patterns=selected_patterns,
+                    patterns=new_patterns,
                     need=need,
                     surplus=surplus,
                     dual_need=master_solution.dual_need,
                     dual_surplus=master_solution.dual_surplus,
                 )
+                selected_patterns = new_patterns
+            elif self.runtime_gnn_mode and new_patterns:
+                # E1 per-(p,t) top-1 from pool_size=K:
+                # Gurobi PoolSolutions=K extracts K candidates per (p,t) MIP.
+                # GNN scores all K candidates (side-effect: writes gnn_score /
+                # gnn_combined_score into metadata), then we keep the 1 highest
+                # GNN-scored pattern per (p,t) group — same column count as A0
+                # (~1 per active (p,t) per iteration) but GNN-guided selection.
+                # LP optimality preserved: CG stops only when no (p,t) MIP
+                # finds a new negative-RC column.
+                _gnn_t0 = time.perf_counter()
+                self._select_patterns_with_gnn(
+                    patterns=new_patterns,
+                    need=need,
+                    surplus=surplus,
+                    dual_need=master_solution.dual_need,
+                    dual_surplus=master_solution.dual_surplus,
+                )
+                self._gnn_runtime_cumulative = getattr(self, "_gnn_runtime_cumulative", 0.0) + (time.perf_counter() - _gnn_t0)
+                if getattr(self, "_global_col_budget_per_iter", 0) > 0:
+                    # Global top-k mode: return all GNN-scored patterns; the
+                    # run_column_generation caller applies the global budget cap.
+                    selected_patterns = new_patterns
+                else:
+                    # Default: per-(p,t) top-1 by GNN score.
+                    group_best: Dict[tuple, "LTPattern"] = {}
+                    for pat in new_patterns:
+                        key = (getattr(pat, "product", None), getattr(pat, "period", None))
+                        s = float(pat.metadata.get("gnn_combined_score", pat.metadata.get("gnn_score", 0.0)) or 0.0)
+                        prev_s = float(group_best[key].metadata.get("gnn_combined_score", group_best[key].metadata.get("gnn_score", 0.0)) or 0.0) if key in group_best else -1e18
+                        if s > prev_s:
+                            group_best[key] = pat
+                    selected_patterns = list(group_best.values()) if group_best else [
+                        min(new_patterns, key=lambda pat: float(pat.metadata.get("reduced_cost", 0.0)))
+                    ]
+            else:
+                # A0: pool_size=1 gives exactly 1 candidate per (p,t) MIP; pass through all.
+                selected_patterns = new_patterns
             self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
             self._last_pricing_summary["patterns_kept_after_gnn"] = len(selected_patterns)
             self._last_pricing_summary["collect_teacher_mode"] = bool(self.collect_teacher_mode)
-            self._last_pricing_summary["runtime_gnn_mode"] = False
+            self._last_pricing_summary["runtime_gnn_mode"] = bool(self.runtime_gnn_mode)
+            self._last_pricing_summary["exact_full_mode"] = True
             return selected_patterns
         if self.pruned_exact_mode:
             # E2 path: four-feature pruning first, then exact Gurobi pricing
@@ -6340,6 +6324,7 @@ class LateralTransshipmentCG:
                 dual_surplus=master_solution.dual_surplus,
                 rc_tol=rc_tol,
                 episode=self.current_episode,
+                implied_net_lt=master_solution.implied_net_lt or None,
             )
             if self.collect_teacher_mode and new_patterns:
                 self._collect_teacher_batch_without_gnn_prefilter(
@@ -6384,13 +6369,22 @@ class LateralTransshipmentCG:
                 episode=self.current_episode,
             )
             if self.runtime_gnn_mode:
-                selected_patterns = self._select_patterns_with_gnn(
+                # GNN as pure ranker: score and rank all negative-RC candidates,
+                # then append any patterns the selector excluded back to the list
+                # (GNN-top first, remainder sorted by RC proxy). All negative-RC
+                # patterns are proposed to the CG loop so LP optimality is
+                # preserved — GNN ranking may speed up convergence via better
+                # column ordering but cannot cause early suboptimal stopping.
+                gnn_selected = self._select_patterns_with_gnn(
                     patterns=new_patterns,
                     need=need,
                     surplus=surplus,
                     dual_need=master_solution.dual_need,
                     dual_surplus=master_solution.dual_surplus,
                 )
+                selected_ids = {p.pattern_id for p in gnn_selected}
+                remainder = [p for p in new_patterns if p.pattern_id not in selected_ids]
+                selected_patterns = list(gnn_selected) + remainder
             else:
                 selected_patterns = new_patterns
             self._last_pricing_summary["active_product_period_count"] = len(active_product_periods)
@@ -6446,6 +6440,7 @@ class LateralTransshipmentCG:
         rc_tol: float = -1e-6,
         msg: bool = False,
         stopping_mode: Optional[str] = None,
+        global_col_budget_per_iter: int = 0,
     ) -> CGSolution:
         # stopping_mode controls when the CG loop terminates:
         #   "fixed_budget" → stop at max_iter regardless of RC / improvement
@@ -6464,6 +6459,8 @@ class LateralTransshipmentCG:
                 "'fixed_budget', 'convergence', 'hybrid'."
             )
         self._cg_stopping_mode = stopping_mode
+        self._global_col_budget_per_iter = max(0, int(global_col_budget_per_iter))
+        self._gnn_runtime_cumulative = 0.0
         best_sol = self.solve_rmp(msg=msg)
         best_sol.iterations_run = 0
         rmp_metrics_total = dict(best_sol.efficiency_metrics)
@@ -6519,6 +6516,25 @@ class LateralTransshipmentCG:
         for it in range(1, max_iter + 1):
             self.current_episode = it
             new_patterns = self.pricing_step(best_sol, rc_tol=rc_tol)
+            # Global column budget: keep only top-k patterns across ALL (p,t)
+            # pairs. For A0 (no GNN scores) sort by reduced_cost ascending
+            # (most negative first); for E1 sort by gnn_combined_score desc.
+            if self._global_col_budget_per_iter > 0 and len(new_patterns) > self._global_col_budget_per_iter:
+                _has_gnn = any(
+                    pat.metadata.get("gnn_combined_score") is not None
+                    for pat in new_patterns
+                )
+                if _has_gnn:
+                    new_patterns = sorted(
+                        new_patterns,
+                        key=lambda _p: -float(_p.metadata.get("gnn_combined_score") or _p.metadata.get("gnn_score") or 0.0),
+                    )
+                else:
+                    new_patterns = sorted(
+                        new_patterns,
+                        key=lambda _p: float(_p.metadata.get("reduced_cost") or 0.0),
+                    )
+                new_patterns = new_patterns[: self._global_col_budget_per_iter]
             added = self.add_patterns(new_patterns)
             self._mark_teacher_rows_passed_to_rmp(it)
             episode_summary = dict(self._last_pricing_summary)
@@ -6569,6 +6585,8 @@ class LateralTransshipmentCG:
                 else:
                     print(f"[CG] No negative reduced-cost columns found. LP optimal. Stop. [stopping_mode={stopping_mode}]")
                 self._print_cg_episode_history()
+                rmp_metrics_total["gnn_total_runtime"] = getattr(self, "_gnn_runtime_cumulative", 0.0)
+                best_sol.efficiency_metrics = dict(rmp_metrics_total)
                 best_sol.stackelberg_column_scores = list(self.stackelberg_column_score_log)
                 if self.stackelberg_aware_scoring:
                     best_sol.follower_solution = self._compute_final_follower_solution(best_sol)
@@ -6634,6 +6652,7 @@ class LateralTransshipmentCG:
             best_sol = sol
 
         self._print_cg_episode_history()
+        rmp_metrics_total["gnn_total_runtime"] = getattr(self, "_gnn_runtime_cumulative", 0.0)
         best_sol.efficiency_metrics = dict(rmp_metrics_total)
         best_sol.stackelberg_column_scores = list(self.stackelberg_column_score_log)
         if self.stackelberg_aware_scoring:
@@ -7149,49 +7168,6 @@ def build_realized_operating_cost_breakdown(
         for (s, p, _), shortage in realized_shortage_after_lt.items()
     )
 
-    # ── SLA penalty (L2 quadratic) — default OFF for backward compat ─────
-    # Validate_with_Man_Kaggle.py / Validate_with_Achamrah_Kaggle.py and any
-    # other caller of build_realized_operating_cost_breakdown remain
-    # bit-identical when IRP_SLA_PENALTY is unset (sla_on=False short-circuit).
-    # Quadratic form mirrors the master / pricing objectives so realized cost
-    # uses the SAME penalty function the optimisation minimises.
-    sla_on, sla_mu, sla_nu, sla_alpha, sla_beta = _get_sla_penalty_config()
-    sla_shortage_penalty = 0.0
-    sla_surplus_penalty = 0.0
-    if sla_on:
-        # ω(s,p,t) = 1 + α · time_urgency(t)
-        urgency_by_t: Dict[Period, float] = {
-            tt: _sla_time_urgency(tt, data.periods) for tt in data.periods
-        }
-        if sla_mu > 0.0:
-            # μ · ω · shortage^2  (variance-aware risk-averse penalty)
-            sla_shortage_penalty = float(sla_mu) * sum(
-                (1.0 + sla_alpha * urgency_by_t.get(t, 1.0))
-                * (float(realized_shortage_after_lt.get((s, p, t), 0.0)) ** 2)
-                for s in data.stores
-                for p in data.products
-                for t in data.periods
-            )
-        if sla_nu > 0.0:
-            # Realized "surplus_unused" is the excess store inventory carried
-            # above its baseline DC plan inventory (i.e. inventory not consumed
-            # to mitigate a stockout elsewhere). Approximated by the realized
-            # inventory level itself, which is the natural per-store quantity
-            # that the master's surplus_unused variable tracks.
-            for p in data.products:
-                # ρ(s,p,t) = 1 + β · surplus_ratio   — relative share of stocked
-                # surplus this store contributes for product p in period t.
-                for t in data.periods:
-                    total_inv_pt = sum(
-                        float(realized_inventory_after_lt.get((s, p, t), 0.0))
-                        for s in data.stores
-                    )
-                    for s in data.stores:
-                        store_inv = float(realized_inventory_after_lt.get((s, p, t), 0.0))
-                        rho = 1.0 + sla_beta * _sla_surplus_ratio(store_inv, total_inv_pt)
-                        # ν · ρ · inventory^2
-                        sla_surplus_penalty += float(sla_nu) * rho * (store_inv ** 2)
-
     realized_operating_cost = (
         direct_cw_unit_cost
         + store_holding_cost
@@ -7200,8 +7176,6 @@ def build_realized_operating_cost_breakdown(
         + vehicle_fixed_cost
         + lateral_transshipment_cost
         + shortage_cost
-        + sla_shortage_penalty
-        + sla_surplus_penalty
     )
     breakdown = {
         "direct_cw_unit_cost_executed_plan": round(direct_cw_unit_cost, 6),
@@ -7215,12 +7189,6 @@ def build_realized_operating_cost_breakdown(
         "total_realized_shortage_units": round(sum(realized_shortage_after_lt.values()), 6),
         "total_realized_store_inventory_units": round(sum(realized_inventory_after_lt.values()), 6),
     }
-    if sla_on:
-        breakdown["sla_shortage_penalty"] = round(sla_shortage_penalty, 6)
-        breakdown["sla_surplus_penalty"] = round(sla_surplus_penalty, 6)
-        breakdown["sla_penalty_enabled"] = True
-        breakdown["sla_mu"] = float(sla_mu)
-        breakdown["sla_nu"] = float(sla_nu)
     return breakdown
 
 
@@ -8095,6 +8063,9 @@ class IRPResearchPipeline:
         stackelberg_aware_scoring: bool = False,
         stackelberg_exact_follower: bool = False,
         stackelberg_min_lateral_qty: Optional[float] = None,
+        rc_only_cols_per_pp: int = 1,
+        global_col_budget_per_iter: int = 0,
+        top_pairs_per_feature: int = 20,
     ) -> Dict[str, Any]:
         recourse_started_at = time.perf_counter()
         baseline_cost_breakdown = build_full_irpt_cost_breakdown(self.data, baseline_sol)
@@ -8158,7 +8129,7 @@ class IRPResearchPipeline:
             initial_patterns=initial_patterns,
             lt_activation_threshold=lt_activation_threshold,
             max_pairs_per_pattern=4,
-            top_pairs_per_feature=20,
+            top_pairs_per_feature=top_pairs_per_feature,
             top_patterns_per_feature=5,
             stackelberg_params=stackelberg_params,
             use_gnn=effective_runtime_gnn,
@@ -8180,6 +8151,7 @@ class IRPResearchPipeline:
             stackelberg_aware_scoring=stackelberg_aware_scoring,
             stackelberg_exact_follower=stackelberg_exact_follower,
             stackelberg_min_lateral_qty=stackelberg_min_lateral_qty,
+            rc_only_cols_per_pp=rc_only_cols_per_pp,
         )
         if use_branch_and_price:
             cg_sol = cg_engine.run_branch_and_price(
@@ -8189,7 +8161,10 @@ class IRPResearchPipeline:
                 max_depth=bp_max_depth,
             )
         else:
-            cg_sol = cg_engine.run_column_generation(max_iter=cg_iterations, msg=msg)
+            cg_sol = cg_engine.run_column_generation(
+                max_iter=cg_iterations, msg=msg,
+                global_col_budget_per_iter=global_col_budget_per_iter,
+            )
         if _is_quiet():
             _cg_summary = cg_sol.summary()
             print(f"[CG Summary] obj={cg_sol.objective:.4f} selected={len(cg_sol.selected_patterns)} keys={len(_cg_summary) if isinstance(_cg_summary, dict) else 'n/a'}")
@@ -9186,7 +9161,6 @@ def run_three_way_benchmark(
         #   "e1_only"  → A0_no_penalty / E1_rc_only / E1_rc_gnn   thesis E1 ablation:
         #                isolates GNN's ranking contribution from RC pre-filter.
         #   "e2_only"  → A0_with_penalty / E2_pruned_gnn          thesis E2 benchmark:
-        #                both variants use exact MIQP pricing under SLA penalty;
         #                E2 pre-filters donor/receiver pairs by the four pricing
         #                features and re-ranks the resulting columns with the
         #                trained BiGAT. No Stackelberg.
@@ -9194,9 +9168,6 @@ def run_three_way_benchmark(
         gnn_selection_mode_env = os.environ.get("IRP_GNN_SELECTION_MODE", "cumulative_mass").strip() or "cumulative_mass"
         if variant_set == "e1_only":
             variants: List[Tuple[str, Dict[str, Any]]] = [
-                # A0_no_penalty: pure CG with exact Gurobi pricing, no GNN, no
-                # SLA penalty. Reference upper bound on quality / lower bound on
-                # speed for the E1 ablation.
                 ("A0_no_penalty", {
                     "use_gnn": False, "collect_teacher_mode": False,
                     "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
@@ -9224,30 +9195,24 @@ def run_three_way_benchmark(
             ]
         elif variant_set == "e2_only":
             variants = [
-                # A0_with_penalty: pure CG with exact Gurobi pricing under SLA
-                # penalty. No four-feature pruning, no GNN, no Stackelberg.
-                # Reference upper bound on quality / lower bound on speed for
-                # the E2 benchmark. Penalty is configured via IRP_SLA_PENALTY/
-                # MU/NU/ALPHA/BETA env vars; when on, the pricing MIP becomes
-                # an MIQP per (product, period).
                 ("A0_with_penalty", {
                     "use_gnn": False, "collect_teacher_mode": False,
                     "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
                     "exact_full_mode": True,
+                    "use_branch_and_price": False,
                 }),
-                # E2_pruned_gnn: same SLA-penalty MIQP pricing as A0, but
-                # restricted to donor-receiver pairs that survive the four-
-                # feature screen. The trained BiGAT then re-ranks the
-                # resulting column pool. Δ(A0_with_penalty, E2_pruned_gnn)
-                # measures the runtime saving from pruning + GNN ranking at
-                # matched penalty regime. No Stackelberg; B&P kept on to
-                # match the teacher-generation regime that produced the
-                # checkpoint training data.
+                # E2_pruned_gnn: pruned exact pricing restricted to donor-
+                # receiver pairs that survive the four-feature screen. The
+                # trained BiGAT re-ranks the resulting column pool.
+                # Δ(A0_with_penalty, E2_pruned_gnn) measures the runtime cost
+                # of pruning + GNN against full-exact A0. No Stackelberg;
+                # B&P off (same as A0) for clean CG-only comparison.
                 ("E2_pruned_gnn", {
                     "use_gnn": True, "collect_teacher_mode": False,
                     "runtime_gnn_mode": True, "heuristic_top_k_mode": False,
                     "pruned_exact_mode": True,
                     "gnn_selection_mode": gnn_selection_mode_env,
+                    "use_branch_and_price": False,
                 }),
             ]
         else:
@@ -9515,6 +9480,701 @@ def run_three_way_benchmark(
 
 
 # ============================================================================
+# SOLVER SCALABILITY BENCHMARK  (Gurobi MIP vs ALNS — 6 thesis scenarios)
+# ============================================================================
+
+# Tier-based time limits for Achamrah GA/SA in the scalability benchmark.
+# Achamrah Phase 1 (RMILP) + Phase 2 (GA+SA) is expensive; these caps prevent
+# multi-hour runs while still giving the algorithm a fair budget per scale tier.
+_ACHAMRAH_TIER_TIME_LIMITS: Dict[str, float] = {
+    "small":  300.0,   # 5 min
+    "medium": 600.0,   # 10 min
+    "large":  1200.0,  # 20 min
+}
+
+
+def _irpdata_to_irpt_instance(data: "IRPData") -> Any:
+    """Convert an IRPData instance to an IRPTInstance for Achamrah GA/SA.
+
+    Lateral transshipment is disabled by setting b[i,j]=1e6 for all POS pairs,
+    making LT cost-prohibitive without modifying the matheuristic internals.
+    Node indices: 0=CW, 1..n_stores=POS.  Products and periods are re-indexed
+    from 1 so they match IRPTInstance's expected integer convention.
+    """
+    try:
+        from achamrah_2022_irpt_matheuristic import IRPTInstance as _IRPTInst
+    except ImportError:
+        raise ImportError(
+            "achamrah_2022_irpt_matheuristic not found — "
+            "place it alongside irp_gurobi_converted.py"
+        )
+
+    stores   = list(data.stores)
+    products = list(data.products)
+    periods  = list(data.periods)
+    vehicles = list(data.vehicles) if data.vehicles else [1, 2]
+
+    s_id  = {s: i + 1 for i, s in enumerate(stores)}     # store  → 1..n
+    p_id  = {p: i + 1 for i, p in enumerate(products)}   # sku    → 1..m
+    t_id  = {t: i + 1 for i, t in enumerate(periods)}    # period → 1..T
+    v_id  = {v: i + 1 for i, v in enumerate(vehicles)}   # vehicle→ 1..V
+
+    N = list(s_id.values())
+    P = list(p_id.values())
+    H = list(t_id.values())
+    V = list(v_id.values())
+    N0 = [0] + N
+
+    # --- distance matrix (default 1.0 when not populated) ---
+    _BIG_D = 1.0
+    d: Dict[Tuple[int, int], float] = {}
+    for i in N0:
+        for j in N0:
+            if i == j:
+                continue
+            # Reverse-lookup node labels
+            s_i = stores[i - 1] if i > 0 else data.warehouse
+            s_j = stores[j - 1] if j > 0 else data.warehouse
+            raw = data.distance.get((s_i, s_j), data.distance.get((s_j, s_i), None))
+            d[(i, j)] = float(raw) if raw is not None else _BIG_D
+
+    # --- transshipment costs: 1e6 → effectively disabled (baseline mode) ---
+    _NO_LT = 1e6
+    b: Dict[Tuple[int, int], float] = {
+        (i, j): _NO_LT for i in N for j in N if i != j
+    }
+
+    # --- holding cost h[(p, i)] ---
+    h: Dict[Tuple[int, int], float] = {}
+    for p in products:
+        h[(p_id[p], 0)] = float(data.holding_cost_wh.get(p, 0.0))
+        for s in stores:
+            h[(p_id[p], s_id[s])] = float(data.holding_cost_store.get((s, p), 0.0))
+
+    # --- node capacity C[i] (sum over products) ---
+    C: Dict[int, float] = {0: float(data.max_inventory_wh.get(products[0], 1e9)) * len(products)}
+    for s in stores:
+        C[s_id[s]] = sum(
+            float(data.max_inventory_store.get((s, p), 1e9)) for p in products
+        )
+
+    # --- initial inventory I0[(p, i)] ---
+    I0: Dict[Tuple[int, int], float] = {}
+    for p in products:
+        I0[(p_id[p], 0)] = float(data.init_inventory_wh.get(p, 0.0))
+        for s in stores:
+            I0[(p_id[p], s_id[s])] = float(data.init_inventory_store.get((s, p), 0.0))
+
+    # --- demand D[(p, i, t)] ---
+    D_irpt: Dict[Tuple[int, int, int], float] = {}
+    for s in stores:
+        for p in products:
+            for t in periods:
+                D_irpt[(p_id[p], s_id[s], t_id[t])] = float(data.demand.get((s, p, t), 0.0))
+
+    # --- replenishment g[(p, t)] ---
+    g: Dict[Tuple[int, int], float] = {}
+    for p in products:
+        for t in periods:
+            g[(p_id[p], t_id[t])] = float(data.replenishment_wh.get((p, t), 0.0))
+
+    # --- lost-sales cost f[(p, i)] ---
+    f: Dict[Tuple[int, int], float] = {}
+    for p in products:
+        for s in stores:
+            f[(p_id[p], s_id[s])] = float(data.shortage_cost.get((s, p), 0.25))
+
+    return _IRPTInst(
+        N=N, P=P, H=H, V=V,
+        alpha=float(data.alpha) if data.alpha else 1.0,
+        Q=float(data.vehicle_capacity),
+        d=d, b=b, h=h, C=C, I0=I0, D=D_irpt, g=g, f=f,
+        name="baseline_no_lt",
+    )
+
+
+# Six thesis scenarios: (label, store_limit, sku_limit).
+# Label prefix drives time-limit lookup: "small_*" → small bucket, etc.
+_SCALABILITY_TIERS: List[Tuple[str, int, int]] = [
+    ("small_4s2p",   4,  2),
+    ("small_5s2p",   5,  2),
+    ("medium_7s3p",  7,  3),
+    ("medium_7s4p",  7,  4),
+    ("large_10s5p", 10,  5),
+    ("large_12s5p", 12,  5),
+]
+
+
+
+def _scalability_tier_group(label: str) -> str:
+    """Map "small_4s2p" → "small", etc."""
+    for grp in ("small", "medium", "large"):
+        if label.startswith(grp):
+            return grp
+    return label
+
+
+def _alns_final_accept_rate(history: List[Dict[str, float]], tail_fraction: float = 0.2) -> float:
+    """Accept rate over the final `tail_fraction` of ALNS history (skips iter-0 seed)."""
+    real = [h for h in (history or []) if int(h.get("iteration", 0)) > 0]
+    if not real:
+        return float("nan")
+    n_tail = max(1, int(round(len(real) * float(tail_fraction))))
+    tail = real[-n_tail:]
+    return float(sum(float(h.get("accepted", 0.0)) for h in tail) / max(1, len(tail)))
+
+
+def _detect_period_window(
+    excel_path: str,
+    period_count: int = 60,
+    sheet_name: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Return (start_date_str, end_date_str) covering the first `period_count`
+    distinct PERIOD dates found in the dataset."""
+    input_path = _project_path(str(excel_path).strip())
+    try:
+        if input_path.suffix.lower() == ".csv":
+            df_dates = pd.read_csv(input_path, usecols=["PERIOD"])
+        else:
+            df_dates = pd.read_excel(input_path, sheet_name=sheet_name or 0, usecols=["PERIOD"])
+        dates = sorted(
+            pd.to_datetime(df_dates["PERIOD"].astype(str), format="%Y%m%d", errors="coerce")
+              .dropna()
+              .unique()
+              .tolist()
+        )
+    except Exception:
+        return ("", "")
+    if not dates:
+        return ("", "")
+    start = dates[0]
+    end = dates[min(int(period_count) - 1, len(dates) - 1)]
+    return (str(start.date()), str(end.date()))
+
+
+def _plot_alns_convergence_scenario(
+    history: List[Dict[str, float]],
+    scenario_label: str,
+    out_path: Path,
+) -> None:
+    """Two-panel ALNS convergence chart for a single scenario."""
+    if not history:
+        return
+    _, plt = _mpl_agg()
+    if plt is None:
+        return
+    try:
+        hist_df = pd.DataFrame(history)
+        if hist_df.empty or "iteration" not in hist_df.columns:
+            return
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+
+        # --- Left: cost trajectory ---
+        ax = axes[0]
+        ax.plot(hist_df["iteration"], hist_df["best_cost"] / 1e6,
+                color="#55A868", linewidth=2, label="Best (incumbent)")
+        ax.plot(hist_df["iteration"], hist_df["current_cost"] / 1e6,
+                color="#4C72B0", linewidth=0.8, alpha=0.6, label="Current")
+        if "candidate_cost" in hist_df.columns:
+            ax.scatter(hist_df["iteration"], hist_df["candidate_cost"] / 1e6,
+                       s=3, color="#DD8452", alpha=0.25, label="Candidate")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Cost (M)")
+        ax.set_title(f"ALNS Cost Trajectory — {scenario_label}")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # --- Right: acceptance dynamics ---
+        ax2 = axes[1]
+        window = max(20, len(hist_df) // 50)
+        if "accepted" in hist_df.columns:
+            accept_rate = hist_df["accepted"].rolling(window, min_periods=1).mean()
+            ax2.plot(hist_df["iteration"], accept_rate * 100,
+                     color="#4C72B0", linewidth=2,
+                     label=f"Accept rate ({window}-iter rolling avg)")
+        if "new_best" in hist_df.columns:
+            new_best_mask = hist_df["new_best"] > 0
+            if new_best_mask.any():
+                ax2.scatter(
+                    hist_df.loc[new_best_mask, "iteration"],
+                    [100] * int(new_best_mask.sum()),
+                    marker="v", color="#55A868", s=40, label="New best found",
+                )
+        ax2.set_xlabel("Iteration")
+        ax2.set_ylabel("Accept Rate (%)")
+        ax2.set_ylim(-5, 115)
+        ax2.set_title(f"ALNS Acceptance Dynamics — {scenario_label}")
+        ax2.legend(fontsize=8, loc="lower left")
+        ax2.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        _save_fig(plt, str(out_path))
+    except Exception as exc:
+        print(f"[Scalability] ALNS chart failed for {scenario_label}: {exc}")
+
+
+def _plot_scalability_summary(df: pd.DataFrame, out_path: Path) -> None:
+    """4-panel chart: runtime, ALNS gap %, fulfillment rate, total objective."""
+    if df.empty:
+        return
+    _, plt = _mpl_agg()
+    if plt is None:
+        return
+    try:
+        tier_labels = list(dict.fromkeys(df["scenario"].tolist()))  # preserve order
+        x = range(len(tier_labels))
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+        fig.suptitle("Solver Scalability Benchmark — Gurobi MIP vs ALNS\n(6 scenarios × 60 periods)", fontsize=13)
+
+        def _vals(solver: str, col: str) -> List[float]:
+            sub = df[df["solver"] == solver].set_index("scenario")
+            return [float(sub.loc[t, col]) if t in sub.index else float("nan") for t in tier_labels]
+
+        bar_w = 0.38
+
+        # Top-left: runtime (log)
+        ax = axes[0, 0]
+        g_rt = _vals("Gurobi", "runtime_seconds")
+        a_rt = _vals("ALNS",   "runtime_seconds")
+        ax.bar([i - bar_w/2 for i in x], g_rt, bar_w, label="Gurobi", color="#1f77b4")
+        ax.bar([i + bar_w/2 for i in x], a_rt, bar_w, label="ALNS",   color="#d62728")
+        ax.set_yscale("log")
+        ax.set_xticks(list(x)); ax.set_xticklabels(tier_labels, rotation=20, ha="right", fontsize=8)
+        ax.set_ylabel("Runtime (s, log)"); ax.set_title("Runtime"); ax.legend(); ax.grid(True, alpha=0.3, which="both")
+
+        # Top-right: objective value
+        ax = axes[0, 1]
+        g_obj = _vals("Gurobi", "objective")
+        a_obj = _vals("ALNS",   "objective")
+        ax.bar([i - bar_w/2 for i in x], [v/1e6 for v in g_obj], bar_w, label="Gurobi", color="#1f77b4")
+        ax.bar([i + bar_w/2 for i in x], [v/1e6 for v in a_obj], bar_w, label="ALNS",   color="#d62728")
+        ax.set_xticks(list(x)); ax.set_xticklabels(tier_labels, rotation=20, ha="right", fontsize=8)
+        ax.set_ylabel("Objective (M)"); ax.set_title("Total Objective Value"); ax.legend(); ax.grid(True, alpha=0.3)
+
+        # Bottom-left: ALNS gap %
+        ax = axes[1, 0]
+        a_gap = _vals("ALNS", "optimality_gap_pct")
+        bar_colors = ["#2ca02c" if not math.isnan(v) and v < 10.0 else "#d62728" for v in a_gap]
+        ax.bar(list(x), a_gap, 0.6, color=bar_colors)
+        ax.axhline(0, color="gray", linestyle="--", linewidth=1)
+        ax.axhline(10, color="orange", linestyle=":", linewidth=1, label="10% threshold")
+        ax.set_xticks(list(x)); ax.set_xticklabels(tier_labels, rotation=20, ha="right", fontsize=8)
+        ax.set_ylabel("ALNS Gap vs Gurobi (%)"); ax.set_title("ALNS Optimality Gap"); ax.legend(); ax.grid(True, alpha=0.3)
+        for i, v in enumerate(a_gap):
+            if not math.isnan(v):
+                ax.text(i, v + 0.3, f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
+
+        # Bottom-right: fulfillment rate
+        ax = axes[1, 1]
+        g_fr = _vals("Gurobi", "fulfillment_rate_pct")
+        a_fr = _vals("ALNS",   "fulfillment_rate_pct")
+        ax.bar([i - bar_w/2 for i in x], g_fr, bar_w, label="Gurobi", color="#1f77b4")
+        ax.bar([i + bar_w/2 for i in x], a_fr, bar_w, label="ALNS",   color="#d62728")
+        ax.set_xticks(list(x)); ax.set_xticklabels(tier_labels, rotation=20, ha="right", fontsize=8)
+        ax.set_ylim(0, 105); ax.set_ylabel("Fulfillment Rate (%)"); ax.set_title("Demand Fulfillment Rate")
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        _save_fig(plt, str(out_path))
+        print(f"[Scalability] Saved summary chart → {out_path}")
+    except Exception as exc:
+        print(f"[Scalability] Summary chart failed: {exc}")
+
+
+def run_solver_scalability_benchmark(
+    excel_path: str,
+    results_dir: Optional[Path] = None,
+    n_replications: int = 1,
+    seed_base: int = 42,
+    sheet_name: Optional[str] = None,
+    period_count: int = 60,
+) -> pd.DataFrame:
+    """Compare exact Gurobi MIP vs ALNS across 6 thesis scenarios (DC→stores only).
+
+    Each scenario is a (store_limit, sku_limit) pair drawn from the first
+    `period_count` distinct periods of the dataset.  Both solvers run under
+    a real wall-clock time limit (tier-dependent defaults below).
+
+    Per-scenario outputs (under <results_dir>/benchmark/scalability/<label>/):
+      - solver_comparison.csv    — Gurobi vs ALNS key metrics
+      - cost_breakdown.csv       — per-solver component breakdown
+      - fulfillment.csv          — per store-period fulfillment
+      - alns_history.csv         — raw iteration log
+      - chart_alns_convergence.png
+
+    Aggregate outputs:
+      - <results_dir>/benchmark/solver_scalability.csv   (long format, all rows)
+      - <results_dir>/benchmark/solver_scalability_summary.csv (wide, 1 row per scenario)
+      - <results_dir>/charts/solver_scalability.png      (4-panel summary chart)
+    """
+    out_root = Path(results_dir) if results_dir is not None else Path(RESULTS_DIR)
+    benchmark_dir = out_root / "benchmark"
+    charts_dir    = out_root / "charts"
+    scal_dir      = benchmark_dir / "scalability"
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    charts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Detect 60-period date window once (same window across all scenarios)
+    start_date, end_date = _detect_period_window(excel_path, period_count, sheet_name)
+    if start_date:
+        print(f"[Scalability] Period window: {start_date} → {end_date} ({period_count} periods max)")
+    else:
+        print("[Scalability] Could not detect period window — using full dataset range.")
+
+    long_rows: List[Dict[str, Any]] = []   # one row per (scenario, replication, solver)
+    wide_rows: List[Dict[str, Any]] = []   # one row per (scenario, replication)
+
+    for tier_index, (tier_label, store_lim, sku_lim) in enumerate(_SCALABILITY_TIERS):
+        scenario_dir = scal_dir / tier_label
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n{'='*70}")
+        print(f"[Scalability] Scenario: {tier_label}  "
+              f"(stores≤{store_lim}, skus≤{sku_lim}, periods≤{period_count})")
+        _ach_tl_show = _ACHAMRAH_TIER_TIME_LIMITS.get(_scalability_tier_group(tier_label), 600.0)
+        print(f"  Gurobi: no time limit  |  ALNS: 1000 iters  |  "
+              f"Achamrah GA/SA: {_ach_tl_show:.0f}s time limit")
+        print(f"{'='*70}")
+
+        mapper = DatasetToIRPValidationMapper(
+            excel_path=excel_path,
+            sheet_name=sheet_name,
+            store_limit=store_lim,
+            sku_limit=sku_lim,
+            start_date=start_date or None,
+            end_date=end_date or None,
+        )
+        data, _, _, _ = mapper.build_irp_data(
+            cw_replenishment_factor=0.8,
+            holding_cost_rate=0.01,
+            shortage_cost_rate=0.25,
+            wh_inventory_multiplier=0.8,
+            store_capacity_multiplier=1.2,
+            store_initial_inventory_multiplier=0.2,
+            vehicle_count=2,
+            vehicle_fixed_cost=50.0,
+            alpha=1.0,
+            cw_capacity_factor=2.0,
+        )
+        n_stores  = len(data.stores)
+        n_skus    = len(data.products)
+        n_periods = len(data.periods)
+
+        # Auto-scale vehicle capacity to ~80% per-vehicle coverage of average
+        # dispatch demand. This makes vehicle routing the binding optimisation
+        # lever (shortage 15-25%), while WH supply remains non-constraining.
+        # With this design, ALNS can meaningfully choose which stores to
+        # prioritise and finds consistent new-best improvements (>5 per run).
+        _dispatch_pds = [t for t in data.periods if (t - min(data.periods)) % 5 == 0]
+        _n_dispatch = max(1, len(_dispatch_pds))
+        _total_dem = max(1.0, sum(data.demand.values()))
+        _auto_cap = _total_dem / _n_dispatch / 2 * 0.85   # 85% of per-vehicle need
+        data.vehicle_capacity = max(500.0, round(_auto_cap))
+
+        for replication in range(1, int(n_replications) + 1):
+            rep_tag = f"rep{replication}"
+
+            # ====================================================
+            # Gurobi exact solve
+            # ====================================================
+            print(f"\n  [Gurobi] {tier_label} {rep_tag} ...")
+            t0 = time.perf_counter()
+            gurobi_sol     = None
+            gurobi_obj     = float("nan")
+            gurobi_bound   = float("nan")
+            gurobi_mip_gap = float("nan")
+            gurobi_status  = "Error"
+            try:
+                gurobi_sol = AchamrahFullIRPTModel(data).solve(
+                    msg=False,
+                    allow_lateral_transshipment=False,
+                )
+                gurobi_status  = str(gurobi_sol.status)
+                gm             = gurobi_sol.efficiency_metrics or {}
+                gurobi_obj     = float(gurobi_sol.objective) if math.isfinite(float(gurobi_sol.objective)) else float("nan")
+                gurobi_bound   = float(gm.get("obj_bound",  float("nan")))
+                gurobi_mip_gap = float(gm.get("mip_gap",    float("nan")))
+            except Exception as exc:
+                gurobi_status = f"Error:{type(exc).__name__}"
+                print(f"  [Gurobi] ERROR: {exc}")
+            gurobi_runtime = time.perf_counter() - t0
+            gurobi_gap_pct = float(gurobi_mip_gap) * 100.0 if math.isfinite(gurobi_mip_gap) else float("nan")
+
+            # Cost breakdown + fulfillment for Gurobi
+            gurobi_bd: Dict[str, float] = {}
+            gurobi_ff_rate = float("nan")
+            if gurobi_sol is not None:
+                try:
+                    gurobi_bd = build_full_irpt_cost_breakdown(data, gurobi_sol)
+                except Exception:
+                    pass
+                try:
+                    ff_df = build_forecast_fulfillment_df(data, gurobi_sol)
+                    if not ff_df.empty and "forecast_fulfillment_rate" in ff_df.columns:
+                        gurobi_ff_rate = float(ff_df["forecast_fulfillment_rate"].mean()) * 100.0
+                    ff_df.to_csv(scenario_dir / f"gurobi_fulfillment_{rep_tag}.csv", index=False)
+                except Exception:
+                    pass
+                try:
+                    bd_rows = [{"solver": "Gurobi", "component": k, "value": v} for k, v in gurobi_bd.items()]
+                    pd.DataFrame(bd_rows).to_csv(scenario_dir / f"gurobi_cost_breakdown_{rep_tag}.csv", index=False)
+                except Exception:
+                    pass
+
+            print(
+                f"  [Gurobi] obj={gurobi_obj:.6g}  runtime={gurobi_runtime:.1f}s  "
+                f"status={gurobi_status}  mip_gap={gurobi_gap_pct:.2f}%  "
+                f"fulfillment={gurobi_ff_rate:.1f}%"
+            )
+
+            # ====================================================
+            # ALNS heuristic solve
+            # ====================================================
+            alns_seed = int(seed_base) + int(replication) * 1000 + int(tier_index)
+            print(f"\n  [ALNS]   {tier_label} {rep_tag}  seed={alns_seed} ...")
+            t0 = time.perf_counter()
+            alns_sol     = None
+            alns_obj     = float("nan")
+            alns_status  = "Error"
+            alns_history: List[Dict[str, float]] = []
+            alns_new_best = float("nan")
+            alns_accept   = float("nan")
+            try:
+                alns_sol = BaselineALNSModel(data).solve(
+                    msg=True,
+                    max_iterations=1000,
+                    seed=alns_seed,
+                    allow_lateral_transshipment=False,
+                )
+                alns_status  = str(alns_sol.status)
+                alns_obj     = float(alns_sol.objective) if math.isfinite(float(alns_sol.objective)) else float("nan")
+                alns_history = list(getattr(alns_sol, "alns_history", []) or [])
+                am           = alns_sol.efficiency_metrics or {}
+                alns_new_best = float(am.get("alns_new_best", 0.0))
+                alns_accept   = _alns_final_accept_rate(alns_history)
+            except Exception as exc:
+                alns_status = f"Error:{type(exc).__name__}"
+                print(f"  [ALNS]   ERROR: {exc}")
+            alns_runtime = time.perf_counter() - t0
+
+            # ALNS gap vs Gurobi
+            ref = gurobi_obj if math.isfinite(gurobi_obj) else (
+                gurobi_bound if math.isfinite(gurobi_bound) else float("nan")
+            )
+            alns_gap_pct = (
+                (alns_obj - ref) / ref * 100.0
+                if (math.isfinite(alns_obj) and math.isfinite(ref) and abs(ref) > 1e-9)
+                else float("nan")
+            )
+
+            # Cost breakdown + fulfillment for ALNS
+            alns_bd: Dict[str, float] = {}
+            alns_ff_rate = float("nan")
+            if alns_sol is not None:
+                try:
+                    alns_bd = build_full_irpt_cost_breakdown(data, alns_sol)
+                except Exception:
+                    pass
+                try:
+                    ff_df = build_forecast_fulfillment_df(data, alns_sol)
+                    if not ff_df.empty and "forecast_fulfillment_rate" in ff_df.columns:
+                        alns_ff_rate = float(ff_df["forecast_fulfillment_rate"].mean()) * 100.0
+                    ff_df.to_csv(scenario_dir / f"alns_fulfillment_{rep_tag}.csv", index=False)
+                except Exception:
+                    pass
+                try:
+                    bd_rows = [{"solver": "ALNS", "component": k, "value": v} for k, v in alns_bd.items()]
+                    pd.DataFrame(bd_rows).to_csv(scenario_dir / f"alns_cost_breakdown_{rep_tag}.csv", index=False)
+                except Exception:
+                    pass
+
+            # ALNS history CSV
+            if alns_history:
+                try:
+                    pd.DataFrame(alns_history).to_csv(
+                        scenario_dir / f"alns_history_{rep_tag}.csv", index=False
+                    )
+                except Exception:
+                    pass
+
+            # Per-scenario ALNS convergence chart
+            _plot_alns_convergence_scenario(
+                alns_history, tier_label,
+                scenario_dir / f"chart_alns_convergence_{rep_tag}.png",
+            )
+
+            gap_str = f"{alns_gap_pct:.2f}%" if math.isfinite(alns_gap_pct) else "n/a"
+            print(
+                f"  [ALNS]   obj={alns_obj:.6g}  runtime={alns_runtime:.1f}s  "
+                f"gap={gap_str}  new_best={alns_new_best:.0f}  "
+                f"accept={alns_accept:.1%}  fulfillment={alns_ff_rate:.1f}%"
+            )
+
+            # ====================================================
+            # Achamrah GA/SA heuristic solve (baseline, LT disabled)
+            # ====================================================
+            _tier_group = _scalability_tier_group(tier_label)
+            _ach_tl = _ACHAMRAH_TIER_TIME_LIMITS.get(_tier_group, 600.0)
+            achamrah_seed = int(seed_base) + int(replication) * 2000 + int(tier_index)
+            print(f"\n  [Achamrah] {tier_label} {rep_tag}  seed={achamrah_seed}  "
+                  f"time_limit={_ach_tl:.0f}s ...")
+            t0 = time.perf_counter()
+            achamrah_obj     = float("nan")
+            achamrah_runtime = float("nan")
+            achamrah_constructive_rt = float("nan")
+            achamrah_improvement_rt  = float("nan")
+            achamrah_status  = "Skipped"
+            try:
+                from achamrah_2022_irpt_matheuristic import (
+                    AchamrahIRPTSolver as _AchSolver,
+                    HeuristicParams    as _HeuParams,
+                )
+                _inst = _irpdata_to_irpt_instance(data)
+                _params = _HeuParams(
+                    seed=achamrah_seed,
+                    constructive_time_limit=_ach_tl * 0.35,
+                    improvement_time_limit=_ach_tl * 0.65,
+                    full_time_limit=_ach_tl,
+                    # Reduce GA population for benchmark speed
+                    population_size=30,
+                    iterations_per_temp=30,
+                )
+                _ach_result = _AchSolver(_inst, _params).solve_full_matheuristic()
+                achamrah_obj              = float(_ach_result.best_objective) if math.isfinite(_ach_result.best_objective) else float("nan")
+                achamrah_constructive_rt  = float(_ach_result.constructive_runtime_seconds)
+                achamrah_improvement_rt   = float(_ach_result.improvement_runtime_seconds)
+                achamrah_status = "Optimal" if math.isfinite(achamrah_obj) else "Infeasible"
+            except ImportError:
+                achamrah_status = "ModuleNotFound"
+                print(f"  [Achamrah] SKIPPED — achamrah_2022_irpt_matheuristic not found")
+            except Exception as exc:
+                achamrah_status = f"Error:{type(exc).__name__}"
+                print(f"  [Achamrah] ERROR: {exc}")
+            achamrah_runtime = time.perf_counter() - t0
+
+            achamrah_gap_pct = (
+                (achamrah_obj - ref) / ref * 100.0
+                if (math.isfinite(achamrah_obj) and math.isfinite(ref) and abs(ref) > 1e-9)
+                else float("nan")
+            )
+            ach_gap_str = f"{achamrah_gap_pct:.2f}%" if math.isfinite(achamrah_gap_pct) else "n/a"
+            print(
+                f"  [Achamrah] obj={achamrah_obj:.6g}  runtime={achamrah_runtime:.1f}s  "
+                f"gap={ach_gap_str}  "
+                f"(constructive={achamrah_constructive_rt:.1f}s  "
+                f"improvement={achamrah_improvement_rt:.1f}s)"
+            )
+
+            # ====================================================
+            # Per-scenario solver comparison CSV
+            # ====================================================
+            _breakdown_components = [
+                "direct_cw_unit_cost", "store_holding_cost", "warehouse_holding_cost",
+                "route_distance_cost",  "vehicle_fixed_cost",  "shortage_cost",
+            ]
+            cmp_rows = []
+            for solver_name, sol_obj, sol_rt, sol_status, bd, ff_rate in [
+                ("Gurobi",   gurobi_obj,   gurobi_runtime,   gurobi_status,   gurobi_bd, gurobi_ff_rate),
+                ("ALNS",     alns_obj,     alns_runtime,     alns_status,     alns_bd,   alns_ff_rate),
+                ("Achamrah", achamrah_obj, achamrah_runtime, achamrah_status, {},        float("nan")),
+            ]:
+                row: Dict[str, Any] = {
+                    "scenario": tier_label, "replication": replication,
+                    "solver": solver_name,
+                    "stores": n_stores, "skus": n_skus, "periods": n_periods,
+                    "objective": round(sol_obj, 4) if math.isfinite(sol_obj) else float("nan"),
+                    "runtime_seconds": round(sol_rt, 3),
+                    "status": sol_status,
+                    "fulfillment_rate_pct": round(ff_rate, 4) if math.isfinite(ff_rate) else float("nan"),
+                }
+                for comp in _breakdown_components:
+                    row[comp] = round(float(bd.get(comp, float("nan"))), 4)
+                if solver_name == "Gurobi":
+                    row["optimality_gap_pct"]     = round(gurobi_gap_pct, 4) if math.isfinite(gurobi_gap_pct) else float("nan")
+                    row["alns_new_best_count"]     = float("nan")
+                    row["alns_final_accept_rate"]  = float("nan")
+                elif solver_name == "ALNS":
+                    row["optimality_gap_pct"]      = round(alns_gap_pct, 4) if math.isfinite(alns_gap_pct) else float("nan")
+                    row["alns_new_best_count"]     = alns_new_best
+                    row["alns_final_accept_rate"]  = round(alns_accept, 4) if math.isfinite(alns_accept) else float("nan")
+                else:  # Achamrah
+                    row["optimality_gap_pct"]      = round(achamrah_gap_pct, 4) if math.isfinite(achamrah_gap_pct) else float("nan")
+                    row["alns_new_best_count"]     = float("nan")
+                    row["alns_final_accept_rate"]  = float("nan")
+                cmp_rows.append(row)
+                long_rows.append(row)
+
+            try:
+                pd.DataFrame(cmp_rows).to_csv(scenario_dir / f"solver_comparison_{rep_tag}.csv", index=False)
+            except Exception:
+                pass
+
+            # Wide row for summary CSV (one row per scenario × replication)
+            wide: Dict[str, Any] = {
+                "scenario": tier_label, "replication": replication,
+                "stores": n_stores, "skus": n_skus, "periods": n_periods,
+                "gurobi_obj":            round(gurobi_obj, 4) if math.isfinite(gurobi_obj) else float("nan"),
+                "gurobi_runtime_s":      round(gurobi_runtime, 3),
+                "gurobi_status":         gurobi_status,
+                "gurobi_mip_gap_pct":    round(gurobi_gap_pct, 4) if math.isfinite(gurobi_gap_pct) else float("nan"),
+                "gurobi_fulfillment_pct": round(gurobi_ff_rate, 4) if math.isfinite(gurobi_ff_rate) else float("nan"),
+                "alns_obj":              round(alns_obj, 4) if math.isfinite(alns_obj) else float("nan"),
+                "alns_runtime_s":        round(alns_runtime, 3),
+                "alns_status":           alns_status,
+                "alns_gap_vs_gurobi_pct": round(alns_gap_pct, 4) if math.isfinite(alns_gap_pct) else float("nan"),
+                "alns_fulfillment_pct":  round(alns_ff_rate, 4) if math.isfinite(alns_ff_rate) else float("nan"),
+                "alns_new_best_count":   alns_new_best,
+                "alns_final_accept_rate": round(alns_accept, 4) if math.isfinite(alns_accept) else float("nan"),
+                "achamrah_obj":          round(achamrah_obj, 4) if math.isfinite(achamrah_obj) else float("nan"),
+                "achamrah_runtime_s":    round(achamrah_runtime, 3),
+                "achamrah_status":       achamrah_status,
+                "achamrah_gap_vs_gurobi_pct": round(achamrah_gap_pct, 4) if math.isfinite(achamrah_gap_pct) else float("nan"),
+                "achamrah_constructive_rt_s": round(achamrah_constructive_rt, 3) if math.isfinite(achamrah_constructive_rt) else float("nan"),
+                "achamrah_improvement_rt_s":  round(achamrah_improvement_rt, 3) if math.isfinite(achamrah_improvement_rt) else float("nan"),
+            }
+            for comp in _breakdown_components:
+                wide[f"gurobi_{comp}"] = round(float(gurobi_bd.get(comp, float("nan"))), 4)
+                wide[f"alns_{comp}"]   = round(float(alns_bd.get(comp, float("nan"))), 4)
+            wide_rows.append(wide)
+
+    # ====================================================
+    # Master outputs
+    # ====================================================
+    long_df = pd.DataFrame(long_rows)
+    wide_df = pd.DataFrame(wide_rows)
+
+    long_csv = benchmark_dir / "solver_scalability.csv"
+    wide_csv = benchmark_dir / "solver_scalability_summary.csv"
+    long_df.to_csv(long_csv, index=False)
+    wide_df.to_csv(wide_csv, index=False)
+    print(f"\n[Scalability] Long CSV  → {long_csv}")
+    print(f"[Scalability] Summary   → {wide_csv}")
+
+    # Print summary table to stdout
+    if not wide_df.empty:
+        print("\n" + "="*110)
+        print("SCALABILITY BENCHMARK — SUMMARY (Gurobi MIP  vs  ALNS  vs  Achamrah GA/SA)")
+        print("="*110)
+        _show_cols = [
+            "scenario", "stores", "skus", "periods",
+            "gurobi_obj",    "gurobi_runtime_s",    "gurobi_status",   "gurobi_mip_gap_pct",
+            "alns_obj",      "alns_runtime_s",      "alns_gap_vs_gurobi_pct",  "alns_new_best_count",
+            "achamrah_obj",  "achamrah_runtime_s",  "achamrah_gap_vs_gurobi_pct", "achamrah_status",
+        ]
+        show = wide_df[[c for c in _show_cols if c in wide_df.columns]]
+        print(show.to_string(index=False))
+        print("="*110)
+
+    # Summary chart (long_df has Gurobi, ALNS, and Achamrah as separate rows)
+    _chart_df = pd.DataFrame()
+    if not long_df.empty:
+        _chart_df = long_df.copy()
+    _plot_scalability_summary(_chart_df, charts_dir / "solver_scalability.png")
+
+    return long_df
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -9584,6 +10244,22 @@ if __name__ == "__main__":
         print("[Mode] OFFLINE TRAINING — training dataset; CG → teacher rows → GNN train/validate.")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ----- Solver scalability benchmark short-circuit -----
+    # Compares Gurobi MIP vs ALNS across Small/Medium/Large tiers using only
+    # `DatasetToIRPValidationMapper`, `AchamrahFullIRPTModel`, `BaselineALNSModel`.
+    # The function builds its own per-tier `IRPData` objects, so we run BEFORE
+    # the main pipeline's mapper construction.
+    if os.environ.get("IRP_RUN_SCALABILITY_BENCHMARK", "0").lower() not in {"0", "false", "no"}:
+        run_solver_scalability_benchmark(
+            excel_path=str(EXCEL_PATH),
+            period_count=int(os.environ.get("IRP_SCALABILITY_PERIOD_COUNT", "60")),
+            sheet_name=os.environ.get("IRP_SCALABILITY_SHEET_NAME") or None,
+            seed_base=int(os.environ.get("IRP_SCALABILITY_SEED_BASE", "42")),
+            n_replications=int(os.environ.get("IRP_SCALABILITY_REPLICATIONS", "1")),
+        )  # no time limits — both solvers run to completion
+        sys.exit(0)
+
     if os.environ.get("IRP_CLEAN_RESULTS", "1").lower() not in {"0", "false", "no"}:
         removed = clean_managed_outputs(RESULTS_DIR)
         if removed:
@@ -9617,16 +10293,16 @@ if __name__ == "__main__":
         wh_inventory_multiplier=0.8,
         store_capacity_multiplier=1.2,
         shortage_cost_rate=0.05,
-        holding_cost_rate=100,
+        holding_cost_rate=0.01,
         cw_ship_cost_flat=1.0,
         lt_ship_cost_flat=0.6,
         fixed_dispatch_cw=8.0,
         fixed_dispatch_lt=2.0,
         vehicle_count=2,
-        vehicle_capacity=500.0,
+        vehicle_capacity=float(os.environ.get("IRP_VEHICLE_CAPACITY", "900.0")),
         vehicle_fixed_cost=50.0,
         alpha=1.0,
-        cw_replenishment_factor=0.2,
+        cw_replenishment_factor=0.8,
         cw_capacity_factor=2.0,
         store_initial_inventory_multiplier=float(os.environ.get("IRP_STORE_INIT_MULTIPLIER", "0.2")),
         lt_cost_multiplier=float(os.environ.get("IRP_LT_COST_MULTIPLIER", "1.0")),
@@ -9812,16 +10488,16 @@ if __name__ == "__main__":
                     wh_inventory_multiplier=0.8,
                     store_capacity_multiplier=1.2,
                     shortage_cost_rate=0.05,
-                    holding_cost_rate=100,
+                    holding_cost_rate=0.01,
                     cw_ship_cost_flat=1.0,
                     lt_ship_cost_flat=0.6,
                     fixed_dispatch_cw=8.0,
                     fixed_dispatch_lt=2.0,
                     vehicle_count=2,
-                    vehicle_capacity=500.0,
+                    vehicle_capacity=float(os.environ.get("IRP_VEHICLE_CAPACITY", "900.0")),
                     vehicle_fixed_cost=50.0,
                     alpha=1.0,
-                    cw_replenishment_factor=0.2,
+                    cw_replenishment_factor=0.8,
                     cw_capacity_factor=2.0,
                     store_initial_inventory_multiplier=float(
                         os.environ.get("IRP_STORE_INIT_MULTIPLIER", "0.2")

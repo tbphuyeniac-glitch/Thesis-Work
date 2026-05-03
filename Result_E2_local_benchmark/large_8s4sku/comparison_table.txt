@@ -1,0 +1,5 @@
+        variant  rmp_objective  realized_cost_with_lt  lt_cost_with_lt  shortage_cost_with_lt  cg_iterations  variant_runtime_seconds  columns_generated  columns_added_to_rmp
+A0_with_penalty   9.134291e+08           9.270989e+08     93304.069849            19319058.64              9                16.706422               1359                  1359
+  E2_pruned_gnn   9.142345e+08           9.264371e+08     77082.691933            18511448.80              5                10.929742               1371                   715
+
+wall_seconds=165.92

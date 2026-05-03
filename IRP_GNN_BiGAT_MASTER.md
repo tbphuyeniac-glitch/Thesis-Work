@@ -93,10 +93,17 @@ Builds and solves a restricted master problem using LT patterns:
 File: `GNN/models/attention/model.py` — `BiGATColumnScorer`
 
 A bipartite graph attention network that:
-- takes candidate column nodes (12 features) and RMP constraint nodes (7 features),
+- takes candidate column nodes (10 features) and RMP constraint nodes (7 features),
 - runs 2-layer bidirectional attention,
 - outputs a score per column,
 - enables top-k selection before RMP insertion.
+
+> **Schema update (E1/E2):** the column feature vector was reduced from 12 → 10
+> by dropping `acceptance_score` and `compensation_mean`. Those two features come
+> from the Stackelberg compensation game (Section 9), which is disabled in the
+> E1/E2 thesis configurations, so they carried no learnable signal and the
+> teacher CSV writes them as constants. The data loader slices legacy 12-feature
+> pkls down to 10 transparently — no rebuild needed.
 
 ---
 
@@ -130,15 +137,23 @@ Current Code/
 │   │   ├── baseline/model.py            # Baseline GNN (MLP only, no attention)
 │   │   └── simple/model.py              # Simple GNN variant
 │   │
+│   ├── eval_dantzig_vs_gnn.py           # Within-group Dantzig vs GNN MRR comparator
+│   │
 │   ├── data/
-│   │   └── irplt_teacher/
-│   │       ├── train/sample_*.pkl       # Graph samples for training
-│   │       ├── valid/sample_*.pkl       # Graph samples for validation
-│   │       └── test/sample_*.pkl        # Graph samples for testing
+│   │   ├── irplt_teacher/                       # initial / smoke-test dataset
+│   │   ├── irplt_teacher_filtered/              # E1 filtered (ranking filter applied)
+│   │   ├── irplt_teacher_E2_filtered/           # E2 filtered (PRIMARY for E2 thesis)
+│   │   │   ├── train/sample_*.pkl       # 9,300 samples
+│   │   │   ├── valid/sample_*.pkl       # 3,002 samples
+│   │   │   ├── test/sample_*.pkl        # 2,578 samples
+│   │   │   └── dataset_summary.json
+│   │   └── irplt_synthetic_debug/               # synthetic warm-up (smoke only)
 │   │
 │   └── trained_models/
+│       ├── irplt_teacher_E2_filtered_3epochs/   # 3-epoch baseline (column_dim=12, hidden_dim=16)
+│       ├── irplt_teacher_filtered_local200_fixed/
 │       └── irplt_teacher/bigat/
-│           ├── pairwise_rank/best_model.pt   # PRIMARY checkpoint used at inference
+│           ├── pairwise_rank/best_model.pt      # PRIMARY checkpoint used at inference
 │           └── pairwise_rank/training_history.json
 │
 └── Results/
@@ -416,6 +431,13 @@ feature_ranges = {
 
 ## 9. Stackelberg-style acceptance layer
 
+> **E1/E2 status:** the Stackelberg layer is part of the design but **disabled**
+> in the E1 and E2 thesis configurations. The two derived column features
+> `acceptance_score` and `compensation_mean` therefore carry no signal in those
+> regimes and have been dropped from the GNN input (Section 10.2). Re-enabling
+> Stackelberg in a future configuration would require restoring the 12-feature
+> schema or adding the two features back as additional inputs.
+
 For each donor-receiver pair that passes feature pruning, a Stackelberg game decides acceptance:
 
 **Donor side**: worries about shortage risk increase, shipping burden, service-level loss.
@@ -435,7 +457,7 @@ BiGAT is inserted **after patterns are built** and **before they are added to th
 ### 10.2 Inputs to BiGAT
 
 **A. Candidate LT column nodes**
-Each candidate column is represented by 12 features (defined in `GNN/utilities.py`):
+Each candidate column is represented by 10 features (defined in `GNN/utilities.py`):
 
 ```python
 COLUMN_FEATURE_NAMES = [
@@ -448,10 +470,14 @@ COLUMN_FEATURE_NAMES = [
     "avg_surplus_ratio",      # avg weighted surplus_ratio across pairs
     "avg_time_urgency",       # avg weighted time_urgency across pairs
     "avg_negative_reduced_cost",  # avg pair-level negative reduced cost
-    "acceptance_score",       # mean Stackelberg acceptance score
-    "compensation_mean",      # mean Stackelberg compensation
     "column_cost",            # total pattern cost
 ]
+
+# Legacy 12-feature pkls also stored "acceptance_score" and "compensation_mean"
+# at indices 9 and 10. Those features are products of the Stackelberg layer,
+# which is inactive in E1/E2; `utilities.graph_to_tensors` slices them out at
+# load time so legacy pkls are usable without rebuilding the dataset.
+_LEGACY_COLUMN_FEATURE_INDICES_TO_DROP = (9, 10)
 ```
 
 **B. RMP constraint nodes**
@@ -562,7 +588,7 @@ class BipartiteAttentionLayer(nn.Module):
 
 
 class BiGATColumnScorer(nn.Module):
-    def __init__(self, column_dim=12, constraint_dim=7, edge_dim=3, hidden_dim=64, dropout=0.1):
+    def __init__(self, column_dim=10, constraint_dim=7, edge_dim=3, hidden_dim=64, dropout=0.1):
         # Encoders with LayerNorm
         self.column_encoder = Sequential(Linear(column_dim, hidden_dim), ReLU(), Dropout, Linear)
         self.constraint_encoder = Sequential(...)
@@ -613,7 +639,7 @@ def score_graph(model: BiGATColumnScorer, graph: Dict[str, torch.Tensor]) -> tor
 {
     "state_dict": model.state_dict(),
     "config": {
-        "column_dim": 12,
+        "column_dim": 10,        # 10 after dropping Stackelberg features
         "constraint_dim": 7,
         "edge_dim": 3,
         "hidden_dim": 64,
@@ -621,6 +647,10 @@ def score_graph(model: BiGATColumnScorer, graph: Dict[str, torch.Tensor]) -> tor
     "metadata": {...}
 }
 ```
+
+> Pre-cleanup checkpoints with `column_dim: 12` are not directly loadable
+> against the new 10-feature inputs. Retrain from scratch on the new schema
+> rather than mixing legacy and new checkpoints.
 
 Default checkpoint path: `GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt`
 
@@ -642,13 +672,18 @@ source_instance, branch_node_id, episode, product, period,
 pattern_id, column_cost, reduced_cost, total_flow, n_pairs,
 total_need_covered, total_surplus_consumed, avg_shortage_ratio,
 avg_surplus_ratio, avg_time_urgency, avg_negative_reduced_cost,
-acceptance_score, compensation_mean,
+acceptance_score, compensation_mean,           # written but dropped by builder
 constraint_features_json,  # JSON array of constraint feature vectors
 constraint_state_hash,     # SHA-1 of constraint_features_json (for grouping)
 edge_features_json,        # JSON array of edge feature vectors
 edge_index_json,           # JSON array of [col_idx, con_idx] pairs
 label                      # 1 if selected, 0 otherwise
 ```
+
+> `acceptance_score` and `compensation_mean` are still written by the teacher
+> exporter for backwards compatibility, but `build_teacher_graph_dataset.py`
+> drops them when materializing the per-sample pkl. Downstream training and
+> inference both consume the 10-feature schema only.
 
 ### 12.3 Multi-instance scenario generation
 File: `GNN/generate_teacher_scenarios.py`
@@ -673,50 +708,119 @@ File: `GNN/build_teacher_graph_dataset.py`
 ```bash
 python GNN/build_teacher_graph_dataset.py \
     --teacher-csv Results/scenarios/aggregate_teacher_rows.csv \
-    --out-dir GNN/data/irplt_teacher
+    --out-dir GNN/data/irplt_teacher_E2_filtered \
+    --ranking-filter-groups \
+    --min-group-size 2 \
+    --require-mixed-labels \
+    --overwrite
 ```
 
 Outputs:
-- `GNN/data/irplt_teacher/train/sample_*.pkl`
-- `GNN/data/irplt_teacher/valid/sample_*.pkl`
-- `GNN/data/irplt_teacher/test/sample_*.pkl`
-- `GNN/data/irplt_teacher/dataset_summary.json`
+- `GNN/data/irplt_teacher_E2_filtered/train/sample_*.pkl`
+- `GNN/data/irplt_teacher_E2_filtered/valid/sample_*.pkl`
+- `GNN/data/irplt_teacher_E2_filtered/test/sample_*.pkl`
+- `GNN/data/irplt_teacher_E2_filtered/dataset_summary.json`
 
-Each `.pkl` file is a dict with keys:
+Each `.pkl` file is a dict with keys (one (product, period) group per sample):
 ```python
 {
-    "column_features":        torch.Tensor [n_cols, 12],
+    "column_features":        torch.Tensor [n_cols, 10],   # 10-feature schema
     "constraint_features":    torch.Tensor [n_cons, 7],
     "edge_index_col_to_con":  torch.Tensor [2, n_edges],
     "edge_attr_col_to_con":   torch.Tensor [n_edges, 3],
-    "labels":                 torch.Tensor [n_cols],    # float, 0.0 or 1.0
-    "labels_binary":          torch.Tensor [n_cols],    # binary version
-    "source_instance":        str,
-    "product":                str,
-    "period":                 int,
+    "labels":                 torch.Tensor [n_cols],       # float, 0.0 or 1.0
+    "labels_binary":          torch.Tensor [n_cols],       # binary version
+    "metadata": {                                           # group identity
+        "label_source": "teacher_rmp",
+        "source_instance": str, "product": str, "period": int, ...
+    },
 }
 ```
+
+Legacy 12-feature pkls (pre-cleanup) are still loadable: `graph_to_tensors`
+detects them and slices indices 9–10 on load.
+
+#### 12.4.1 Ranking filter (Fix A)
+Pass `--ranking-filter-groups` to drop signal-less groups before training:
+
+| Rule | Reason |
+|---|---|
+| `size < min-group-size` (default 2) | no pairwise comparison possible |
+| all-positive group | softplus pairwise loss is identically zero |
+| all-negative group | softplus pairwise loss is identically zero |
+| `size > max-group-size` (default 64) | stratified-cap to preserve positive ratio |
+
+Example yields on the E2 teacher CSV: 21,861 size<2 + 9,381 all-positive + 160
+zero-positive groups dropped, leaving 14,880 mixed-label groups (9,300 train /
+3,002 valid / 2,578 test).
+
+#### 12.4.2 Constraint feature propagation
+The teacher exporter de-duplicates `constraint_features_json` to the first row
+of each export batch (one (source_instance, branch_node_id, episode,
+constraint_state_hash) bundle). `propagate_constraint_features_json()` fans the
+JSON back across all (product, period) groups in the same batch *before*
+grouping. An earlier bug propagated by the full group key, which silently
+zero-padded ~99% of constraint matrices on E1 — that has been fixed.
+`dataset_summary.json` now records `groups_repaired_zero_padded` per split;
+both filtered datasets currently report 0 repaired groups.
 
 ### 12.5 BiGAT training
 File: `GNN/03_train_bigat.py`
 
 ```bash
 python GNN/03_train_bigat.py \
-    --data-dir GNN/data/irplt_teacher \
-    --out-dir GNN/trained_models/irplt_teacher/bigat \
+    --data-dir GNN/data/irplt_teacher_E2_filtered \
+    --out-dir GNN/trained_models/irplt_teacher_E2_filtered/bigat/pairwise_rank \
     --objective pairwise_rank \
-    --epochs 100 \
+    --epochs 50 \
     --lr 1e-3 \
     --hidden-dim 64 \
     --dropout 0.1 \
     --patience 15
 ```
 
-Training objectives:
-- `pairwise_rank` (PRIMARY): pairwise ranking loss — penalizes when negative-score columns rank above positive ones.
-- `bce`: binary cross-entropy on admission probability.
+Defaults (after the cleanup): `--epochs 50`, `--hidden-dim 64`, `--patience 15`.
+The earlier defaults (5 / 16 / 8) were too small — the model under-fit and the
+validation `score_gap` plateaued near 0.1.
 
-Early stopping: based on MRR (pairwise_rank) or validation loss (bce).
+Training objectives:
+- `pairwise_rank` (PRIMARY): pairwise ranking loss within each sample group.
+  Each pkl already represents one (product, period) group with K columns, so
+  the within-sample softplus loss IS the within-group pairwise loss.
+- `score_regression`: smooth-L1 against the teacher score.
+- `binary`: binary cross-entropy with positive-weight rebalancing.
+
+Early stopping: highest `ranking_mrr` on valid (pairwise_rank), else lowest
+validation loss.
+
+Recommended sanity checks during training:
+- `score_gap > 0.2` by epoch 10 — if it plateaus near 0.1, suspect zeroed
+  constraint features (`groups_repaired_zero_padded` > 10% in summary) or a
+  too-small `hidden_dim`.
+- `ranking_top3_hit ≈ 1.0` is uninformative on this dataset because most
+  groups have K ≤ 3; rely on `ranking_mrr` and `mean_positive_rank` instead.
+
+### 12.6 Dantzig vs GNN ranking comparison
+File: `GNN/eval_dantzig_vs_gnn.py`
+
+```bash
+python GNN/eval_dantzig_vs_gnn.py \
+    --data-dir GNN/data/irplt_teacher_E2_filtered \
+    --split test \
+    --checkpoint GNN/trained_models/irplt_teacher_E2_filtered/bigat/pairwise_rank/best_model.pt \
+    --hard-rho-threshold 0.3 \
+    --out-file Results/eval_dantzig_vs_gnn.json
+```
+
+For each (product, period) test group:
+- **Dantzig MRR**: rank columns by `reduced_cost` ascending, MRR = 1 / rank of best positive.
+- **GNN MRR**: rank columns by BiGAT logits descending, MRR = 1 / rank of best positive.
+- **Spearman(-RC, label)**: within-group correlation. Hard groups have ρ ≤ 0.3.
+
+Reference Dantzig numbers on the E2 test split (no GNN): full = 0.8088, hard
+(52.9%) = 0.6877, easy (47.1%) = 0.9449. The thesis claim that GNN beats
+Dantzig requires `gnn_mrr > 0.8088` overall and (more importantly)
+`gnn_mrr > 0.6877` on hard groups.
 
 ---
 
@@ -878,7 +982,7 @@ It learns **admission priority of LT columns**, specifically:
 
 ### Phase E. BiGAT-guided selection
 16. Build bipartite graph:
-   - Column nodes: 12-feature vectors
+   - Column nodes: 10-feature vectors
    - Constraint nodes: 7-feature vectors (need-cover + surplus-cap)
    - Edges: 3-feature vectors
 17. Run BiGAT encode_graph → scoring_head
@@ -953,6 +1057,7 @@ Results/
 | Graph dataset builder | `GNN/build_teacher_graph_dataset.py` | CLI entry point |
 | GNN training | `GNN/03_train_bigat.py` | CLI entry point |
 | Offline evaluation | `GNN/04_test.py` | CLI entry point |
+| Dantzig vs GNN MRR | `GNN/eval_dantzig_vs_gnn.py` | CLI entry point |
 | 3-way benchmark | `irp_gurobi_converted.py` | `run_three_way_benchmark()` |
 | Kaggle entry | `kaggle_irp_pipeline_clean.py` | `__main__` |
 | Run infrastructure | `run_infrastructure.py` | `RunLogger`, `CheckpointManager` |
@@ -965,16 +1070,19 @@ Results/
 - Full ALNS baseline (`BaselineALNSModel`)
 - Full CG engine with RMP, pricing, pruning, Stackelberg (`LateralTransshipmentCG`)
 - Demand shock mechanism (`DemandShockEngine`)
-- BiGAT model (`BiGATColumnScorer`)
-- Teacher data collection and graph building pipeline
+- BiGAT model (`BiGATColumnScorer`) on the 10-feature schema
+- Teacher data collection and graph building pipeline (with ranking filter +
+  constraint-feature propagation fix)
 - BiGAT training loop with pairwise ranking loss
 - Three-phase pipeline orchestration
 - Three-way benchmark runner
+- Dantzig-vs-GNN within-group MRR comparator
 - Results layout management
 - Run infrastructure (checkpointing, logging, CSV helpers)
 
 ### 21.2 What may still need work
-- Fine-tuning hyperparameters for the specific dataset
+- Retraining on the 10-feature schema with `--hidden-dim 64 --epochs 50` and
+  validating that the GNN beats the Dantzig MRR floor on hard groups
 - Generating enough teacher data instances for robust generalization
 - Calibrating the shocking factor for realistic demand scenarios
 - Validating the B&P implementation on larger instances
@@ -996,11 +1104,22 @@ python irp_gurobi_converted.py
 
 # Or use scenario generator for multi-instance training data:
 python GNN/generate_teacher_scenarios.py --master-csv data.csv --bases "b1:5:3"
-python GNN/build_teacher_graph_dataset.py --teacher-csv Results/scenarios/aggregate_teacher_rows.csv --out-dir GNN/data/irplt_teacher
-python GNN/03_train_bigat.py --data-dir GNN/data/irplt_teacher --out-dir GNN/trained_models/irplt_teacher/bigat
+python GNN/build_teacher_graph_dataset.py \
+    --teacher-csv Results/scenarios/aggregate_teacher_rows.csv \
+    --out-dir GNN/data/irplt_teacher_E2_filtered \
+    --ranking-filter-groups --min-group-size 2 --require-mixed-labels --overwrite
+python GNN/03_train_bigat.py \
+    --data-dir GNN/data/irplt_teacher_E2_filtered \
+    --out-dir GNN/trained_models/irplt_teacher_E2_filtered/bigat/pairwise_rank \
+    --hidden-dim 64 --epochs 50 --patience 15 --objective pairwise_rank
+
+# Sanity check: GNN MRR vs Dantzig (-RC) MRR on full test + hard groups
+python GNN/eval_dantzig_vs_gnn.py \
+    --data-dir GNN/data/irplt_teacher_E2_filtered \
+    --checkpoint GNN/trained_models/irplt_teacher_E2_filtered/bigat/pairwise_rank/best_model.pt
 
 # Phase 2: online inference with pre-trained GNN
-IRP_ONLINE_INFERENCE=1 IRP_GNN_CHECKPOINT=GNN/trained_models/irplt_teacher/bigat/pairwise_rank/best_model.pt \
+IRP_ONLINE_INFERENCE=1 IRP_GNN_CHECKPOINT=GNN/trained_models/irplt_teacher_E2_filtered/bigat/pairwise_rank/best_model.pt \
 python irp_gurobi_converted.py
 
 # Run 3-way benchmark

@@ -1,0 +1,432 @@
+{
+  "generated_at": "2026-04-30T17:04:32Z",
+  "master_csv": "/kaggle/working/Thesis-Work/1BISCR501V_90100140_20260323-150407111_filtered_sites.csv",
+  "time_limit": 300,
+  "n_bases": 6,
+  "n_scenarios": 30,
+  "bases_dir": "/kaggle/working/Thesis-Work/test_baselines/bases",
+  "scenarios_dir": "/kaggle/working/Thesis-Work/test_baselines/scenarios",
+  "usage": "Load scenarios/{source_instance}.pkl.gz \u2192 {'shocked_data': IRPData, 'baseline_sol': FullIRPTSolution}. shocked_data.demand and realized_demand are already set. Pass directly to run_lt_recourse_from_baseline() for A0/E1/E2 CG.",
+  "scenarios": [
+    {
+      "source_instance": "base_01__normal_global__seed1373158607",
+      "base_dataset_id": "base_01",
+      "shock_type": "normal_global",
+      "shock_seed": "1373158607",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_01__normal_global__seed1373158607.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_01__gamma_store__seed239081664",
+      "base_dataset_id": "base_01",
+      "shock_type": "gamma_store",
+      "shock_seed": "239081664",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_01__gamma_store__seed239081664.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_01__sku_spike__seed53710185",
+      "base_dataset_id": "base_01",
+      "shock_type": "sku_spike",
+      "shock_seed": "53710185",
+      "shock_params": {
+        "shock_probability": "0.95",
+        "max_reallocation_fraction": "0.40",
+        "reallocations_per_product_period": "2",
+        "non_dispatch_shock_multiplier": "2.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_01__sku_spike__seed53710185.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_01__normal_global__seed1592467582",
+      "base_dataset_id": "base_01",
+      "shock_type": "normal_global",
+      "shock_seed": "1592467582",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_01__normal_global__seed1592467582.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_01__gamma_store__seed590620972",
+      "base_dataset_id": "base_01",
+      "shock_type": "gamma_store",
+      "shock_seed": "590620972",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_01__gamma_store__seed590620972.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_04__normal_global__seed1268073013",
+      "base_dataset_id": "base_04",
+      "shock_type": "normal_global",
+      "shock_seed": "1268073013",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_04__normal_global__seed1268073013.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_04__gamma_store__seed906070221",
+      "base_dataset_id": "base_04",
+      "shock_type": "gamma_store",
+      "shock_seed": "906070221",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_04__gamma_store__seed906070221.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_04__sku_spike__seed68252794",
+      "base_dataset_id": "base_04",
+      "shock_type": "sku_spike",
+      "shock_seed": "68252794",
+      "shock_params": {
+        "shock_probability": "0.95",
+        "max_reallocation_fraction": "0.40",
+        "reallocations_per_product_period": "2",
+        "non_dispatch_shock_multiplier": "2.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_04__sku_spike__seed68252794.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_04__normal_global__seed63989048",
+      "base_dataset_id": "base_04",
+      "shock_type": "normal_global",
+      "shock_seed": "63989048",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_04__normal_global__seed63989048.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_04__gamma_store__seed201209006",
+      "base_dataset_id": "base_04",
+      "shock_type": "gamma_store",
+      "shock_seed": "201209006",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_04__gamma_store__seed201209006.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_08__normal_global__seed597409993",
+      "base_dataset_id": "base_08",
+      "shock_type": "normal_global",
+      "shock_seed": "597409993",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_08__normal_global__seed597409993.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_08__gamma_store__seed1738238662",
+      "base_dataset_id": "base_08",
+      "shock_type": "gamma_store",
+      "shock_seed": "1738238662",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_08__gamma_store__seed1738238662.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_08__sku_spike__seed1866808230",
+      "base_dataset_id": "base_08",
+      "shock_type": "sku_spike",
+      "shock_seed": "1866808230",
+      "shock_params": {
+        "shock_probability": "0.95",
+        "max_reallocation_fraction": "0.40",
+        "reallocations_per_product_period": "2",
+        "non_dispatch_shock_multiplier": "2.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_08__sku_spike__seed1866808230.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_08__normal_global__seed13955984",
+      "base_dataset_id": "base_08",
+      "shock_type": "normal_global",
+      "shock_seed": "13955984",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_08__normal_global__seed13955984.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_08__gamma_store__seed1629526406",
+      "base_dataset_id": "base_08",
+      "shock_type": "gamma_store",
+      "shock_seed": "1629526406",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_08__gamma_store__seed1629526406.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_09__normal_global__seed1730483679",
+      "base_dataset_id": "base_09",
+      "shock_type": "normal_global",
+      "shock_seed": "1730483679",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_09__normal_global__seed1730483679.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_09__gamma_store__seed342865763",
+      "base_dataset_id": "base_09",
+      "shock_type": "gamma_store",
+      "shock_seed": "342865763",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_09__gamma_store__seed342865763.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_09__sku_spike__seed1499242942",
+      "base_dataset_id": "base_09",
+      "shock_type": "sku_spike",
+      "shock_seed": "1499242942",
+      "shock_params": {
+        "shock_probability": "0.95",
+        "max_reallocation_fraction": "0.40",
+        "reallocations_per_product_period": "2",
+        "non_dispatch_shock_multiplier": "2.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_09__sku_spike__seed1499242942.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_09__normal_global__seed907557513",
+      "base_dataset_id": "base_09",
+      "shock_type": "normal_global",
+      "shock_seed": "907557513",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_09__normal_global__seed907557513.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_09__gamma_store__seed730682428",
+      "base_dataset_id": "base_09",
+      "shock_type": "gamma_store",
+      "shock_seed": "730682428",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_09__gamma_store__seed730682428.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_21__normal_global__seed794957573",
+      "base_dataset_id": "base_21",
+      "shock_type": "normal_global",
+      "shock_seed": "794957573",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_21__normal_global__seed794957573.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_21__gamma_store__seed762938026",
+      "base_dataset_id": "base_21",
+      "shock_type": "gamma_store",
+      "shock_seed": "762938026",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_21__gamma_store__seed762938026.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_21__sku_spike__seed449912920",
+      "base_dataset_id": "base_21",
+      "shock_type": "sku_spike",
+      "shock_seed": "449912920",
+      "shock_params": {
+        "shock_probability": "0.95",
+        "max_reallocation_fraction": "0.40",
+        "reallocations_per_product_period": "2",
+        "non_dispatch_shock_multiplier": "2.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_21__sku_spike__seed449912920.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_21__normal_global__seed1439190227",
+      "base_dataset_id": "base_21",
+      "shock_type": "normal_global",
+      "shock_seed": "1439190227",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_21__normal_global__seed1439190227.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_21__gamma_store__seed573330499",
+      "base_dataset_id": "base_21",
+      "shock_type": "gamma_store",
+      "shock_seed": "573330499",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_21__gamma_store__seed573330499.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_24__normal_global__seed525727462",
+      "base_dataset_id": "base_24",
+      "shock_type": "normal_global",
+      "shock_seed": "525727462",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_24__normal_global__seed525727462.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_24__gamma_store__seed350904184",
+      "base_dataset_id": "base_24",
+      "shock_type": "gamma_store",
+      "shock_seed": "350904184",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_24__gamma_store__seed350904184.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_24__sku_spike__seed992696250",
+      "base_dataset_id": "base_24",
+      "shock_type": "sku_spike",
+      "shock_seed": "992696250",
+      "shock_params": {
+        "shock_probability": "0.95",
+        "max_reallocation_fraction": "0.40",
+        "reallocations_per_product_period": "2",
+        "non_dispatch_shock_multiplier": "2.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_24__sku_spike__seed992696250.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_24__normal_global__seed814874364",
+      "base_dataset_id": "base_24",
+      "shock_type": "normal_global",
+      "shock_seed": "814874364",
+      "shock_params": {
+        "shock_probability": "0.85",
+        "max_reallocation_fraction": "0.60",
+        "reallocations_per_product_period": "3",
+        "non_dispatch_shock_multiplier": "1.8"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_24__normal_global__seed814874364.pkl.gz",
+      "status": "ok"
+    },
+    {
+      "source_instance": "base_24__gamma_store__seed579708538",
+      "base_dataset_id": "base_24",
+      "shock_type": "gamma_store",
+      "shock_seed": "579708538",
+      "shock_params": {
+        "shock_probability": "0.75",
+        "max_reallocation_fraction": "0.80",
+        "reallocations_per_product_period": "4",
+        "non_dispatch_shock_multiplier": "2.2"
+      },
+      "pkl_path": "/kaggle/working/Thesis-Work/test_baselines/scenarios/base_24__gamma_store__seed579708538.pkl.gz",
+      "status": "ok"
+    }
+  ]
+}

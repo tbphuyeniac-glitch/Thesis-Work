@@ -835,8 +835,16 @@ class ThesisCRunner:
             shortage_cost = float(realized.get("shortage_cost_realized", 0.0))
             shortage_qty  = float(realized.get("total_realized_shortage_units", 0.0))
 
-            # Service level = 1 - shortage_qty / total_demand
-            total_demand = float(realized.get("total_demand", 1.0)) or 1.0
+            # Service level = 1 - shortage_qty / total_realized_demand
+            # "total_realized_demand" lives in post_shock_summary (not in the
+            # cost breakdown dict), so fall back to summing data.realized_demand.
+            post_shock_summary = results.get("post_shock_summary") or {}
+            total_demand = (
+                float(post_shock_summary.get("total_realized_demand", 0.0))
+                or float(realized.get("total_realized_demand", 0.0))
+                or sum(float(v) for v in data.realized_demand.values())
+                or 1.0
+            )
             service_level = max(0.0, 1.0 - shortage_qty / total_demand)
 
             # LT plan from results
@@ -848,10 +856,10 @@ class ThesisCRunner:
             else:
                 lt_total_qty, n_lt_moves = 0.0, 0
 
-            # CG stats
+            # CG stats — actual key in cg_history is "proposed_columns"
             n_cols_gen  = int(results.get("gnn_candidates_before", 0))
             n_cols_sel  = int(results.get("gnn_selected_columns", 0))
-            n_cols_gen  = n_cols_gen or sum(int(ep.get("generated_columns", 0)) for ep in cg_history)
+            n_cols_gen  = n_cols_gen or sum(int(ep.get("proposed_columns", 0)) for ep in cg_history)
 
             print(f"  [ThesisC breakdown] routing={routing_cost:.2f}  "
                   f"holding={holding_cost:.2f}  shortage={shortage_cost:.2f}  "

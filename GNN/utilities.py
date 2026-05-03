@@ -22,10 +22,13 @@ COLUMN_FEATURE_NAMES = [
     "avg_surplus_ratio",
     "avg_time_urgency",
     "avg_negative_reduced_cost",
-    "acceptance_score",
-    "compensation_mean",
     "column_cost",
 ]
+
+# Indices in legacy 12-feature column vectors that the current 10-feature schema
+# drops (acceptance_score, compensation_mean). E1/E2 do not include the
+# Stackelberg compensation game, so these features carry no signal.
+_LEGACY_COLUMN_FEATURE_INDICES_TO_DROP = (9, 10)
 
 CONSTRAINT_FEATURE_NAMES = [
     "dual_value",
@@ -157,9 +160,7 @@ def make_synthetic_irplt_graph(
                 float(dual_surplus[surplus_id] * qty),
             ])
 
-        acceptance_score = float(np.clip(rng.beta(3.0, 2.0) if reduced_cost < 0 else rng.beta(1.5, 4.0), 0.0, 1.0))
-        compensation_mean = _positive_normal(rng, mean=0.2 * total_flow, std=0.2, floor=0.0)
-        label = 1.0 if (reduced_cost < 0 and acceptance_score >= 0.45) else 0.0
+        label = 1.0 if reduced_cost < 0 else 0.0
 
         column_features.append([
             reduced_cost,
@@ -171,8 +172,6 @@ def make_synthetic_irplt_graph(
             float(np.mean(surplus_ratios)),
             float(np.mean(urgencies)),
             float(np.mean(negative_pair_rcs)),
-            acceptance_score,
-            compensation_mean,
             column_cost,
         ])
         labels.append(label)
@@ -322,7 +321,6 @@ def build_bigraph_for_patterns(
             edge_attrs.append([qty, qty / max(donor_surplus, 1e-9), d_surplus * qty])
 
         column_cost = float(getattr(pat, "column_cost", 0.0))
-        pat_metadata = getattr(pat, "metadata", {}) or {}
         column_features.append([
             reduced_cost,
             total_flow,
@@ -333,8 +331,6 @@ def build_bigraph_for_patterns(
             float(np.mean(surplus_ratios)) if surplus_ratios else 0.0,
             float(np.mean(urgencies)) if urgencies else 0.0,
             float(np.mean(neg_pair_rc)) if neg_pair_rc else 0.0,
-            float(pat_metadata.get("mean_acceptance_score", pat_metadata.get("acceptance_score", 0.0))),
-            float(pat_metadata.get("mean_compensation", pat_metadata.get("compensation", 0.0))),
             column_cost,
         ])
 
@@ -502,7 +498,16 @@ def build_training_sample_from_exported_teacher_rows(
     for col_idx, row in enumerate(rows):
         if not row.get("column_features_json"):
             raise ValueError(f"teacher row for pattern {row.get('pattern_id')} is missing column_features_json")
-        column_features.append([float(value) for value in _json_load_value(row.get("column_features_json"), [])])
+        feature_row = [float(value) for value in _json_load_value(row.get("column_features_json"), [])]
+        if len(feature_row) == len(COLUMN_FEATURE_NAMES) + len(_LEGACY_COLUMN_FEATURE_INDICES_TO_DROP):
+            drop = set(_LEGACY_COLUMN_FEATURE_INDICES_TO_DROP)
+            feature_row = [v for i, v in enumerate(feature_row) if i not in drop]
+        if len(feature_row) != len(COLUMN_FEATURE_NAMES):
+            raise ValueError(
+                f"column_features_json for pattern {row.get('pattern_id')} has {len(feature_row)} entries; "
+                f"expected {len(COLUMN_FEATURE_NAMES)}"
+            )
+        column_features.append(feature_row)
         constraint_ids = _json_load_value(row.get("edge_constraint_indices_json"), [])
         attrs = _json_load_value(row.get("edge_attrs_json"), [])
         if len(constraint_ids) != len(attrs):
@@ -686,8 +691,18 @@ def load_graph_sample(path: str | Path) -> Dict[str, torch.Tensor]:
 
 
 def graph_to_tensors(sample: Dict[str, Any], device: str | torch.device | None = None) -> Dict[str, torch.Tensor]:
+    column_features = torch.as_tensor(sample["column_features"], dtype=torch.float32, device=device)
+    target_dim = len(COLUMN_FEATURE_NAMES)
+    legacy_dim = target_dim + len(_LEGACY_COLUMN_FEATURE_INDICES_TO_DROP)
+    if column_features.shape[1] == legacy_dim:
+        keep = [i for i in range(legacy_dim) if i not in set(_LEGACY_COLUMN_FEATURE_INDICES_TO_DROP)]
+        column_features = column_features[:, keep]
+    elif column_features.shape[1] != target_dim:
+        raise ValueError(
+            f"column_features has {column_features.shape[1]} dims; expected {target_dim} (or legacy {legacy_dim})"
+        )
     graph = {
-        "column_features": torch.as_tensor(sample["column_features"], dtype=torch.float32, device=device),
+        "column_features": column_features,
         "constraint_features": torch.as_tensor(sample["constraint_features"], dtype=torch.float32, device=device),
         "edge_index_col_to_con": torch.as_tensor(sample["edge_index_col_to_con"], dtype=torch.long, device=device),
         "edge_attr_col_to_con": torch.as_tensor(sample["edge_attr_col_to_con"], dtype=torch.float32, device=device),

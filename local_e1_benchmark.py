@@ -1,7 +1,10 @@
-"""Local E1 ablation benchmark: A0_no_penalty vs E1_rc_only vs E1_rc_gnn.
+"""Local E1 ablation benchmark: A0 vs E1_rc_only (k=1 and k=3) vs E1_rc_gnn.
 
-Runs the same ALNS baseline once, then for each variant applies the same demand
-shock and runs CG. Reports objective, runtime, CG iterations.
+Tests the fix for the "k=3 same (p,t) overhead" bug:
+  - E1_rc_only_k3 (OLD): max_columns_per_product_period=3 → adds 3 cols from
+    same (p,t) per iter → RMP grows 3× faster, LP uses only 1 at optimum
+  - E1_rc_only_k1 (FIX): rc_only_cols_per_pp=1 → 1 best col per (p,t) per
+    iter → diversity from different (p,t) pairs, same as A0's pool_size=1
 
 Usage:
     IRP_GNN_CHECKPOINT=GNN/trained_models/irplt_teacher_filtered_local3/bigat/pairwise_rank/best_model.pt \
@@ -107,20 +110,34 @@ def main():
     print(f"[bench] GNN checkpoint: {gnn_ckpt}")
 
     variants = [
+        # A0: exact Gurobi MIP pricing, 1 column per (p,t) per iter (pool_size=1)
         ("A0_no_penalty", {
             "use_gnn": False, "collect_teacher_mode": False,
             "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
             "exact_full_mode": True,
         }),
-        ("E1_rc_only", {
+        # E1 OLD (k=3): RC filter, 3 cols per (p,t) per iter — demonstrates the
+        # overhead bug: RMP grows 3× faster with no quality gain (extra cols λ=0)
+        ("E1_rc_only_k3", {
             "use_gnn": False, "collect_teacher_mode": False,
             "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
             "rc_filter_mode": True,
+            "rc_only_cols_per_pp": 3,   # old behavior for comparison
         }),
-        ("E1_rc_gnn", {
+        # E1 FIX (k=1): RC filter, 1 best col per (p,t) per iter — mirrors A0's
+        # pool_size=1; diversity across (p,t) pairs, not depth within one pair
+        ("E1_rc_only_k1", {
+            "use_gnn": False, "collect_teacher_mode": False,
+            "runtime_gnn_mode": False, "heuristic_top_k_mode": False,
+            "rc_filter_mode": True,
+            "rc_only_cols_per_pp": 1,   # default, explicit for clarity
+        }),
+        # E1+GNN (k=1): GNN ranker on top of k=1 RC filter
+        ("E1_rc_gnn_k1", {
             "use_gnn": True, "collect_teacher_mode": False,
             "runtime_gnn_mode": True, "heuristic_top_k_mode": False,
             "rc_filter_mode": True,
+            "rc_only_cols_per_pp": 1,
             "gnn_selection_mode": "relative_threshold",
             "gnn_relative_threshold": 0.70,
             "gnn_max_keep_fraction": 0.30,
@@ -141,42 +158,59 @@ def main():
     print("\n" + "#" * 76)
     print("# E1 ABLATION SUMMARY  (mean across scenarios)")
     print("#" * 76)
-    print(f"{'variant':<18} {'obj_mean':>12} {'rt_mean':>10} {'iters_mean':>11} {'cols_mean':>10}")
+    print(f"{'variant':<22} {'obj_mean':>12} {'rt_mean':>10} {'iters_mean':>11} {'cols_mean':>10}")
     summary = {}
     for v_name, _ in variants:
         rows = [r for r in all_rows if r["variant"] == v_name]
         n = len(rows) or 1
         s = {
-            "obj_mean": sum(r["objective"] for r in rows) / n,
-            "rt_mean":  sum(r["runtime_s"] for r in rows) / n,
+            "obj_mean":   sum(r["objective"] for r in rows) / n,
+            "rt_mean":    sum(r["runtime_s"] for r in rows) / n,
             "iters_mean": sum(r["cg_iterations"] for r in rows) / n,
             "cols_mean":  sum(r["total_columns"] for r in rows) / n,
         }
         summary[v_name] = s
-        print(f"{v_name:<18} {s['obj_mean']:>12.2f} {s['rt_mean']:>10.1f}s "
+        print(f"{v_name:<22} {s['obj_mean']:>12.2f} {s['rt_mean']:>10.1f}s "
               f"{s['iters_mean']:>11.1f} {s['cols_mean']:>10.1f}")
 
-    # Verdict deltas
-    a0 = summary.get("A0_no_penalty")
-    e1ro = summary.get("E1_rc_only")
-    e1rg = summary.get("E1_rc_gnn")
-    if a0 and e1ro and e1rg:
+    # Verdict: k=3 bug vs k=1 fix
+    a0   = summary.get("A0_no_penalty")
+    k3   = summary.get("E1_rc_only_k3")
+    k1   = summary.get("E1_rc_only_k1")
+    gnn1 = summary.get("E1_rc_gnn_k1")
+
+    if a0:
         print("\n[verdict — vs A0_no_penalty]")
-        for tag, s in [("E1_rc_only", e1ro), ("E1_rc_gnn", e1rg)]:
+        for tag, s in [("E1_rc_only_k3", k3), ("E1_rc_only_k1", k1), ("E1_rc_gnn_k1", gnn1)]:
+            if s is None:
+                continue
             d_obj = s["obj_mean"] - a0["obj_mean"]
             d_rt  = s["rt_mean"] / max(1e-6, a0["rt_mean"])
             d_it  = s["iters_mean"] - a0["iters_mean"]
-            print(f"  {tag:<12}  Δobj={d_obj:+.2f}  rt_ratio={d_rt:.2f}x  Δiters={d_it:+.1f}")
-        print("\n[verdict — E1_rc_gnn vs E1_rc_only (marginal GNN contribution)]")
-        d_obj = e1rg["obj_mean"] - e1ro["obj_mean"]
-        d_rt  = e1rg["rt_mean"] / max(1e-6, e1ro["rt_mean"])
-        d_it  = e1rg["iters_mean"] - e1ro["iters_mean"]
-        print(f"  Δobj={d_obj:+.2f}  rt_ratio={d_rt:.2f}x  Δiters={d_it:+.1f}")
+            d_col = s["cols_mean"] - a0["cols_mean"]
+            print(f"  {tag:<18}  Δobj={d_obj:+.2f}  rt_ratio={d_rt:.2f}×  Δiters={d_it:+.1f}  Δcols={d_col:+.0f}")
 
-    out_path = Path("Results_local_e1_bench") / "e1_ablation.json"
+    if k3 and k1:
+        print("\n[verdict — k=1 FIX vs k=3 OLD (same pricing path)]")
+        d_obj = k1["obj_mean"] - k3["obj_mean"]
+        d_rt  = k1["rt_mean"] / max(1e-6, k3["rt_mean"])
+        d_it  = k1["iters_mean"] - k3["iters_mean"]
+        d_col = k1["cols_mean"] - k3["cols_mean"]
+        print(f"  Δobj={d_obj:+.2f}  rt_ratio={d_rt:.2f}×  Δiters={d_it:+.1f}  Δcols={d_col:+.0f}")
+        print(f"  (expected: Δiters≈0 or small +, rt_ratio<1.0 = faster, Δcols≈−2/3 per active pp)")
+
+    if k1 and gnn1:
+        print("\n[verdict — E1_rc_gnn_k1 vs E1_rc_only_k1 (marginal GNN on k=1)]")
+        d_obj = gnn1["obj_mean"] - k1["obj_mean"]
+        d_rt  = gnn1["rt_mean"] / max(1e-6, k1["rt_mean"])
+        d_it  = gnn1["iters_mean"] - k1["iters_mean"]
+        print(f"  Δobj={d_obj:+.2f}  rt_ratio={d_rt:.2f}×  Δiters={d_it:+.1f}")
+
+    out_path = Path("Results_local_e1_bench") / "e1_k1_vs_k3_ablation.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump({"rows": all_rows, "summary": summary}, f, indent=2)
+    print(f"\n[bench] results saved → {out_path}")
     print(f"\n[bench] saved {out_path}")
 
 

@@ -1,0 +1,19 @@
+{
+  "best_valid_mrr": 0.9213302244967735,
+  "best_valid_loss": null,
+  "primary_metric": "ranking_mrr",
+  "objective": "pairwise_rank",
+  "dataset_type": "teacher",
+  "data_dir": "GNN/data/irplt_teacher_E2_filtered",
+  "resume_checkpoint": null,
+  "auto_resume": false,
+  "label_sources": {
+    "teacher_rmp": 12302
+  },
+  "last_epoch": 3,
+  "history_rows": 3,
+  "checkpoint": "GNN/trained_models/irplt_teacher_E2_filtered_3epochs/bigat/pairwise_rank/best_model.pt",
+  "last_checkpoint": "GNN/trained_models/irplt_teacher_E2_filtered_3epochs/bigat/pairwise_rank/last_model.pt",
+  "history": "GNN/trained_models/irplt_teacher_E2_filtered_3epochs/bigat/pairwise_rank/training_history.json",
+  "loss_chart": "GNN/trained_models/irplt_teacher_E2_filtered_3epochs/bigat/pairwise_rank/training_loss_curve.png"
+}

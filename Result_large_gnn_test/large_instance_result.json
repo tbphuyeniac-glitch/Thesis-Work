@@ -1,0 +1,20 @@
+[
+  {
+    "variant": "A0_QUAD",
+    "rmp_objective": 26325183087101.02,
+    "runtime_seconds": 84.83973533399694,
+    "cg_iterations": 10
+  },
+  {
+    "variant": "E2_GNN",
+    "rmp_objective": 26325183068249.598,
+    "runtime_seconds": 60.47412354199332,
+    "cg_iterations": 10
+  },
+  {
+    "variant": "E1_k3",
+    "rmp_objective": 26325181372359.21,
+    "runtime_seconds": 162.3768680840003,
+    "cg_iterations": 26
+  }
+]
