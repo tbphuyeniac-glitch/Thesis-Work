@@ -81,6 +81,7 @@ class GASAResult:
     routing_cost: float = 0.0
     holding_cost: float = 0.0
     shortage_cost: float = 0.0
+    shortage_qty: float = 0.0   # total shortage in units (for service-level computation)
     ship_cost: float = 0.0
     vehicle_fixed_cost: float = 0.0
 
@@ -117,15 +118,22 @@ class BaselineGASASolver:
     # =========================================================
     # Public API
     # =========================================================
-    def solve(self) -> GASAResult:
+    def solve(self, initial_routes: Optional[Chromosome] = None) -> GASAResult:
+        """
+        initial_routes: if provided, skip constructive phase and seed the
+        population from these routes (e.g. extracted from a Gurobi solution).
+        """
         start = time.time()
 
         t0 = time.time()
-        seed_routes = self._constructive_greedy()
+        if initial_routes is not None:
+            seed_routes = initial_routes
+        else:
+            seed_routes = self._constructive_greedy()
         constructive_runtime = time.time() - t0
         seed_obj = self._evaluate_routes(seed_routes)["total"]
 
-        # Population seeded by perturbing constructive solution
+        # Population seeded by perturbing the initial solution
         population: List[Tuple[Chromosome, float]] = [(seed_routes, seed_obj)]
         for _ in range(max(1, self.params.population_size - 1)):
             perturbed = self._two_opt(seed_routes)
@@ -140,13 +148,17 @@ class BaselineGASASolver:
         iter_count = 0
         improvement_start = time.time()
 
-        while T > self.params.final_temperature:
+        def _time_exceeded() -> bool:
+            return (self.params.time_limit is not None
+                    and (time.time() - start) >= self.params.time_limit)
+
+        # Outer loop: SA with reheat — when T cools to final_temperature,
+        # reheat back to initial_temperature (restarting from best) and
+        # continue until time_limit or max_iterations is reached.
+        while not _time_exceeded() and iter_count <= self.params.max_iterations:
             for _ in range(self.params.iterations_per_temp):
                 iter_count += 1
-                if iter_count > self.params.max_iterations:
-                    break
-                if (self.params.time_limit is not None
-                        and (time.time() - start) >= self.params.time_limit):
+                if iter_count > self.params.max_iterations or _time_exceeded():
                     break
 
                 # GA: select parents → crossover → mutate
@@ -176,12 +188,16 @@ class BaselineGASASolver:
                     new_best_count += 1
 
             history.append((T, best_obj))
-            if iter_count > self.params.max_iterations:
+            if iter_count > self.params.max_iterations or _time_exceeded():
                 break
-            if (self.params.time_limit is not None
-                    and (time.time() - start) >= self.params.time_limit):
-                break
+
             T *= self.params.cooling_ratio
+
+            # Reheat: when cooled to final_temperature, restart from best
+            if T <= self.params.final_temperature:
+                T = self.params.initial_temperature
+                current_routes = self._copy(best_routes)
+                current_obj    = best_obj
 
         improvement_runtime = time.time() - improvement_start
 
@@ -198,6 +214,7 @@ class BaselineGASASolver:
             routing_cost=bd["routing"],
             holding_cost=bd["holding"],
             shortage_cost=bd["shortage"],
+            shortage_qty=bd["shortage_qty"],
             ship_cost=bd["ship"],
             vehicle_fixed_cost=bd["vehicle_fixed"],
         )
@@ -243,9 +260,10 @@ class BaselineGASASolver:
         }
         inv_cw: Dict[int, float] = {p: float(inst.I0.get((p, 0), 0.0)) for p in inst.P}
 
-        holding   = 0.0
-        shortage  = 0.0
-        ship_cost = 0.0
+        holding      = 0.0
+        shortage     = 0.0
+        shortage_qty = 0.0
+        ship_cost    = 0.0
 
         for t in H:
             # 1. CW replenishment
@@ -264,9 +282,9 @@ class BaselineGASASolver:
                         if inv_store[(p, store)] >= d_t:
                             inv_store[(p, store)] -= d_t
                         else:
-                            shortage += float(inst.f.get((p, store), 0.25)) * (
-                                d_t - inv_store[(p, store)]
-                            )
+                            _sh = d_t - inv_store[(p, store)]
+                            shortage     += float(inst.f.get((p, store), 0.25)) * _sh
+                            shortage_qty += _sh
                             inv_store[(p, store)] = 0.0
                 # End-of-period store holding cost
                 for p in inst.P:
@@ -319,9 +337,9 @@ class BaselineGASASolver:
                     if inv_store[(p, store)] >= d_t:
                         inv_store[(p, store)] -= d_t
                     else:
-                        shortage += float(inst.f.get((p, store), 0.25)) * (
-                            d_t - inv_store[(p, store)]
-                        )
+                        _sh = d_t - inv_store[(p, store)]
+                        shortage     += float(inst.f.get((p, store), 0.25)) * _sh
+                        shortage_qty += _sh
                         inv_store[(p, store)] = 0.0
 
             # 4. End-of-period holding cost
@@ -335,6 +353,7 @@ class BaselineGASASolver:
             "routing":       routing,
             "holding":       holding,
             "shortage":      shortage,
+            "shortage_qty":  shortage_qty,
             "ship":          ship_cost,
             "vehicle_fixed": veh_fixed,
             "total":         total,

@@ -100,6 +100,10 @@ def solve_joint_tc(
     pen2 = float(shortage_penalty_stage2)
     cij_trans = [[cij[i][j] * lt_cost_multiplier for j in range(nodes_number)]
                  for i in range(nodes_number)]
+    # Thesis math model: b_{ij} = 0.01 * alpha * dist (per-unit, not per-arc)
+    # alpha=1.0 in the thesis benchmark, so b_{ij} = 0.01 * dist_{ij}
+    cij_unit = [[0.01 * cij[i][j] for j in range(nodes_number)]
+                for i in range(nodes_number)]
     eps_eq = 1e-5   # tolerance for inventory balance equalities (BFP-TC convention)
     t0 = time.time()
 
@@ -230,11 +234,12 @@ def solve_joint_tc(
     for m_idx in range(M):
         obj.addTerms(him[0][m_idx], Iim[0][m_idx])
 
-    # Stage 2: LT transport cost (binary route gate, not per-unit — same as BFP-TC)
+    # Stage 2: LT transport cost — thesis math model b_{ij} * w_{ijm} (per-unit, not per-arc)
     for i in range(N):
         for j in range(N):
             if i != j:
-                obj.addTerms(cij_trans[i+1][j+1], zij[i][j])
+                for m_idx in range(M):
+                    obj.addTerms(cij_unit[i+1][j+1], wijm[i][j][m_idx])
 
     # Stage 2: post-LT holding cost — the SOLE holding term for stores.
     for i in range(N):
@@ -503,8 +508,11 @@ def solve_joint_tc(
                 for m_idx in range(M):
                     wijm_val[i, j, m_idx] = wijm[i][j][m_idx].X
 
-    s2_lt = sum(cij_trans[i+1][j+1] * zij_val[i, j]
-                for i in range(N) for j in range(N) if i != j)
+    s2_lt = sum(
+        cij_unit[i+1][j+1] * wijm_val.get((i, j, m_idx), 0.0)
+        for i in range(N) for j in range(N) if i != j
+        for m_idx in range(M)
+    )
     s2_holding = sum(him[i+1][m_idx] * post_inv_val[i][m_idx]
                      for i in range(N) for m_idx in range(M))
     final_stockout_units = sum(rem_short_val[i][m_idx]
@@ -524,7 +532,7 @@ def solve_joint_tc(
                 "to_store_idx": j,
                 "product_idx": m_idx,
                 "qty": qty,
-                "unit_cost": cij_trans[i+1][j+1],
+                "unit_cost": cij_unit[i+1][j+1],
             })
 
     mip_gap_val = float(m.MIPGap)

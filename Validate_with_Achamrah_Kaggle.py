@@ -1003,7 +1003,11 @@ class AchamrahRunner:
         h_cost.update({(p, 0): 0.0 for p in P})
         f_cost = {(p, i): SHORTAGE_COST_RATE for p in P for i in N}
         f_cost.update({(p, 0): 0.0 for p in P})
-        b_cost = {(i, j): LT_COST_FLAT for i in N for j in N if i != j}
+        # Thesis math model: b_{ij} = 0.01 * alpha * dist_{ij} (per unit shipped)
+        b_cost = {
+            (i, j): 0.01 * ROUTING_ALPHA * d_achamrah.get((i, j), 100.0)
+            for i in N for j in N if i != j
+        }
 
         # Storage capacities: size from data so the constraint never spuriously
         # binds. Stores: 5× initial inventory + buffer for LT/delivery inflows.
@@ -1175,7 +1179,7 @@ class AchamrahRunner:
                     "to_store":     to_name,
                     "sku":          sku_name,
                     "lt_qty":       mv.get("quantity", 0.0),
-                    "lt_unit_cost": LT_COST_FLAT,
+                    "lt_unit_cost": b_cost.get((mv.get("from_store"), mv.get("to_store")), 0.01 * ROUTING_ALPHA * 100.0),
                     "lt_total_cost": mv.get("cost", 0.0),
                     "vehicle": mv.get("vehicle", "N/A") or "N/A",
                     "achamrah_vehicle_indexed_lt": self.vehicle_indexed_lt,

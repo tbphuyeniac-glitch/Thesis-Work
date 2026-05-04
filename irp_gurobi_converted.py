@@ -1735,10 +1735,20 @@ class BaselineALNSModel:
         return {t for t in d.periods if (t - t0) % cycle == 0}
 
     def _target_delivery(self, s: Store, p: Product, t: Period, prev_inv: float) -> float:
-        """How much to push to (s,p) in period t: cover current demand + small safety buffer, bounded by max store inv."""
+        """Target delivery quantity for (s,p) at dispatch period t.
+
+        Bug fix: previously covered only 1 dispatch cycle (current + future
+        until next dispatch). When the WH is over-supplied (init_wh near
+        max_wh + heavy replenishment), Gurobi is FORCED to dispatch full
+        vehicle capacity to avoid WH overflow — ALNS used to leave inventory
+        sitting at WH because its target was already met locally. Now we
+        also account for *WH overflow share*: how much this (s,p) should
+        absorb to keep the WH below its capacity. Final target =
+        max(demand_buffer, wh_overflow_share), capped by store max_room.
+        """
         d = self.data
         demand = float(d.demand.get((s, p, t), 0.0))
-        # Look-ahead: if the next period is not a dispatch period, add its demand too.
+        # Look-ahead until next dispatch period (covers full dispatch cycle).
         future_need = 0.0
         remaining_periods = [tau for tau in d.periods if tau > t]
         for tau in remaining_periods:
@@ -1746,6 +1756,38 @@ class BaselineALNSModel:
             if tau in self._dispatch_periods:
                 break
         need = max(0.0, demand + future_need - prev_inv)
+
+        # WH overflow share: how much we need to offload from WH to stay
+        # within capacity. Distribute proportionally across stores by
+        # remaining demand share.
+        max_wh = float(d.max_inventory_wh.get(p, float("inf")))
+        if math.isfinite(max_wh):
+            # Estimate WH inventory if we don't dispatch this product
+            # any further at this period: init + cum_replenish - cum_dispatch.
+            # Simpler proxy: if init + total_future_replenish > max_wh,
+            # we must offload the difference across remaining dispatches.
+            init_wh = float(d.init_inventory_wh.get(p, 0.0))
+            future_replenish = sum(
+                float(d.replenishment_wh.get((p, tau), 0.0))
+                for tau in d.periods if tau >= t
+            )
+            future_dispatches = max(1, sum(1 for tau in d.periods if tau >= t and tau in self._dispatch_periods))
+            # Total demand for this product across all stores remaining
+            store_demand_share = 0.0
+            total_demand_remaining = 0.0
+            for tau in d.periods:
+                if tau < t:
+                    continue
+                store_demand_share += float(d.demand.get((s, p, tau), 0.0))
+                for ss in d.stores:
+                    total_demand_remaining += float(d.demand.get((ss, p, tau), 0.0))
+            share = store_demand_share / max(1.0, total_demand_remaining)
+            # Volume that MUST be offloaded across all dispatches to satisfy WH cap
+            wh_offload_total = max(0.0, init_wh + future_replenish - max_wh)
+            # This dispatch's portion (per store, proportional to demand share)
+            wh_offload_here = wh_offload_total / future_dispatches * share
+            need = max(need, wh_offload_here + max(0.0, demand - prev_inv))
+
         max_room = max(0.0, float(d.max_inventory_store.get((s, p), float("inf"))) - prev_inv)
         return min(need, max_room)
 
@@ -1782,36 +1824,55 @@ class BaselineALNSModel:
                         if key[1] == p:
                             targets[key] *= scale
 
-            # Assign to vehicles via nearest-neighbor, capacity-respecting
+            # Assign to vehicles via nearest-neighbor, capacity-respecting.
+            # Bug fix: previously a store was skipped entirely if its full target
+            # didn't fit — leading to large unused vehicle capacity. We now allow
+            # PARTIAL delivery: visit the nearest store regardless of full fit and
+            # deliver up to remaining capacity (split proportionally across SKUs).
             stores_need = sorted({s for (s, p) in targets if sum(targets.get((s, q), 0.0) for q in d.products) > 1e-9},
                                  key=lambda s: -sum(targets.get((s, q), 0.0) for q in d.products))
             remaining_stores = list(stores_need)
+            _MIN_USEFUL_CAP = 1.0   # below this, end the route
             for v in d.vehicles:
                 if not remaining_stores:
                     break
                 capacity = float(d.vehicle_capacity)
                 route: List[Store] = []
                 current_node: Node = d.warehouse
-                while remaining_stores:
-                    # pick nearest store whose total target fits
+                while remaining_stores and capacity > _MIN_USEFUL_CAP:
+                    # Nearest unvisited store whose target is non-trivial
                     candidates = []
                     for s in remaining_stores:
                         load_s = sum(targets.get((s, q), 0.0) for q in d.products)
-                        if load_s <= capacity + 1e-9:
-                            dist = float(d.distance.get((current_node, s), 0.0))
-                            candidates.append((dist, load_s, s))
+                        if load_s <= 1e-9:
+                            continue
+                        dist = float(d.distance.get((current_node, s), 0.0))
+                        candidates.append((dist, load_s, s))
                     if not candidates:
                         break
-                    candidates.sort(key=lambda item: (item[0], -item[1]))
-                    _, load_s, s = candidates[0]
+                    # Prefer stores whose full target FITS; among those, nearest.
+                    # If none fit, fall back to nearest with partial delivery.
+                    fits = [c for c in candidates if c[1] <= capacity + 1e-9]
+                    pool = fits if fits else candidates
+                    pool.sort(key=lambda item: (item[0], -item[1]))
+                    _, load_s, s = pool[0]
                     route.append(s)
-                    capacity -= load_s
                     current_node = s
                     remaining_stores.remove(s)
+
+                    # Determine per-product delivery: scale to fit remaining cap
+                    if load_s <= capacity + 1e-9:
+                        scale = 1.0
+                    else:
+                        scale = capacity / load_s     # partial delivery
+                    delivered_total = 0.0
                     for p in d.products:
-                        q = float(targets.get((s, p), 0.0))
+                        full_q = float(targets.get((s, p), 0.0))
+                        q = self._snap_qty(full_q * scale)
                         if q > 1e-9:
                             state.deliv[(s, p, v, t)] = q
+                            delivered_total += q
+                    capacity -= delivered_total
                 if route:
                     state.routes[(t, v)] = route
 

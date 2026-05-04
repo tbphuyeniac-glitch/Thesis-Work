@@ -491,7 +491,7 @@ class JointRunner:
             vehicle_capacity=VEHICLE_CAPACITY,
             holding_cost_rate=HOLDING_COST_RATE,
             shortage_cost_rate=SHORTAGE_COST_RATE,
-            dc_capacity=50000.0,                     # = 5 SKUs × 10k init
+            dc_capacity=55000.0,                     # 5 SKUs × 10k init + 5k buffer
             dc_initial_stock_per_product=10000.0,
         )
         self.source_name = self.METHOD_NAME

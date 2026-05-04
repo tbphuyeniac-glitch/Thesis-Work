@@ -315,6 +315,7 @@ class ManBFPTCRunner:
             N, M = static["N"], static["M"]
             store_to_idx = static["store_to_idx"]
             sku_to_idx   = static["sku_to_idx"]
+            cij = static["cij"]  # distance matrix; index 0=DC, 1..N=stores
 
             periods_dt = sorted(df_slice["period_date"].unique())
             num_periods = len(periods_dt)
@@ -406,7 +407,35 @@ class ManBFPTCRunner:
                 agg_stage1_forecast_shortage += float(res.get("stage1_forecast_shortage", 0.0))
                 agg_stage1_forecast_shortage_units += float(
                     res.get("stage1_forecast_shortage_units", 0.0))
-                agg_stage2_lt_transport += float(res.get("stage2_lt_transport_cost", 0.0))
+                # Thesis math model: LT cost = 0.01 * dist_{ij} * qty (per-unit, not per-arc)
+                # Replace Man's arc-gate cost (cij_trans * zij) with thesis per-unit formula.
+                period_thesis_lt = 0.0
+                for mv in res.get("lt_moves", []):
+                    qty = float(mv.get("qty", 0.0))
+                    if qty <= 1e-9:
+                        continue
+                    fi = int(mv["from_store_idx"])
+                    ti = int(mv["to_store_idx"])
+                    pi = int(mv["product_idx"])
+                    thesis_unit = 0.01 * cij[fi + 1][ti + 1]
+                    thesis_total = thesis_unit * qty
+                    period_thesis_lt += thesis_total
+                    lt_moves_out.append({
+                        "scenario_id": scenario_id,
+                        "method":      self.METHOD_NAME,
+                        "period":      t_idx,
+                        "from_store":  id_to_store.get(fi, str(fi)),
+                        "to_store":    id_to_store.get(ti, str(ti)),
+                        "sku":         id_to_sku.get(pi,   str(pi)),
+                        "lt_qty":      qty,
+                        "lt_unit_cost": thesis_unit,
+                        "lt_total_cost": thesis_total,
+                        "vehicle":     "N/A",
+                    })
+                    agg_lt_total_qty += qty
+                    num_lt_moves += 1
+                agg_stage2_lt_transport += period_thesis_lt
+
                 agg_stage2_holding += float(res.get("stage2_holding_cost", 0.0))
                 agg_stage2_remaining_shortage += float(res.get("stage2_remaining_shortage", 0.0))
                 agg_stage2_remaining_shortage_units += float(
@@ -416,29 +445,6 @@ class ManBFPTCRunner:
                 # Period demand contribution to total demand (for service level).
                 agg_total_demand += sum(dim_actual[i][m]
                                         for i in range(N) for m in range(M))
-
-                # LT moves from this period (annotate with names + period).
-                for mv in res.get("lt_moves", []):
-                    qty = float(mv.get("qty", 0.0))
-                    if qty <= 1e-9:
-                        continue
-                    fi = int(mv["from_store_idx"])
-                    ti = int(mv["to_store_idx"])
-                    pi = int(mv["product_idx"])
-                    lt_moves_out.append({
-                        "scenario_id": scenario_id,
-                        "method":      self.METHOD_NAME,
-                        "period":      t_idx,
-                        "from_store":  id_to_store.get(fi, str(fi)),
-                        "to_store":    id_to_store.get(ti, str(ti)),
-                        "sku":         id_to_sku.get(pi,   str(pi)),
-                        "lt_qty":      qty,
-                        "lt_unit_cost": float(mv.get("unit_cost", 0.0)),
-                        "lt_total_cost": qty * float(mv.get("unit_cost", 0.0)),
-                        "vehicle":     "N/A",
-                    })
-                    agg_lt_total_qty += qty
-                    num_lt_moves += 1
 
                 # Roll inventory state to next period.
                 Iim0_dc     = list(res["post_lt_dc_inventory"])
