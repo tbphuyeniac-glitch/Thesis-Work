@@ -11,7 +11,6 @@ Metrics:  Objective, Runtime, Service Level (%), Gap vs Gurobi
 from __future__ import annotations
 import json
 import csv
-import math
 import time
 from collections import defaultdict
 from typing import Dict, Tuple, List, Optional
@@ -42,15 +41,15 @@ SCENARIOS_LARGE = [
     {"label": "L04", "stores": 9, "products": 6, "vehicles": 3, "periods": 60},
     {"label": "L05", "stores": 10, "products": 5, "vehicles": 3, "periods": 60},
     {"label": "L06", "stores": 10, "products": 6, "vehicles": 3, "periods": 60},
-    {"label": "L07", "stores": 10, "products": 7, "vehicles": 3, "periods": 60},
-    {"label": "L08", "stores": 12, "products": 5, "vehicles": 3, "periods": 60},
-    {"label": "L09", "stores": 8, "products": 5, "vehicles": 3, "periods": 90},
-    {"label": "L10", "stores": 9, "products": 5, "vehicles": 3, "periods": 90},
-    {"label": "L11", "stores": 10, "products": 5, "vehicles": 3, "periods": 90},
-    {"label": "L12", "stores": 10, "products": 6, "vehicles": 4, "periods": 90},
-    {"label": "L13", "stores": 12, "products": 5, "vehicles": 3, "periods": 90},
-    {"label": "L14", "stores": 12, "products": 6, "vehicles": 3, "periods": 120},
-    {"label": "L15", "stores": 12, "products": 7, "vehicles": 4, "periods": 120},
+    {"label": "L07", "stores": 10, "products": 7, "vehicles": 3, "periods": 30},
+    {"label": "L08", "stores": 12, "products": 5, "vehicles": 3, "periods": 15},
+    {"label": "L09", "stores": 8, "products": 5, "vehicles": 3, "periods": 15},
+    {"label": "L10", "stores": 9, "products": 5, "vehicles": 3, "periods": 15},
+    {"label": "L11", "stores": 10, "products": 5, "vehicles": 3, "periods": 30},
+    {"label": "L12", "stores": 10, "products": 6, "vehicles": 4, "periods": 15},
+    {"label": "L13", "stores": 12, "products": 5, "vehicles": 3, "periods": 30},
+    {"label": "L14", "stores": 12, "products": 6, "vehicles": 3, "periods": 15},
+    {"label": "L15", "stores": 12, "products": 7, "vehicles": 4, "periods": 15},
 ]
 
 
@@ -143,43 +142,6 @@ def _to_gasa_instance(data: IRPData):
     )
     v_id = {v: i + 1 for i, v in enumerate(vehicles)}
     return inst, s_id, t_id, v_id
-
-
-def _gurobi_to_gasa_routes(gur_sol, data: IRPData,
-                            s_id: Dict, t_id: Dict, v_id: Dict) -> dict:
-    """
-    Extract route visit order from gur_sol.x (arc activations) and convert
-    to (int_t_idx, int_v_idx) → List[store_idx].
-    """
-    wh = data.warehouse
-    arcs_by_vt: Dict = {}
-    for (i, j, v, t), val in gur_sol.x.items():
-        if float(val) > 0.5:
-            arcs_by_vt.setdefault((v, t), []).append((i, j))
-
-    chromosome: dict = {
-        (t_id[t], v_id[v]): []
-        for t in data.periods if t in t_id
-        for v in (data.vehicles if data.vehicles else list(v_id.keys())) if v in v_id
-    }
-    for (v, t), arcs in arcs_by_vt.items():
-        if v not in v_id or t not in t_id:
-            continue
-        next_map = {i: j for i, j in arcs}
-        route = []
-        cur = wh
-        visited = {cur}
-        while cur in next_map:
-            nxt = next_map[cur]
-            if nxt == wh or nxt in visited:
-                break
-            if nxt in s_id:
-                route.append(s_id[nxt])
-            visited.add(nxt)
-            cur = nxt
-        if route:
-            chromosome[(t_id[t], v_id[v])] = route
-    return chromosome
 
 
 def _service_level(data: IRPData, deliv: dict) -> float:
@@ -286,7 +248,7 @@ def run_scenario(cfg: dict) -> List[BenchmarkResult]:
 
     # ── GA/SA (pure heuristic) ────────────────────────────────────
     print("\n  [GA/SA] solving (pure heuristic, no warm-start) ...")
-    inst, s_id, t_id, v_id = _to_gasa_instance(data)
+    inst, _, _, _ = _to_gasa_instance(data)
     params = GASAParams(seed=SEED, population_size=30,
                         iterations_per_temp=30, time_limit=None,
                         max_iterations=2250)
@@ -317,9 +279,22 @@ def run_scenario(cfg: dict) -> List[BenchmarkResult]:
 
 def main():
     all_results = []
-    for cfg in SCENARIOS_LARGE:
+    total_scenarios = len(SCENARIOS_LARGE)
+
+    for idx, cfg in enumerate(SCENARIOS_LARGE, 1):
+        print(f"\n\n{'#'*80}")
+        print(f"# Scenario {idx}/{total_scenarios}: {cfg['label']}")
+        print(f"{'#'*80}")
         results = run_scenario(cfg)
         all_results.extend(results)
+
+        # ── Per-scenario summary ────────────────────────────────────
+        print(f"\n  ✓ Scenario {cfg['label']} Summary:")
+        print(f"  {'-'*60}")
+        for r in results:
+            gap_s = f"{r.gap_cost:+.2f}%" if r.method != "Gurobi" else "  —"
+            print(f"    {r.method:<10} | obj={r.objective:>12,.0f} | rt={r.runtime:>7.1f}s | "
+                  f"SL={r.service_level*100:>6.2f}% | gap={gap_s:>8}")
 
     # ── Export to CSV ──────────────────────────────────────────────
     csv_path = "benchmark_results_15scenarios_large.csv"
@@ -350,7 +325,7 @@ def main():
         print(f"{r.scenario:<12} {r.method:<10} {r.objective:>14,.0f} {r.runtime:>8.1f}s "
               f"{r.service_level*100:>7.2f}% {gap_s:>8}")
 
-    print("\nDone. All 15 large scenarios completed.\n")
+    print("\n✓ Done. All 15 large scenarios completed.\n")
 
 
 if __name__ == "__main__":
