@@ -96,15 +96,20 @@ SHORT_LABEL = {
 #   medium = ~5-15s per CG variant (tens of thousands of pairs)
 #   large  = ~20-60s per CG variant (hundreds of thousands of pairs)
 SCENARIOS: List[Dict] = [
-    {"name": "s1", "tier": "small",  "store_limit": 3,  "sku_limit": 2},
-    {"name": "s2", "tier": "small",  "store_limit": 4,  "sku_limit": 2},
-    {"name": "s3", "tier": "small",  "store_limit": 5,  "sku_limit": 2},
-    {"name": "m1", "tier": "medium", "store_limit": 6,  "sku_limit": 3},
-    {"name": "m2", "tier": "medium", "store_limit": 7,  "sku_limit": 3},
-    {"name": "m3", "tier": "medium", "store_limit": 8,  "sku_limit": 4},
-    {"name": "l1", "tier": "large",  "store_limit": 9,  "sku_limit": 4},
-    {"name": "l2", "tier": "large",  "store_limit": 10, "sku_limit": 5},
-    {"name": "l3", "tier": "large",  "store_limit": 12, "sku_limit": 5},
+    # 10 large scenarios only (store_limit <= 12, sku_limit <= 46)
+    # Group A: store scaling, SKU=5 fixed  (pairs ~ n_stores^2 * n_skus)
+    {"name": "l1",  "tier": "large", "store_limit": 9,  "sku_limit": 4},
+    {"name": "l2",  "tier": "large", "store_limit": 10, "sku_limit": 5},
+    {"name": "l3",  "tier": "large", "store_limit": 12, "sku_limit": 5},
+    {"name": "l4",  "tier": "large", "store_limit": 9,  "sku_limit": 5},
+    {"name": "l5",  "tier": "large", "store_limit": 11, "sku_limit": 5},
+    # Group B: SKU scaling, stores=12 fixed
+    {"name": "l6",  "tier": "large", "store_limit": 12, "sku_limit": 4},
+    {"name": "l7",  "tier": "large", "store_limit": 12, "sku_limit": 6},
+    {"name": "l8",  "tier": "large", "store_limit": 12, "sku_limit": 7},
+    # Group C: mixed (both dimensions grow)
+    {"name": "l9",  "tier": "large", "store_limit": 10, "sku_limit": 6},
+    {"name": "l10", "tier": "large", "store_limit": 11, "sku_limit": 6},
 ]
 
 
