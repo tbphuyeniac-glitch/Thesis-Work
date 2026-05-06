@@ -532,33 +532,215 @@ The code implementation in `irp_gurobi_converted.py` is **correct** despite docu
 
 ---
 
+---
+
+## 🔴 MISSING ALGORITHMIC COMPONENTS (Not in Chapter 4 v3)
+
+These are implemented in code but **not documented** in Chapter 4:
+
+### **Missing 1: Inactive (p,t) Pair Constraint**
+
+**Code location:** `irp_gurobi_converted.py:6006–6007`
+
+```python
+if (p,t) not in active_product_periods:
+    mdl.addConstr(residual_need[(s,p,t)] == need[(s,p,t)])
+```
+
+**What it does:** For product-period pairs that don't meet the activation threshold `θ_{LT}`, 
+RMP adds a **hard constraint** forcing `r_{s,p,t} = need_{s,p,t}`. This means:
+- Zero LT columns can be selected for that (p,t)
+- All unmet need incurs the full shortage penalty
+- No columns are priced for inactive pairs
+
+**Missing in Chapter 4:** Section 3.3 (RMP) should document this constraint:
+
+```markdown
+**Inactive (p,t) constraint** (added if (p,t) ∉ active_product_periods):
+
+For all store s:
+  r_{s,p,t} = need_{s,p,t}
+
+This enforces that **no LT is allowed** for inactive product-period pairs; 
+all unmet demand incurs shortage penalty.
+```
+
+---
+
+### **Missing 2: Heuristic vs Exact Pricing Duality**
+
+**Code location:** `irp_gurobi_converted.py:4812–4813` (heuristic) vs. section 3.4 (exact MIP)
+
+**Heuristic pair-level reduced cost proxy:**
+```python
+dual_score = dual_need.get((j,p,t), 0.0) + dual_surplus.get((i,p,t), 0.0)
+reduced_cost_proxy = fixed_cost + unit_cost * qty_cap - dual_score * qty_cap
+```
+
+**Exact pricing MIP reduced cost:**
+```
+c̄(c) = cost_c - Σ μ_{j,p,t}·q_{ij} - Σ ν_{i,p,t}·q_{ij}
+```
+
+**The issue:** Chapter 4 documents **only the exact pricing MIP** (section 3.4). 
+But code also implements a **heuristic variant** that:
+1. Scores donor-receiver pairs using a simplified dual-score proxy (not full column optimization)
+2. Uses ranking/pruning heuristics to select top-k pairs
+3. Falls back to this when `IRP_USE_EXACT_PRICING=False`
+
+**Missing in Chapter 4:** Section 3.4 should distinguish:
+
+```markdown
+### 3.4 Pricing Problem — Exact vs Heuristic Variants
+
+#### 3.4.1 Exact Pricing (Default)
+
+[Current section 3.4 content]
+
+For a fixed active (p,t) pair, solve the full MIP:
+
+  min_{q,y} Σ_{(i,j)} [ f_ij·y_ij + (b_ij - μ_{j,p,t} - ν_{i,p,t})·q_ij ]
+  
+This returns the globally-optimal column with minimum reduced cost.
+
+#### 3.4.2 Heuristic Pricing (Optional)
+
+As a faster alternative, the code also supports a pair-level heuristic:
+
+For each donor-receiver pair (i,j), compute a proxy reduced cost:
+
+  c̄_proxy(i,j) = f_ij + (b_ij - μ_{j,p,t} - ν_{i,p,t})·qty_cap
+
+where qty_cap = min(surplus_i, need_j).
+
+Then rank pairs by this proxy and select top-k without solving a full column MIP.
+This is faster but sacrifices optimality (may miss good multi-arc columns).
+
+**Use case:** Heuristic mode is faster for large instances; exact mode is slower but 
+returns proven-optimal columns per (p,t).
+```
+
+---
+
+### **Missing 3: Pattern Deduplication & Column Cardinality Cap**
+
+**Code location:** `irp_gurobi_converted.py:3829–3835` (dedup function) and 
+lines 5443, 5586 (application)
+
+**What happens:**
+
+After pricing produces a set of candidate patterns, two filters apply:
+
+1. **Deduplication** (`_deduplicate_priced_patterns`):
+   - Remove duplicate patterns (same set of flows)
+   - Signature-based dedup by pattern.flows dict
+   - Keeps only first occurrence
+
+2. **Column cardinality cap** (`max_columns_per_product_period`):
+   - Default: 3 new columns per (p,t) per iteration
+   - If > 3 patterns survive dedup, keep only top-3 by score
+   - Can be disabled (set to 0 for unlimited)
+
+**Missing in Chapter 4:** Section 3.8 (CG Algorithm) should document:
+
+```markdown
+#### Step 6.5 — Pattern Deduplication
+
+After pricing returns candidate LT patterns for active (p,t) pairs:
+
+1. Remove duplicate patterns: For patterns c₁, c₂ with same donor-receiver flows 
+   (ignoring cost differences), keep only one.
+
+2. Column cardinality limit: Retain at most K_col = `max_columns_per_product_period` 
+   patterns per (p,t) per iteration, ranked by BiGAT score (or reduced cost if 
+   BiGAT is disabled).
+
+This prevents RMP from growing unboundedly and reduces numerical issues.
+```
+
+---
+
+### **Missing 4: Fallback for Missing Post-Shock Inventory**
+
+**Code location:** `irp_gurobi_converted.py:4685–4686`
+
+```python
+ending_inventory = max(0.0, float(
+    d.post_shock_inventory.get((s,p,t), self.baseline.inv_store[(s,p,t)])
+))
+```
+
+**What it does:** In `_build_need_and_surplus_proxies`, if `post_shock_inventory` 
+hasn't been populated yet (e.g., during Stage 1), code **falls back to baseline inventory** 
+from Stage 1 solution.
+
+**Chapter 4 assumption:** Section 3.1 is written as if Î^{post}_{s,p,t} is always 
+available (computed after demand shock). But in practice:
+- Before demand shock engine runs, post_shock_inventory is empty
+- CG can be called in debug/testing mode before shock
+- Code gracefully falls back instead of crashing
+
+**Missing in Chapter 4:** Section 3.1 should note:
+
+```markdown
+**Inventory source:** Î^{post}_{s,p,t} is computed by the demand-shock engine 
+after Stage 1 baseline execution. If not yet available (e.g., during warm-start 
+RMP initialization), the code uses baseline inventory I_{s,p,t} as a fallback.
+```
+
+---
+
 ## SUMMARY OF FIXES NEEDED
 
-### Critical (Must Fix for Clarity)
-1. **Section 3.2:** Clarify column flow notation and product-period scope
-2. **Section 3.4:** Explain relationship between pricing MIP variables and column flows
-3. **Section 3.3.5:** Add dual variable recap before pricing section
-4. **Section 2.5:** Rename π_d, π_r to avoid conflict with shortage penalty π_{sp}
-5. **Section 1.2:** Add parameter definitions: θ_{LT}, K^{max}, L, R, S_0
+### Critical (Notation & Missing Algorithms)
+1. **Missing 1 — Section 3.3:** Add inactive (p,t) constraint: r_{s,p,t} = need_{s,p,t} when (p,t) ∉ active pairs
+2. **Missing 2 — Section 3.4:** Distinguish exact pricing MIP vs heuristic pair-level proxy
+3. **Missing 3 — Section 3.8:** Document pattern deduplication and max_columns_per_product_period cap
+4. **Missing 4 — Section 3.1:** Clarify fallback to baseline inventory when post_shock_inventory unavailable
+5. **Section 3.2:** Clarify column flow notation and product-period scope
+6. **Section 3.4:** Explain relationship between pricing MIP variables and column flows
+7. **Section 3.3.5:** Add dual variable recap before pricing section
+8. **Section 2.5:** Rename π_d, π_r to avoid conflict with shortage penalty π_{sp}
+9. **Section 1.2:** Add parameter definitions: θ_{LT}, K^{max}, L, R, S_0
 
 ### Important (Should Fix)
-6. **Section 3.3:** Define r_{s,p,t} (slack variable) before use
-7. **Section 3.1:** Clarify d^{real}_{s,p,t} notation and demand shock relationship
-8. **Section 1.3:** Add I^{beg}_{sp,t} as derived value
+10. **Section 3.3:** Define r_{s,p,t} (slack variable) before use
+11. **Section 3.1:** Clarify d^{real}_{s,p,t} notation and demand shock relationship
+12. **Section 1.3:** Add I^{beg}_{sp,t} as derived value
 
 ### Recommended (Polish)
-9. Fix constraint (10) quantifier
-10. Add index convention note for constraint (2) y_{jspvt}
-11. Clarify π_{sp} vs π_{s,p,t} dynamic vs static
-12. Improve constraint (20) window notation
+13. Fix constraint (10) quantifier
+14. Add index convention note for constraint (2) y_{jspvt}
+15. Clarify π_{sp} vs π_{s,p,t} dynamic vs static
+16. Improve constraint (20) window notation
 
 ---
 
 ## CODE ALIGNMENT VERDICT
 
-✅ **The code implementation is mathematically sound and matches Chapter 4 formulas.**
+⚠️ **The code implementation is mathematically sound BUT Chapter 4 documents only the "happy path".**
 
-The issues are **documentary/notational**, not algorithmic. Once you apply these fixes, the chapter will be unambiguous and easier for readers to cross-reference with code.
+### Formulas Match ✅
+- Post-shock inventory balance: matches exactly
+- Need/surplus windows: matches exactly
+- RMP structure & constraints: matches exactly
+- Pricing MIP reduced cost: matches exactly
+
+### Missing Algorithmic Details ⚠️
+The following are **implemented in code but NOT documented in Chapter 4 v3**:
+
+| Algorithm | Code Location | Impact |
+|-----------|---------------|--------|
+| Inactive (p,t) hard constraint | irp_gurobi_converted.py:6006 | Forces r = need when (p,t) below threshold |
+| Heuristic vs exact pricing duality | irp_gurobi_converted.py:4812 | Two modes: exact MIP or fast pair-level proxy |
+| Pattern deduplication | irp_gurobi_converted.py:3829 | Removes duplicate flows before RMP |
+| Column cardinality cap | irp_gurobi_converted.py:3493 | Limits to max_columns_per_product_period per (p,t) per iter |
+| Post-shock fallback | irp_gurobi_converted.py:4685 | Uses baseline inventory if post_shock unavailable |
+
+**Severity:** These are **important safeguards** in code (not bugs), but readers following Chapter 4 alone would miss them.
+
+**Recommendation:** Add section 3.3.6 (Inactive Pair Handling), section 3.4.2 (Heuristic Variant), 
+and expand section 3.8 (CG Algorithm) to include dedup & column cap logic, plus fallback note in 3.1.
 
 ---
 

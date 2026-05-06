@@ -54,6 +54,15 @@
 | $b_{ij}$ | Lateral transshipment unit cost from store $i$ to store $j$ |
 | $f_{ij}$ | Fixed dispatch cost for activating a lateral transshipment from store $i$ to store $j$ (enters via column cost in Part 3) |
 | $F_v$ | Fixed cost for activating vehicle $v$ in a period |
+| $\delta$ | Minimum total activity (units delivered + LT in/out) required at a visited store; default $1.0$ (constraint 21) |
+| $\mathcal{T}_{disp}$ | Set of CW dispatch periods; $\mathcal{T}_{disp} = \{t \in T \mid (t-t_0) \bmod cycle = 0\}$ (constraint 22) |
+| $\theta_{LT}$ | Activation threshold: minimum total need or surplus across stores to enable LT for a $(p,t)$ pair |
+| $K^{max}$ | Maximum donor-receiver arc count per column (pricing MIP arc cardinality cap) |
+| $K^{pool}$ | Maximum number of columns extracted per $(p,t)$ pricing subproblem via pool search |
+| $L$ | Demand-cover lookahead horizon (`need_lookahead_periods`, default 2) |
+| $R$ | Reserve-stock horizon (`surplus_reserve_periods`, default 1) |
+| $S_0$ | Safety-stock floor for surplus reserve target (`safety_stock_units`, default 0) |
+| $\pi^{rebal}$ | Rebalance penalty for proactive LT at stores without active shortage (used in RMP when $\hat{B}^{post}_{s,p,t} = 0$) |
 
 ---
 
@@ -74,7 +83,7 @@
 | $u_{vt}$ | $\in \{0,1\}$ | 1 if vehicle $v$ is used in period $t$ |
 | $z_{ivt}$ | $\in \{0,1\}$ | 1 if node $i$ is visited by vehicle $v$ in period $t$ |
 
-**Derived visit indicators:**
+**Visit indicator equality constraints** *(enforced explicitly in the Gurobi model):*
 
 $$z_{CW,vt} = u_{vt}$$
 
@@ -124,6 +133,8 @@ $$I_{spt} = I_{sp,t-1} + Q^{dir}_{spt} - d_{spt} + B_{spt}
 - \sum_{\substack{j \in N \\ j \neq s}} \sum_{v \in V} y_{sjpvt}
 \tag{2}$$
 
+where $I_{sp,t-1} \equiv I^0_{sp}$ when $t = t_0 = \min T$ (first planning period), matching the code's `prev = init_inventory_store[(s,p)] if t == first_t`.
+
 > In Stage 1, the two LT summation terms are zero, simplifying to the standard
 > balance: $I_{spt} = I_{sp,t-1} + Q^{dir}_{spt} - d_{spt} + B_{spt}$.
 
@@ -144,6 +155,13 @@ $$deliv_{spvt} + \sum_{\substack{i \in N \\ i \neq s}} y_{ispvt}
 - \sum_{\substack{j \in N_0 \\ j \neq s}} q_{psjvt},
 \quad \forall s, p, v, t
 \tag{4b}$$
+
+**Constraint (4c) — Delivery-visit link.** A vehicle can deliver to a store only if it visits that store in that period:
+
+$$deliv_{spvt} \leq Q_V \cdot z_{svt}, \quad \forall s \in N,\; p, v, t
+\tag{4c}$$
+
+> In Stage 1 (LT inactive), this is the only link between delivery quantities and routing decisions at store level; it prevents any product being delivered by a vehicle that does not visit the store.
 
 **Constraint (5) — Empty-return condition.** Vehicles carry no product back to CW:
 
@@ -167,7 +185,7 @@ of period $t$:
 
 $$I^{beg}_{sp,t} \;=\;
 \begin{cases}
-I^0_{sp} & \text{if } t = 1, \\
+I^0_{sp} & \text{if } t = t_0 \;(t_0 = \min T,\text{ the first planning period}), \\
 I_{sp,\,t-1} & \text{otherwise}
 \end{cases}$$
 
@@ -182,7 +200,8 @@ $$\sum_{\substack{i \in N_0 \\ i \neq j}} x_{ijvt} = \sum_{\substack{i \in N_0 \
 
 **Constraint (10) — Single-visit limit per store per period:**
 
-$$\sum_{v \in V} \sum_{\substack{i \in N_0 \\ i \neq j}} x_{ijvt} \leq 1
+$$\sum_{v \in V} \sum_{\substack{i \in N_0 \\ i \neq j}} x_{ijvt} \leq 1,
+\quad \forall j \in N,\; t
 \tag{10}$$
 
 **Constraint (11) — Vehicle activation definition:**
@@ -238,6 +257,28 @@ $$\sum_{v \in V} \sum_{\tau=t_1}^{t_2} z_{sv\tau}
 where $I^{base}_{sp,t_1}$ denotes the inventory at the *beginning* of period $t_1$
 (i.e., $I_{sp,t_1-1}$, with the initial parameter $I^0_{sp}$ used when $t_1$ is the first period).
 The LT source set is $j \in N$ because $y$ is defined for store-to-store transshipment only.
+
+**Constraint (21) — Minimum visit activity.** *(Parametric: enforced when activity threshold $\delta > 0$; default $\delta = 1.0$.)* Every visited store must exhibit non-trivial total activity (received + sent):
+
+$$\sum_{p \in P} \!\Bigl(
+  deliv_{spvt}
+  + \sum_{\substack{i \in N \\ i \neq s}} y_{ispvt}
+  + \sum_{\substack{j \in N \\ j \neq s}} y_{sjpvt}
+\Bigr) \;\geq\; \delta \cdot z_{svt},
+\quad \forall s \in N,\; v, t
+\tag{21}$$
+
+This prevents routing vehicles to stores with zero delivery or LT activity. When $y = 0$ (Stage 1), the constraint reduces to $\sum_p deliv_{spvt} \geq \delta \cdot z_{svt}$.
+
+**Constraint (22) — CW dispatch cycle.** *(Parametric: active when $cw\_dispatch\_cycle > 1$; default cycle $= 5$.)* Direct shipments from the CW are restricted to designated replenishment periods. This constraint is enforced **across all solvers**:
+
+- **ALNS (Stage 1):** repair and greedy-init operators skip CW delivery entirely for $t \notin \mathcal{T}_{disp}$; the feasibility evaluator adds a hard penalty for any non-zero delivery in non-dispatch periods.
+- **Gurobi exact model:** enforced as an equality constraint.
+
+$$Q^{dir}_{spt} = 0, \quad \forall s \in N,\; p \in P,\; t \notin \mathcal{T}_{disp}
+\tag{22}$$
+
+where $\mathcal{T}_{disp} = \bigl\{\, t \in T \mid (t - t_0) \bmod cycle = 0 \,\bigr\}$ and $t_0 = \min T$.
 
 ---
 
@@ -343,6 +384,11 @@ $\Delta f = c^{ship}_{sp} \cdot qty$ (additional units piggyback on the existing
 A request is infeasible for vehicle $v$ if inserting it would violate $Q_V$, or if $s$
 is already visited by another vehicle in period $t$ (single-visit-per-period rule from Eq. (10)).
 
+> **Infeasibility handling.** The ALNS **never accepts infeasible solutions**. A repaired solution
+> that violates any constraint (capacity, single-visit, dispatch-cycle) is discarded entirely
+> and the algorithm retains the previous best incumbent rather than accepting a penalized
+> infeasible state.
+
 **R1 — Greedy Insertion.** For each unserved request (in random order):
 
 $$v^* = \arg\min_{v \in V} \Delta f(s, p, t, v)$$
@@ -359,13 +405,18 @@ $$regret(s, p, t) = \Delta f^{(2)}(s, p, t) - \Delta f^{(1)}(s, p, t)$$
 
 Operator weights are updated every $\eta$ iterations using reaction factor $\rho \in (0,1)$:
 
-$$w_d \leftarrow (1 - \rho)\, w_d + \rho \cdot \frac{\pi_d}{\theta_d}; \qquad
-w_r \leftarrow (1 - \rho)\, w_r + \rho \cdot \frac{\pi_r}{\theta_r}$$
+$$w_d \leftarrow (1 - \rho)\, w_d + \rho \cdot \frac{R_d}{\theta_d}; \qquad
+w_r \leftarrow (1 - \rho)\, w_r + \rho \cdot \frac{R_r}{\theta_r}$$
 
-where $\pi_d$, $\pi_r$ accumulate reward scores ($\sigma_1$ for new global best,
+where $R_d$, $R_r$ accumulate reward scores ($\sigma_1$ for new global best,
 $\sigma_2$ for improvement, $\sigma_3$ for accepted non-improving) and $\theta_d$, $\theta_r$
 count operator usage in the segment. Operators are selected by roulette wheel;
 candidates are accepted via Simulated Annealing cooling $T \leftarrow T \cdot \gamma$.
+
+> **Restart mechanism.** If no improvement is found for `restart_no_improve_iters` = 150
+> consecutive iterations, the ALNS snaps the current solution back to the best-known
+> incumbent and resets the no-improvement counter. This prevents the SA cooling from
+> accepting too many degraded solutions and allows re-exploration from the best state.
 
 ---
 
@@ -373,10 +424,18 @@ candidates are accepted via Simulated Annealing cooling $T \leftarrow T \cdot \g
 
 ### 3.1 Post-Shock State Definitions
 
-After the baseline plan is executed, realized demand deviates from forecast. Let
-$\hat{I}^{post}_{s,p,t}$ denote the post-shock ending inventory at store $s$ for product $p$
-in period $t$, and $\hat{B}^{post}_{s,p,t}$ the corresponding post-shock shortage. The CG
-module uses *windowed* coverage and reserve targets rather than single-period demand:
+After the Stage 1 baseline plan is executed, a hidden demand shock reallocates realized
+demand among stores within each $(p,t)$ pair. Let $d^{real}_{s,p,t}$ denote the
+**realized demand** at store $s$ for product $p$ in period $t$ after the shock; in
+Stage 1 this equals the forecast $d_{spt}$.
+
+Let $\hat{I}^{post}_{s,p,t}$ denote the **post-shock ending inventory** at store $s$
+computed from the baseline shipments against realized demand, and
+$\hat{B}^{post}_{s,p,t}$ the corresponding **post-shock shortage**. If the shock engine
+has not yet been applied (e.g., during warm-start), $\hat{I}^{post}_{s,p,t}$ falls back
+to the Stage 1 baseline inventory $I_{s,p,t}$.
+
+The CG module uses *windowed* coverage and reserve targets rather than single-period demand:
 
 **Demand-cover horizon** ($L = $ `need_lookahead_periods`):
 
@@ -414,9 +473,26 @@ $$cost_c = \sum_{(i,j) \in c} f_{ij} \cdot \mathbb{1}[q^c_{ij} > 0] + \sum_{(i,j
 
 ### 3.3 Restricted Master Problem (RMP)
 
+**Decision variables:**
+
+| Symbol | Type | Description |
+|---|---|---|
+| $\lambda_c$ | $\in [0,1]$ | Convex weight for column $c$; fraction of that column selected |
+| $r_{s,p,t}$ | $\geq 0$ | Slack (recourse) for unmet need at store $s$, product $p$, period $t$; incurs penalty $\pi_{s,p,t}$ |
+
+> **Dynamic penalty $\pi_{s,p,t}$:** In the implementation, the penalty takes two values: $\pi_{s,p,t} = \pi_{sp}$ (the static shortage cost from §1.2) when a post-shock shortage actually exists at $(s,p,t)$; otherwise $\pi_{s,p,t} = \pi^{rebal}$ (a lower *rebalance penalty*) to allow proactive LT for stores that are not yet in shortage but face imminent need.
+
 $$\min_{\lambda,\, r} \quad Z^{base} + \sum_{c \in \mathcal{C}} cost_c \cdot \lambda_c
 + \sum_{s,p,t} \pi_{s,p,t} \cdot r_{s,p,t}
 \tag{RMP}$$
+
+> **Implementation note on $Z^{base}$.** In the code, $Z^{base}$ is not the raw ALNS objective
+> but rather `baseline_without_shortage = baseline_objective − baseline_shortage_component`.
+> The original baseline shortage cost is subtracted out and replaced by the dynamic residual
+> penalty $\sum \pi_{s,p,t} \cdot r_{s,p,t}$. This ensures the RMP shortage penalty correctly
+> reflects the CG-period proxy ($\pi^{rebal}$ vs $\pi_{sp}$) rather than the ALNS-period
+> static cost. The two formulations are mathematically equivalent: $Z^{base}$ here denotes
+> the non-shortage portion of the baseline cost.
 
 **Need-cover constraints** (dual variable $\mu_{s,p,t} \geq 0$):
 
@@ -424,16 +500,27 @@ $$r_{s,p,t} + \sum_{c \in \mathcal{C}} a^{need}_{c,s,p,t} \cdot \lambda_c \;\geq
 \quad \forall\, s, p, t
 \tag{RMP-1}$$
 
+where $a^{need}_{c,s,p,t} = \sum_{i \neq s} q^c_{is}$ is the total inflow to receiver $s$ under column $c$.
+
 **Surplus-capacity constraints** (dual variable $\nu_{s,p,t} \geq 0$):
 
 $$\sum_{c \in \mathcal{C}} a^{surplus}_{c,s,p,t} \cdot \lambda_c \;\leq\; surplus_{s,p,t},
 \quad \forall\, s, p, t
 \tag{RMP-2}$$
 
+where $a^{surplus}_{c,s,p,t} = \sum_{j \neq s} q^c_{sj}$ is the total outflow from donor $s$ under column $c$.
+
 $$\lambda_c \in [0, 1], \quad r_{s,p,t} \geq 0$$
 
-where $a^{need}_{c,s,p,t}$ is the total inflow to receiver $s$ under column $c$, and
-$a^{surplus}_{c,s,p,t}$ is the total outflow from donor $s$ under column $c$.
+**Inactive-pair constraint.** For any $(p,t) \notin \mathcal{A}$ (below the activation
+threshold $\theta_{LT}$), no LT column exists for that pair. The RMP enforces this by
+fixing the slack to its maximum:
+
+$$r_{s,p,t} = need_{s,p,t}, \quad \forall\, s,\; (p,t) \notin \mathcal{A}
+\tag{RMP-3}$$
+
+This forces all unmet need in inactive pairs to be absorbed by the shortage penalty,
+with zero LT coverage.
 
 ---
 
@@ -448,19 +535,59 @@ the per-pair reduced cost contribution is:
 
 $$\bar{c}_{ij} = f_{ij} + \bigl(b_{ij} - \mu_{j,p,t} - \nu_{i,p,t}\bigr) \cdot q$$
 
-The reduced cost of the full column $c$ is the sum of pair contributions, equivalently:
+The reduced cost of the full column $c$ is the sum over all arcs in the column:
 
-$$\bar{c}(c) = cost_c
-- \sum_{j:\,\text{receiver}} \mu_{j,p,t} \cdot q^c_{ij}
-- \sum_{i:\,\text{donor}} \nu_{i,p,t} \cdot q^c_{ij}$$
+$$\bar{c}(c) = \sum_{(i,j)\,\in\, c} \Bigl[
+  f_{ij}\cdot\mathbb{1}[q^c_{ij}>0]
+  + \bigl(b_{ij} - \mu_{j,p,t} - \nu_{i,p,t}\bigr)\cdot q^c_{ij}
+\Bigr]
+= cost_c
+- \sum_{(i,j)\,\in\, c} \mu_{j,p,t} \cdot q^c_{ij}
+- \sum_{(i,j)\,\in\, c} \nu_{i,p,t} \cdot q^c_{ij}$$
 
 A column is added to the RMP if $\bar{c}(c) < 0$. CG converges when no such column exists
-across all active $(p,t)$ pairs. The exact pricing MIP solved per active $(p,t)$ pair is:
+across all active $(p,t)$ pairs.
+
+#### 3.4.1 Exact Pricing (MIP)
+
+For a fixed active $(p,t)$ pair, the pricing subproblem optimises over auxiliary variables
+$q_{ij}$ (quantity, continuous) and $y_{ij}$ (arc indicator, binary) — both implicitly
+scoped to product $p$ and period $t$:
 
 $$\min_{q,y}\; \sum_{(i,j)} \Bigl[ f_{ij}\, y_{ij} + (b_{ij} - \mu_{j,p,t} - \nu_{i,p,t})\, q_{ij} \Bigr]$$
+
 subject to donor capacity $\sum_j q_{ij} \leq surplus_{i,p,t}$, receiver capacity
 $\sum_i q_{ij} \leq need_{j,p,t}$, fixed-charge link $q_{ij} \leq \min(surplus_i, need_j)\, y_{ij}$,
 and a per-pattern arc cap $\sum_{(i,j)} y_{ij} \leq K^{max}$.
+
+The Gurobi solver uses **pool search** (`PoolSearchMode = 2`) to extract up to
+$K^{pool}$ (`exact_pricing_pool_size`) solutions with negative reduced cost per $(p,t)$
+subproblem, adding each as a distinct column to $\mathcal{C}$. This allows multiple
+diverse columns to enter the RMP in a single pricing round, accelerating convergence.
+Each solution $(q^*_{ij}, y^*_{ij})$ from the pool becomes a separate column $c$
+with flows $q^c_{ij}$ and cost $cost_c$.
+
+> **Implied-net-LT soft penalty.** The pricing MIP objective adds a soft penalty for
+> arcs whose flows are already committed by columns in the current RMP solution (i.e.,
+> arcs where existing $\lambda_c > 0$ columns already cover the need or exhaust the
+> surplus). Specifically, if arc $(i,j)$ is already covered under the incumbent RMP
+> solution (`implied_net_lt` flows), a positive penalty term is added to discourage
+> redundant columns for those arcs. This is a heuristic regularizer to promote column
+> diversity; it does not affect dual-feasibility or the termination criterion $\bar{c}(c) < 0$.
+
+#### 3.4.2 Heuristic Pricing (Pair-Level Proxy)
+
+As a faster alternative, candidate columns can be screened at the **single donor-receiver
+pair level** before any MIP is solved. For each pair $(i,j)$, define:
+
+$$qty^{cap}_{ij} = \min\!\bigl(surplus_{i,p,t},\; need_{j,p,t}\bigr)$$
+
+$$\bar{c}^{proxy}_{ij} = f_{ij} + \bigl(b_{ij} - \mu_{j,p,t} - \nu_{i,p,t}\bigr) \cdot qty^{cap}_{ij}$$
+
+Pairs with $\bar{c}^{proxy}_{ij} \geq 0$ are pruned before the MIP stage, reducing the
+number of arcs considered. This proxy assumes single-pair columns; multi-arc interactions
+are captured only in the full MIP (§3.4.1). The heuristic mode ranks pairs by
+$(\mu_{j,p,t} + \nu_{i,p,t} - b_{ij})$ and is used when exact pricing is disabled.
 
 ---
 
@@ -482,7 +609,14 @@ $$\phi_2(c) = \frac{surplus_{i,p,t}}{\displaystyle\sum_{s \in N} surplus_{s,p,t}
 
 **Feature 3 — Time urgency:**
 
-$$\phi_3(c) = \frac{1}{1 + \text{days until stockout at receiver}}$$
+$$\phi_3(c) = \frac{1}{1 + \tau_{stockout}(j,p,t)}$$
+
+where $\tau_{stockout}$ is a dimensionless period-based proxy computed per receiver $j$:
+if the receiver already has a post-shock shortage ($need_{j,p,t} > 0$), then
+$\tau_{stockout} = (d^{real}_{j,p,t} - need_{j,p,t}) / d^{real}_{j,p,t} \in [0,1]$ (fraction of demand
+period remaining); otherwise $\tau_{stockout} = \hat{I}^{post}_{j,p,t} / \bar{d}_{j,p}$ where
+$\bar{d}_{j,p}$ is average future demand (periods of cover at current inventory).
+Higher urgency (lower $\tau_{stockout}$) yields $\phi_3 \to 1$.
 
 **Feature 4 — Negative reduced cost (economic attractiveness):**
 
@@ -558,6 +692,13 @@ no `acceptance_score` while Stackelberg is disabled)*:
 > restored as indices 9–10, and `column_cost` shifts from its current position
 > (index 9 in the 10-feature schema) to index 11 — returning the schema to 12 features
 > indexed 0–11.
+
+> **Implementation note on column feature 0 (reduced cost $\bar{c}(c)$).** When computing
+> per-pair reduced cost contributions for the BiGAT feature vector (used for features 5–8),
+> the fixed arc activation cost $f_{ij}$ is approximated as $f_{ij} / |\text{arcs in column}|$
+> rather than the full $f_{ij}$. This is an approximation for multi-arc columns to distribute
+> the fixed cost evenly across pairs during feature construction; the actual pricing MIP and
+> RMP use the full $f_{ij}$ unchanged.
 
 **Constraint node feature vector $x^{con}_j \in \mathbb{R}^{7}$** *(corrected: 7 features)*:
 
@@ -637,13 +778,16 @@ Step 3:  Initialize RMP with warm-start LT patterns
 Step 4:  Solve RMP → obtain λ, dual values μ, ν
 
 Repeat:
-  Step 5:  Identify active (p,t) pairs [need > θ_LT and surplus > θ_LT]
+  Step 5:  Identify active (p,t) pairs A = {(p,t) : total_need > θ_LT and total_surplus > θ_LT}
+           For inactive pairs: fix r_{s,p,t} = need_{s,p,t} (constraint RMP-3)
   Step 6:  For each active (p,t):
              a. Enumerate donor-receiver pairs
-             b. Compute features φ1–φ4 for each pair
-             c. Apply feature-range pruning → retain promising pairs
+             b. Compute heuristic proxy c̄^proxy_ij; prune pairs with c̄^proxy_ij ≥ 0
+             c. Compute features φ1–φ4 for retained pairs
              d. Apply Stackelberg acceptance filter → accepted pairs only
-             e. Construct LT patterns with reduced cost c̄(c) < 0
+             e. Solve exact pricing MIP (§3.4.1) → patterns with c̄(c) < 0
+  Step 6.5: Deduplicate patterns: remove columns with identical (i,j,q^c_ij) flow signatures
+            Apply column cap: retain at most K_col new columns per (p,t) per iteration
   Step 7:  Build bipartite graph G = (V_c, V_r, E)
   Step 8:  Run BiGAT message passing (2 layers, bidirectional)
   Step 9:  Score and rank candidate columns → s_i = φ(h_i^(L))

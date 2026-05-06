@@ -6370,6 +6370,40 @@ class LateralTransshipmentCG:
             self._last_pricing_summary["runtime_gnn_mode"] = bool(self.runtime_gnn_mode)
             self._last_pricing_summary["exact_full_mode"] = True
             return selected_patterns
+        if self.pruned_exact_mode and self.stackelberg_aware_scoring:
+            # V2 ablation path: four-feature pruning + exact Gurobi pricing,
+            # then Stackelberg delta filter. Generates candidates identically to
+            # V1 (pruned_exact_mode), but only admits patterns where
+            # delta = column_cost + residual_follower_cost - baseline_follower_cost < 0.
+            new_patterns = self._candidate_patterns_pruned_exact(
+                need=need,
+                surplus=surplus,
+                active_product_periods=active_product_periods,
+                dual_need=master_solution.dual_need,
+                dual_surplus=master_solution.dual_surplus,
+                rc_tol=rc_tol,
+                episode=self.current_episode,
+                implied_net_lt=master_solution.implied_net_lt or None,
+            )
+            if not new_patterns:
+                return []
+            follower = self._build_stackelberg_follower_solver()
+            scored = self._score_patterns_by_follower_response(
+                new_patterns, need, surplus, follower, rc_tol=rc_tol,
+            )
+            selected_patterns = [pat for pat, delta in scored if delta < 0]
+            n_stack_accepted = len(selected_patterns)
+            self._last_pricing_summary.update({
+                "active_product_period_count": len(active_product_periods),
+                "patterns_kept_after_gnn": n_stack_accepted,
+                "pairs_accepted_stackelberg": n_stack_accepted,
+                "stackelberg_aware_scoring": True,
+                "stackelberg_total_scored": len(scored),
+                "stackelberg_negative_delta": n_stack_accepted,
+                "collect_teacher_mode": False,
+                "runtime_gnn_mode": False,
+            })
+            return selected_patterns
         if self.pruned_exact_mode:
             # E2 path: four-feature pruning first, then exact Gurobi pricing
             # over the surviving donor-receiver pairs. Used in two regimes:
