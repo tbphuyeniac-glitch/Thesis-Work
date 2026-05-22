@@ -7,7 +7,7 @@
 > covering both DC-to-store replenishment and lateral transshipment. The ALNS (Part 2)
 > solves the Stage 1 sub-problem by fixing all LT variables to zero ($y = 0$). The
 > Column Generation module (Part 3) then handles Stage 2 LT decisions. Constraints
-> referencing $y_{ijpvt}$ — specifically constraints (2), (8), and (15) — belong to the
+> referencing $y_{ijpvt}$ — specifically constraints (2), (8), and (14) — belong to the
 > full integrated model and are trivially satisfied (but structurally inactive) during
 > the ALNS baseline solve.
 
@@ -54,8 +54,8 @@
 | $b_{ij}$ | Lateral transshipment unit cost from store $i$ to store $j$ |
 | $f_{ij}$ | Fixed dispatch cost for activating a lateral transshipment from store $i$ to store $j$ (enters via column cost in Part 3) |
 | $F_v$ | Fixed cost for activating vehicle $v$ in a period |
-| $\delta$ | Minimum total activity (units delivered + LT in/out) required at a visited store; default $1.0$ (constraint 21) |
-| $\mathcal{T}_{disp}$ | Set of CW dispatch periods; $\mathcal{T}_{disp} = \{t \in T \mid (t-t_0) \bmod cycle = 0\}$ (constraint 22) |
+| $\delta$ | Minimum total activity (units delivered + LT in/out) required at a visited store; default $1.0$ (constraint 20) |
+| $\mathcal{T}_{disp}$ | Set of CW dispatch periods; $\mathcal{T}_{disp} = \{t \in T \mid (t-t_0) \bmod cycle = 0\}$ (constraint 21) |
 | $\theta_{LT}$ | Activation threshold: minimum total need or surplus across stores to enable LT for a $(p,t)$ pair |
 | $K^{max}$ | Maximum donor-receiver arc count per column (pricing MIP arc cardinality cap) |
 | $K^{pool}$ | Maximum number of columns extracted per $(p,t)$ pricing subproblem via pool search |
@@ -219,31 +219,26 @@ $$\sum_{v \in V} u_{vt} \leq U_{max}
 $$q_{pijvt} \leq Q_V\, x_{ijvt}
 \tag{13}$$
 
-**Constraint (14) — Direct-shipment definition** *(derived: implied by (4a)+(4b)+(5); not added explicitly to the Gurobi model):*
-
-$$Q^{dir}_{spt} = \sum_{v \in V} q_{p,CW,s,v,t}
-\tag{14}$$
-
-**Constraint (15) — LT-linking constraint.** *(Full model only — trivially satisfied when
+**Constraint (14) — LT-linking constraint.** *(Full model only — trivially satisfied when
 $y = 0$ in Stage 1.)* LT quantity cannot exceed the physical product flow on the
 corresponding arc:
 
 $$y_{ijpvt} \leq q_{pijvt}
-\tag{15}$$
+\tag{14}$$
 
-**Constraints (16)–(18) — Arc usage and node-visit consistency (valid inequalities):**
+**Constraints (15)–(17) — Arc usage and node-visit consistency (valid inequalities):**
 
-$$x_{CW,i,v,t} \leq z_{ivt}, \quad \forall i \in N,\; v, t \tag{16}$$
+$$x_{CW,i,v,t} \leq z_{ivt}, \quad \forall i \in N,\; v, t \tag{15}$$
 
-$$x_{ijvt} \leq z_{jvt}, \quad \forall i, j \in N,\; i \neq j,\; v, t \tag{17}$$
+$$x_{ijvt} \leq z_{jvt}, \quad \forall i, j \in N,\; i \neq j,\; v, t \tag{16}$$
 
-$$z_{ivt} \leq z_{CW,vt}, \quad \forall i \in N,\; v, t \tag{18}$$
+$$z_{ivt} \leq z_{CW,vt}, \quad \forall i \in N,\; v, t \tag{17}$$
 
-**Constraint (19) — Vehicle symmetry breaking:**
+**Constraint (18) — Vehicle symmetry breaking:**
 
-$$z_{CW,v,t} \leq z_{CW,v-1,t} \tag{19}$$
+$$z_{CW,v,t} \leq z_{CW,v-1,t} \tag{18}$$
 
-**Constraint (20) — Inventory-driven visit validity.** Cumulative demand coverage is
+**Constraint (19) — Inventory-driven visit validity.** Cumulative demand coverage is
 linked with store visits and incoming transshipment over any window $[t_1, t_2]$:
 
 $$\sum_{v \in V} \sum_{\tau=t_1}^{t_2} z_{sv\tau}
@@ -252,13 +247,13 @@ $$\sum_{v \in V} \sum_{\tau=t_1}^{t_2} z_{sv\tau}
 \;\geq\;
 \frac{\displaystyle\sum_{\tau=t_1}^{t_2} d_{sp\tau} - I^{base}_{sp,t_1}}
      {\displaystyle\sum_{\tau=t_1}^{t_2} d_{sp\tau}}
-\tag{20}$$
+\tag{19}$$
 
 where $I^{base}_{sp,t_1}$ denotes the inventory at the *beginning* of period $t_1$
 (i.e., $I_{sp,t_1-1}$, with the initial parameter $I^0_{sp}$ used when $t_1$ is the first period).
 The LT source set is $j \in N$ because $y$ is defined for store-to-store transshipment only.
 
-**Constraint (21) — Minimum visit activity.** *(Parametric: enforced when activity threshold $\delta > 0$; default $\delta = 1.0$.)* Every visited store must exhibit non-trivial total activity (received + sent):
+**Constraint (20) — Minimum visit activity.** *(Parametric: enforced when activity threshold $\delta > 0$; default $\delta = 1.0$.)* Every visited store must exhibit non-trivial total activity (received + sent):
 
 $$\sum_{p \in P} \!\Bigl(
   deliv_{spvt}
@@ -266,17 +261,17 @@ $$\sum_{p \in P} \!\Bigl(
   + \sum_{\substack{j \in N \\ j \neq s}} y_{sjpvt}
 \Bigr) \;\geq\; \delta \cdot z_{svt},
 \quad \forall s \in N,\; v, t
-\tag{21}$$
+\tag{20}$$
 
 This prevents routing vehicles to stores with zero delivery or LT activity. When $y = 0$ (Stage 1), the constraint reduces to $\sum_p deliv_{spvt} \geq \delta \cdot z_{svt}$.
 
-**Constraint (22) — CW dispatch cycle.** *(Parametric: active when $cw\_dispatch\_cycle > 1$; default cycle $= 5$.)* Direct shipments from the CW are restricted to designated replenishment periods. This constraint is enforced **across all solvers**:
+**Constraint (21) — CW dispatch cycle.** *(Parametric: active when $cw\_dispatch\_cycle > 1$; default cycle $= 5$.)* Direct shipments from the CW are restricted to designated replenishment periods. This constraint is enforced **across all solvers**:
 
 - **ALNS (Stage 1):** repair and greedy-init operators skip CW delivery entirely for $t \notin \mathcal{T}_{disp}$; the feasibility evaluator adds a hard penalty for any non-zero delivery in non-dispatch periods.
 - **Gurobi exact model:** enforced as an equality constraint.
 
 $$Q^{dir}_{spt} = 0, \quad \forall s \in N,\; p \in P,\; t \notin \mathcal{T}_{disp}
-\tag{22}$$
+\tag{21}$$
 
 where $\mathcal{T}_{disp} = \bigl\{\, t \in T \mid (t - t_0) \bmod cycle = 0 \,\bigr\}$ and $t_0 = \min T$.
 

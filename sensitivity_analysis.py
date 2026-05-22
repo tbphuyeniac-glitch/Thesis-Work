@@ -211,6 +211,14 @@ def _v2_kwargs(min_lateral_qty: float) -> dict:
 
 
 def _total_demand(data) -> float:
+    """Total demand for fill-rate denominator.
+
+    Uses realized_demand if shock has been applied (sum matches numerator's
+    realized shortage). Falls back to forecast demand otherwise.
+    """
+    realized = getattr(data, "realized_demand", None)
+    if realized:
+        return float(sum(realized.values()))
     return float(sum(data.demand.values()))
 
 
@@ -298,7 +306,6 @@ def run_one(
     )
 
     pre_total_cost = float(pre_breakdown["total_realized_operating_cost"])
-    pre_shortage = float(pre_breakdown["total_realized_shortage_units"])
     post_total_cost = float(post_breakdown["total_realized_operating_cost"])
     post_shortage = float(post_breakdown["total_realized_shortage_units"])
 
@@ -307,11 +314,8 @@ def run_one(
         "param_value": param_value,
         "repeat": repeat_idx,
         "seed": seed_for_repeat,
-        # Pre-shock (baseline solved on original demand, no LT)
+        # Pre-shock cost (baseline solved on original demand, no LT) — for cost-chart reference only
         "pre_total_cost": round(pre_total_cost, 4),
-        "pre_shortage_units": round(pre_shortage, 4),
-        "pre_total_demand": round(pre_total_demand, 4),
-        "pre_fill_rate": round(_fill_rate(pre_shortage, pre_total_demand), 6),
         # Post-shock + LT (CG solution executed on shocked demand)
         "post_total_cost": round(post_total_cost, 4),
         "post_shortage_units": round(post_shortage, 4),
@@ -361,9 +365,7 @@ def sweep_shock_fraction(n_repeats: int) -> pd.DataFrame:
     print(f"[ALNS] baseline objective={baseline_sol.objective:.4f}  ({t_baseline:.1f}s)")
 
     pre_breakdown, pre_total_demand = _baseline_pre_metrics(base_data, baseline_sol)
-    print(f"[Pre]  total_cost={pre_breakdown['total_realized_operating_cost']:.4f}  "
-          f"shortage={pre_breakdown['total_realized_shortage_units']:.4f}  "
-          f"fill_rate={_fill_rate(pre_breakdown['total_realized_shortage_units'], pre_total_demand):.4f}")
+    print(f"[Pre]  baseline_cost={pre_breakdown['total_realized_operating_cost']:.4f}")
 
     rows: List[dict] = []
     for value in SHOCK_FRACTION_VALUES:
@@ -450,9 +452,7 @@ def sweep_min_lateral_qty(n_repeats: int) -> pd.DataFrame:
     print(f"[ALNS] baseline objective={baseline_sol.objective:.4f}  ({t_baseline:.1f}s)")
 
     pre_breakdown, pre_total_demand = _baseline_pre_metrics(base_data, baseline_sol)
-    print(f"[Pre]  total_cost={pre_breakdown['total_realized_operating_cost']:.4f}  "
-          f"shortage={pre_breakdown['total_realized_shortage_units']:.4f}  "
-          f"fill_rate={_fill_rate(pre_breakdown['total_realized_shortage_units'], pre_total_demand):.4f}")
+    print(f"[Pre]  baseline_cost={pre_breakdown['total_realized_operating_cost']:.4f}")
 
     rows: List[dict] = []
     for value in MIN_LATERAL_QTY_VALUES:
@@ -486,7 +486,7 @@ def sweep_min_lateral_qty(n_repeats: int) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 SUMMARY_COLS_MEAN = [
-    "pre_total_cost", "pre_fill_rate",
+    "pre_total_cost",
     "post_total_cost", "post_fill_rate",
     "direct_cw_unit_cost", "store_holding_cost", "warehouse_holding_cost",
     "route_distance_cost", "vehicle_fixed_cost", "lateral_transshipment_cost",
@@ -523,10 +523,9 @@ def _make_line_chart(
     ax.grid(True, linestyle="--", alpha=0.4)
     ax.legend()
 
-    # Panel 2: fill rate (pre + post)
+    # Panel 2: post-shock service level only (pre-shock metric removed —
+    # pre uses MILP B var which is inflated by capacity binding; not comparable)
     ax = axes[1]
-    ax.plot(x, summary_df["pre_fill_rate"], marker="s", linestyle="--",
-            color="#9aa0a6", label="Pre-shock (baseline)")
     ax.plot(x, summary_df["post_fill_rate"], marker="o", linestyle="-",
             color="#4a90d9", label="Post-shock + LT (CG)")
     ax.set_xlabel(x_label)

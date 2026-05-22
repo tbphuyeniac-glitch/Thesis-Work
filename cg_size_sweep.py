@@ -113,6 +113,22 @@ SCENARIOS: List[Dict] = [
 ]
 
 
+def _total_realized_demand(data) -> float:
+    """Total demand after shock application. Mirrors kaggle_sensitivity_analysis._total_demand."""
+    realized = getattr(data, "realized_demand", None)
+    if realized:
+        return float(sum(realized.values()))
+    return float(sum(data.demand.values()))
+
+
+def _service_level(shortage: float, demand: float) -> float:
+    """Classic service level: 1 - shortage/demand, clipped to [0,1].
+    Same as kaggle_sensitivity_analysis._fill_rate."""
+    if demand <= 1e-9:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 - shortage / demand))
+
+
 def _moq_for_shortage(total_shortage: float) -> float:
     """Heuristic Stackelberg MOQ scaled by instance shortage volume.
 
@@ -246,7 +262,9 @@ def _run_one(variant: str, scenario: dict, base_data, shared_baseline,
     post_lt = build_realized_operating_cost_breakdown(repeat_data, baseline_for_run, lt_plan_df=lt_plan_df)
     pre = float(pre_lt["total_realized_shortage_units"])
     post = float(post_lt["total_realized_shortage_units"])
-    fill = 1.0 - (post / pre) if pre > 0 else 0.0
+    lt_shortage_recovery_ratio = 1.0 - (post / pre) if pre > 0 else 0.0
+    post_demand = _total_realized_demand(repeat_data)
+    post_lt_service_level = _service_level(post, post_demand)
     diags = getattr(cg, "cg_episode_diagnostics", []) or []
     kwargs = _variant_kwargs(variant, moq_override=moq_for_v2)
     is_pruned_exact = kwargs.get("pruned_exact_mode", False)
@@ -267,7 +285,9 @@ def _run_one(variant: str, scenario: dict, base_data, shared_baseline,
         "variant": variant,
         "moq_used": float(kwargs.get("stackelberg_min_lateral_qty", 0.0)),
         "wall": round(wall, 3),
-        "fill": round(fill, 4),
+        "lt_shortage_recovery_ratio": round(lt_shortage_recovery_ratio, 4),
+        "post_lt_service_level": round(post_lt_service_level, 6),
+        "post_realized_demand": round(post_demand, 2),
         "iters": int(cg_sol.iterations_run),
         "candidates": cand,
         "after_pruning_unique": unique,
@@ -282,7 +302,8 @@ def _run_one(variant: str, scenario: dict, base_data, shared_baseline,
 def _make_chart(df: pd.DataFrame, out_path: Path) -> None:
     metrics = [
         ("wall", "CG Wall Time (s)"),
-        ("fill", "Shortage Fill Rate"),
+        ("lt_shortage_recovery_ratio", "LT Shortage Recovery Ratio"),
+        ("post_lt_service_level", "Post-LT Service Level"),
         ("prune_rate_pct", "Effective Prune Rate (%)"),
     ]
     tiers = ["small", "medium", "large"]
@@ -366,7 +387,9 @@ def main() -> int:
                     moq_for_v2=moq_for_v2,
                 )
                 rows.append(row)
-                print(f"  -> wall={row['wall']:.2f}s fill={row['fill']:.4f} "
+                print(f"  -> wall={row['wall']:.2f}s "
+                      f"recovery={row['lt_shortage_recovery_ratio']:.4f} "
+                      f"service={row['post_lt_service_level']:.4f} "
                       f"iters={row['iters']} prune={row['prune_rate_pct']}% "
                       f"stack={row['n_stack_accepted']} "
                       f"rmp_obj={row['rmp_objective_value']:.2e}")
@@ -387,7 +410,9 @@ def main() -> int:
     if "wall" in df.columns:
         cols_to_show = [c for c in [
             "scenario", "tier", "n_stores", "n_skus", "variant", "moq_used",
-            "wall", "fill", "iters", "candidates", "after_pruning_unique",
+            "wall", "lt_shortage_recovery_ratio", "post_lt_service_level",
+            "post_realized_demand",
+            "iters", "candidates", "after_pruning_unique",
             "prune_rate_pct", "n_stack_accepted", "rmp_objective_value",
             "shortage_before_lt", "shortage_after_lt",
         ] if c in df.columns]

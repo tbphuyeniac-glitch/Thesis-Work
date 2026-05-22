@@ -192,6 +192,10 @@ def _v2_kwargs(min_lateral_qty: float):
 
 
 def _total_demand(data) -> float:
+    """Use realized_demand if shock has been applied; else forecast demand."""
+    realized = getattr(data, "realized_demand", None)
+    if realized:
+        return float(sum(realized.values()))
     return float(sum(data.demand.values()))
 
 
@@ -259,7 +263,6 @@ def run_one(*, sweep_name, param_value, seed, base_data, baseline_sol,
     )
 
     pre_cost     = float(pre_bd["total_realized_operating_cost"])
-    pre_shortage = float(pre_bd["total_realized_shortage_units"])
     post_cost    = float(post_bd["total_realized_operating_cost"])
     post_shortage= float(post_bd["total_realized_shortage_units"])
 
@@ -267,8 +270,8 @@ def run_one(*, sweep_name, param_value, seed, base_data, baseline_sol,
         "sweep": sweep_name,
         "param_value": param_value,
         "seed": seed,
+        # Pre-shock cost (baseline ALNS, no LT) — for cost-chart reference
         "pre_total_cost":  round(pre_cost, 4),
-        "pre_fill_rate":   round(_fill_rate(pre_shortage, pre_demand), 6),
         "post_total_cost": round(post_cost, 4),
         "post_fill_rate":  round(_fill_rate(post_shortage, post_demand), 6),
         "direct_cw_unit_cost":        float(post_bd["direct_cw_unit_cost_executed_plan"]),
@@ -312,8 +315,6 @@ def save_and_plot(rows: List[dict], sweep_name: str, x_label: str):
     ax.grid(True, ls="--", alpha=0.4); ax.legend()
 
     ax = axes[1]
-    ax.plot(x, summary["pre_fill_rate"],  marker="s", ls="--",
-            color="#9aa0a6", label="Pre-shock (baseline, no LT)")
     ax.plot(x, summary["post_fill_rate"], marker="o", ls="-",
             color="#4a90d9", label="Post-shock + LT (CG)")
     ax.set_xlabel(x_label); ax.set_ylabel("Service level (fill rate)")
