@@ -67,9 +67,10 @@ RESULTS_ROOT = Path("/kaggle/working/sensitivity")
 
 DATA_PATH = str(REPO_ROOT / "1BISCR501V_90100140_20260323-150407111_filtered_sites.csv")
 
-# Fixed scenario (V2 MOQ=200 was calibrated for these dimensions)
+# Fixed scenario — matches scenario L1 in cg_size_sweep.py (9 stores x 4 SKUs,
+# large tier) so service level numbers are directly comparable across files.
 SCENARIO = dict(
-    store_limit=7, sku_limit=3,
+    store_limit=9, sku_limit=4,
     vehicle_count=2, vehicle_capacity=900.0,
     wh_inventory_multiplier=0.8,
     store_capacity_multiplier=1.2,

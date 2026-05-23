@@ -64,10 +64,11 @@ THREE_FEATURE_RANGES: Dict[str, Dict[str, float]] = {
     "time_urgency":   {"min": 0.10, "max": 1.00},
 }
 
-# Fixed instance for ALL three sweeps (V2 MOQ=200 was calibrated for this).
+# Fixed instance for ALL three sweeps — matches scenario L1 in cg_size_sweep.py
+# (9 stores x 4 SKUs, large tier) so service level numbers are directly comparable.
 SCENARIO = dict(
-    store_limit=7,
-    sku_limit=3,
+    store_limit=9,
+    sku_limit=4,
     vehicle_count=2,
     vehicle_capacity=900.0,
     wh_inventory_multiplier=0.8,
