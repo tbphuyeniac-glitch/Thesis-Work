@@ -276,6 +276,17 @@ def _run_one(variant: str, scenario: dict, base_data, shared_baseline,
     has_stack = kwargs.get("stackelberg_aware_scoring", False)
     n_stack = (sum(int(d.get("pairs_accepted_stackelberg", 0) or 0) for d in diags)
                if has_stack else 0)
+    # Patterns built by pricing MIP (input to Stackelberg filter for V2;
+    # input directly to RMP gate for V0/V1). Read-only from diagnostics.
+    n_patterns_built = sum(int(d.get("patterns_built_before_gnn", 0) or 0) for d in diags)
+    # Patterns that actually entered the RMP pool after dedup/empty-flow gate.
+    n_patterns_added_to_rmp = sum(int(d.get("patterns_added_to_pool", 0) or 0) for d in diags)
+    # Stackelberg acceptance rate at pattern level: fraction of patterns built
+    # that pass the delta<0 filter. Only meaningful for V2; V0/V1 set to 0.0.
+    stack_acceptance_rate_pct = (
+        round((n_stack / n_patterns_built) * 100.0, 2)
+        if (has_stack and n_patterns_built > 0) else 0.0
+    )
     return {
         "scenario": scenario["name"],
         "tier": scenario["tier"],
@@ -293,6 +304,9 @@ def _run_one(variant: str, scenario: dict, base_data, shared_baseline,
         "after_pruning_unique": unique,
         "prune_rate_pct": round((1.0 - unique / max(cand, 1)) * 100.0, 1),
         "n_stack_accepted": n_stack,
+        "n_patterns_built": n_patterns_built,
+        "n_patterns_added_to_rmp": n_patterns_added_to_rmp,
+        "stack_acceptance_rate_pct": stack_acceptance_rate_pct,
         "rmp_objective_value": round(float(cg_sol.objective), 2),
         "shortage_before_lt": round(pre, 2),
         "shortage_after_lt": round(post, 2),
@@ -391,7 +405,10 @@ def main() -> int:
                       f"recovery={row['lt_shortage_recovery_ratio']:.4f} "
                       f"service={row['post_lt_service_level']:.4f} "
                       f"iters={row['iters']} prune={row['prune_rate_pct']}% "
+                      f"built={row['n_patterns_built']} "
                       f"stack={row['n_stack_accepted']} "
+                      f"stack_rate={row['stack_acceptance_rate_pct']}% "
+                      f"in_rmp={row['n_patterns_added_to_rmp']} "
                       f"rmp_obj={row['rmp_objective_value']:.2e}")
             except Exception as e:
                 import traceback
@@ -413,7 +430,10 @@ def main() -> int:
             "wall", "lt_shortage_recovery_ratio", "post_lt_service_level",
             "post_realized_demand",
             "iters", "candidates", "after_pruning_unique",
-            "prune_rate_pct", "n_stack_accepted", "rmp_objective_value",
+            "prune_rate_pct",
+            "n_patterns_built", "n_stack_accepted",
+            "stack_acceptance_rate_pct", "n_patterns_added_to_rmp",
+            "rmp_objective_value",
             "shortage_before_lt", "shortage_after_lt",
         ] if c in df.columns]
         print(df[cols_to_show].to_string(index=False))
